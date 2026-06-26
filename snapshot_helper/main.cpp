@@ -105,6 +105,46 @@ std::string handleFilename(std::string fn)
 	return fn;
 }
 
+std::string sanitize_zfs_name(std::string name)
+{
+	std::string res;
+	res.reserve(name.size());
+	for (size_t i = 0; i < name.size(); ++i)
+	{
+		char ch = name[i];
+		if (ch == '[')
+		{
+			res += ':';
+		}
+		else if (ch == ']')
+		{
+			// remove/ignore
+		}
+		else if ((ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') ||
+			ch == '_' || ch == '.' || ch == '-' || ch == ':' || ch == '/')
+		{
+			res += ch;
+		}
+		else
+		{
+			res += '_';
+		}
+	}
+	return res;
+}
+
+std::string get_subvolume_folder(int mode, const std::string& backupfolder, const std::string& clientname, const std::string& name)
+{
+	std::string res = backupfolder + os_file_sep() + clientname + os_file_sep() + name;
+	if (mode == mode_zfs)
+	{
+		res = sanitize_zfs_name(res);
+	}
+	return res;
+}
+
 #ifndef _WIN32
 int exec_wait(const std::string& path, bool keep_stdout, ...)
 {
@@ -636,7 +676,7 @@ int main(int argc, char *argv[])
 		std::string clientname=handleFilename(argv[3]);
 		std::string name=handleFilename(argv[4]);
 
-		std::string subvolume_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+name;
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return create_subvolume(mode, subvolume_folder)?0:1;
 	}
@@ -651,7 +691,7 @@ int main(int argc, char *argv[])
 		std::string clientname=handleFilename(argv[3]);
 		std::string name=handleFilename(argv[4]);
 
-		std::string subvolume_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+name;
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return get_mountpoint(mode, subvolume_folder)?0:1;
 	}
@@ -667,8 +707,8 @@ int main(int argc, char *argv[])
 		std::string src_name=handleFilename(argv[4]);
 		std::string dst_name=handleFilename(argv[5]);
 
-		std::string subvolume_src_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+src_name;
-		std::string subvolume_dst_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+dst_name;
+		std::string subvolume_src_folder=get_subvolume_folder(mode, backupfolder, clientname, src_name);
+		std::string subvolume_dst_folder=get_subvolume_folder(mode, backupfolder, clientname, dst_name);
 
 		return create_snapshot(mode, subvolume_src_folder, subvolume_dst_folder)?0:1;
 	}
@@ -683,7 +723,7 @@ int main(int argc, char *argv[])
 		std::string clientname=handleFilename(argv[3]);
 		std::string name=handleFilename(argv[4]);
 
-		std::string subvolume_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+name;
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return remove_subvolume(mode, subvolume_folder)?0:1;
 	}
@@ -781,7 +821,7 @@ int main(int argc, char *argv[])
 		std::string clientname=handleFilename(argv[3]);
 		std::string name=handleFilename(argv[4]);
 
-		std::string subvolume_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+name;
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return is_subvolume(mode, subvolume_folder)?0:1;
 	}
@@ -796,7 +836,7 @@ int main(int argc, char *argv[])
 		std::string clientname=handleFilename(argv[3]);
 		std::string name=handleFilename(argv[4]);
 
-		std::string subvolume_folder=backupfolder+os_file_sep()+clientname+os_file_sep()+name;
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return make_readonly(mode, subvolume_folder)?0:1;
 	}
