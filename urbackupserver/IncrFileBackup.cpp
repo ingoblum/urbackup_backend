@@ -36,6 +36,7 @@
 #include "FileMetadataDownloadThread.h"
 #include "database.h"
 #include <algorithm>
+#include <cerrno>
 #include "PhashLoad.h"
 
 extern std::string server_identity;
@@ -44,7 +45,19 @@ const int64 c_readd_size_limit=4096;
 
 namespace
 {
-	
+	std::string formatSystemErrorInfo(int64 err)
+	{
+		return trim(os_format_errcode(err)) + " (errorcode=" + convert(err) + ")";
+	}
+
+	bool isMissingPathError(int64 err)
+	{
+#ifdef _WIN32
+		return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
+#else
+		return err == ENOENT;
+#endif
+	}
 }
 
 IncrFileBackup::IncrFileBackup( ClientMain* client_main, int clientid, std::string clientname, std::string clientsubname, LogAction log_action,
@@ -1972,22 +1985,44 @@ bool IncrFileBackup::deleteFilesInSnapshot(const std::string clientlist_fn, cons
 							{
 								if (!Server->deleteFile(os_file_prefix(curr_fn)))
 								{
-									ServerLogger::Log(logid, "Could not remove file \"" + curr_fn + "\" in ::deleteFilesInSnapshot - " + systemErrorInfo(), no_error ? LL_WARNING : LL_ERROR);
+									int64 delete_err = os_last_error();
+									if (isMissingPathError(delete_err))
+									{
+										ServerLogger::Log(logid, "Could not remove file \"" + curr_fn + "\" in ::deleteFilesInSnapshot - "
+											+ formatSystemErrorInfo(delete_err) + ". It was already deleted.", LL_WARNING);
+									}
+									else
+									{
+										ServerLogger::Log(logid, "Could not remove file \"" + curr_fn + "\" in ::deleteFilesInSnapshot - "
+											+ formatSystemErrorInfo(delete_err), no_error ? LL_WARNING : LL_ERROR);
 
-									if (!no_error)
+										if (!no_error)
+										{
+											return false;
+										}
+									}
+								}
+							}
+							else
+							{
+								bool removed_dir = os_remove_nonempty_dir(os_file_prefix(curr_fn));
+								int64 remove_err = removed_dir ? 0 : os_last_error();
+								bool dir_exists = os_directory_exists(os_file_prefix(curr_fn));
+								if ((!removed_dir || dir_exists)
+									&& !(isMissingPathError(remove_err) && !dir_exists))
+								{
+									ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot - "
+										+ formatSystemErrorInfo(remove_err), no_error ? LL_WARNING : LL_ERROR);
+
+									if(!no_error)
 									{
 										return false;
 									}
 								}
-							}
-							else if(!os_remove_nonempty_dir(os_file_prefix(curr_fn))
-								|| os_directory_exists(os_file_prefix(curr_fn)) )
-							{
-								ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot - " + systemErrorInfo(), no_error ? LL_WARNING : LL_ERROR);
-
-								if(!no_error)
+								else if (!removed_dir)
 								{
-									return false;
+									ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot - "
+										+ formatSystemErrorInfo(remove_err) + ". It was already deleted.", LL_WARNING);
 								}
 							}
 						}
@@ -2017,30 +2052,49 @@ bool IncrFileBackup::deleteFilesInSnapshot(const std::string clientlist_fn, cons
 							if(ftype & EFileType_File && !keep_inplace
 								&& !Server->deleteFile(os_file_prefix(curr_fn)) )
 							{
+								int64 delete_err = os_last_error();
 								std::auto_ptr<IFile> tf(Server->openFile(os_file_prefix(curr_fn), MODE_READ));
-								if(tf.get()!=NULL)
+								if(isMissingPathError(delete_err))
 								{
-									ServerLogger::Log(logid, "Could not remove file \""+curr_fn+"\" in ::deleteFilesInSnapshot - " + systemErrorInfo(), no_error ? LL_WARNING : LL_ERROR);
+									ServerLogger::Log(logid, "Could not remove file \""+curr_fn+"\" in ::deleteFilesInSnapshot - "
+										+ formatSystemErrorInfo(delete_err)+". It was already deleted.", LL_WARNING);
+								}
+								else if(tf.get()!=NULL)
+								{
+									ServerLogger::Log(logid, "Could not remove file \""+curr_fn+"\" in ::deleteFilesInSnapshot - "
+										+ formatSystemErrorInfo(delete_err), no_error ? LL_WARNING : LL_ERROR);
 								}
 								else
 								{
-									ServerLogger::Log(logid, "Could not remove file \""+curr_fn+"\" in ::deleteFilesInSnapshot - " + systemErrorInfo()+". It was already deleted.", no_error ? LL_WARNING : LL_ERROR);
+									ServerLogger::Log(logid, "Could not remove file \""+curr_fn+"\" in ::deleteFilesInSnapshot - "
+										+ formatSystemErrorInfo(delete_err)+". It was already deleted.", LL_WARNING);
 								}
 
-								if(!no_error)
+								if(!no_error && !isMissingPathError(delete_err) && tf.get()!=NULL)
 								{
 									return false;
 								}
 							}
-							else if (ftype & EFileType_Directory
-								&& (!os_remove_nonempty_dir(os_file_prefix(curr_fn))
-									|| os_directory_exists(os_file_prefix(curr_fn)) ) )
+							else if (ftype & EFileType_Directory)
 							{
-								ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot (2) - " + systemErrorInfo(), no_error ? LL_WARNING : LL_ERROR);
-
-								if (!no_error)
+								bool removed_dir = os_remove_nonempty_dir(os_file_prefix(curr_fn));
+								int64 remove_err = removed_dir ? 0 : os_last_error();
+								bool dir_exists = os_directory_exists(os_file_prefix(curr_fn));
+								if ((!removed_dir || dir_exists)
+									&& !(isMissingPathError(remove_err) && !dir_exists))
 								{
-									return false;
+									ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot (2) - "
+										+ formatSystemErrorInfo(remove_err), no_error ? LL_WARNING : LL_ERROR);
+
+									if (!no_error)
+									{
+										return false;
+									}
+								}
+								else if (!removed_dir)
+								{
+									ServerLogger::Log(logid, "Could not remove directory \"" + curr_fn + "\" in ::deleteFilesInSnapshot (2) - "
+										+ formatSystemErrorInfo(remove_err) + ". It was already deleted.", LL_WARNING);
 								}
 							}
 							else if (ftype==0)
