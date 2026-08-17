@@ -968,6 +968,12 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 		"SELECT f.id AS file_id, f.backupid AS file_backupid, f.fullpath AS file_fullpath, "
 		"f.hashpath AS file_hashpath, f.filesize AS file_filesize, "
 		"f.clientid AS file_clientid, f.incremental AS file_incremental, "
+		"typeof(f.fullpath) AS file_fullpath_type, typeof(f.hashpath) AS file_hashpath_type, "
+		"typeof(f.filesize) AS file_filesize_type, typeof(f.clientid) AS file_clientid_type, "
+		"typeof(f.incremental) AS file_incremental_type, "
+		"quote(f.fullpath) AS file_fullpath_quoted, quote(f.hashpath) AS file_hashpath_quoted, "
+		"quote(f.filesize) AS file_filesize_quoted, quote(f.clientid) AS file_clientid_quoted, "
+		"quote(f.incremental) AS file_incremental_quoted, "
 		"c.name AS client_name, b.path AS backup_path "
 		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
 		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
@@ -991,16 +997,21 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 			++stats.missing_files;
 			if (stats.missing_files <= 20)
 			{
+				const bool malformed_row = row["file_fullpath_type"] != "text"
+					|| row["file_filesize_type"] == "text"
+					|| row["file_clientid_type"] == "null"
+					|| row["file_incremental_type"] == "null";
 				log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove") + " missing file row id "
 					+ row["file_id"] + " backupid " + row["file_backupid"]
+					+ (malformed_row ? " [malformed row]" : "")
 					+ " client \"" + row["client_name"] + "\""
-					+ " clientid " + row["file_clientid"]
+					+ " clientid " + row["file_clientid_quoted"] + " type " + row["file_clientid_type"]
 					+ " backup path \"" + row["backup_path"] + "\""
-					+ " incremental " + row["file_incremental"]
-					+ " filesize " + row["file_filesize"]
-					+ " stored fullpath \"" + row["file_fullpath"] + "\""
+					+ " incremental " + row["file_incremental_quoted"] + " type " + row["file_incremental_type"]
+					+ " filesize " + row["file_filesize_quoted"] + " type " + row["file_filesize_type"]
+					+ " stored fullpath " + row["file_fullpath_quoted"] + " type " + row["file_fullpath_type"]
 					+ " expected physical path \"" + physical_path + "\""
-					+ " hashpath \"" + row["file_hashpath"] + "\"", LL_INFO);
+					+ " hashpath " + row["file_hashpath_quoted"] + " type " + row["file_hashpath_type"], LL_INFO);
 			}
 			if (apply)
 			{
