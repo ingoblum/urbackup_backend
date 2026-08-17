@@ -1180,6 +1180,10 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Remove file metadata rows for files that are no longer physically present.",
 		cmd, false);
 
+	TCLAP::SwitchArg remove_malformed_file_rows_arg("", "remove-malformed-file-rows",
+		"Remove structurally invalid file metadata rows, e.g. rows misrecovered from files_incoming_stat.",
+		cmd, false);
+
 	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
@@ -1242,6 +1246,11 @@ int action_reconcile_storage(std::vector<std::string> args)
 	if(remove_missing_files_arg.getValue())
 	{
 		real_args.push_back("--remove_missing_files");
+		real_args.push_back("true");
+	}
+	if(remove_malformed_file_rows_arg.getValue())
+	{
+		real_args.push_back("--remove_malformed_file_rows");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())

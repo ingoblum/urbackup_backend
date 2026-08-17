@@ -38,7 +38,7 @@ struct SStats
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
-		empty_backups(0), empty_backups_removed(0)
+		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
 	}
 
@@ -52,6 +52,8 @@ struct SStats
 	int64 paths_migrated;
 	int64 missing_files;
 	int64 missing_files_removed;
+	int64 malformed_file_rows;
+	int64 malformed_file_rows_removed;
 	int64 empty_backups;
 	int64 empty_backups_removed;
 };
@@ -661,6 +663,90 @@ bool current_backup_exists(IDatabase* db, const std::string& clientname, const s
 	return !res.empty();
 }
 
+bool is_malformed_file_row(const db_single_result& row, std::string& reason)
+{
+	if (row.find("incoming_stat_match") != row.end()
+		&& row.find("incoming_stat_match")->second == "1")
+	{
+		/*
+		SQLite .recover can sometimes classify recovered cells by the wrong
+		b-tree/schema object if the source database is damaged. In the observed
+		case rows from files_incoming_stat were imported as rows in files:
+
+		  files.id        <- files_incoming_stat.id
+		  files.backupid  <- files_incoming_stat.filesize
+		  files.fullpath  <- files_incoming_stat.clientid       e.g. "54"
+		  files.shahash   <- files_incoming_stat.backupid       e.g. integer 22689
+		  files.filesize  <- files_incoming_stat.existing_clients e.g. "49,54"
+		  files.created   <- files_incoming_stat.direction
+		  files.rsize     <- files_incoming_stat.incremental
+
+		Those rows are not valid file metadata. They can make backups look
+		non-empty and would otherwise be reported as merely "missing files".
+		Keep this as an explicit malformed-row check so removing missing
+		physical files does not silently clean up recovery artifacts unless the
+		operator requested --remove-malformed-file-rows.
+		*/
+		reason = "matches files_incoming_stat row misrecovered into files";
+		return true;
+	}
+
+	if (row.find("file_backupid_type") != row.end() && row.find("file_backupid_type")->second != "integer")
+	{
+		reason = "backupid has type " + row.find("file_backupid_type")->second;
+		return true;
+	}
+	if (row.find("file_fullpath_type") != row.end() && row.find("file_fullpath_type")->second != "text")
+	{
+		reason = "fullpath has type " + row.find("file_fullpath_type")->second;
+		return true;
+	}
+	if (row.find("file_fullpath") != row.end() && !is_absolute_path(row.find("file_fullpath")->second))
+	{
+		reason = "fullpath is not absolute";
+		return true;
+	}
+	if (row.find("file_hashpath_type") != row.end()
+		&& row.find("file_hashpath_type")->second != "null"
+		&& row.find("file_hashpath_type")->second != "text")
+	{
+		reason = "hashpath has type " + row.find("file_hashpath_type")->second;
+		return true;
+	}
+	if (row.find("file_filesize_type") != row.end() && row.find("file_filesize_type")->second != "integer")
+	{
+		reason = "filesize has type " + row.find("file_filesize_type")->second;
+		return true;
+	}
+	if (row.find("file_filesize") != row.end() && watoi64(row.find("file_filesize")->second) < 0)
+	{
+		reason = "filesize is negative";
+		return true;
+	}
+	if (row.find("file_clientid_type") != row.end() && row.find("file_clientid_type")->second != "integer")
+	{
+		reason = "clientid has type " + row.find("file_clientid_type")->second;
+		return true;
+	}
+	if (row.find("file_incremental_type") != row.end() && row.find("file_incremental_type")->second != "integer")
+	{
+		reason = "incremental has type " + row.find("file_incremental_type")->second;
+		return true;
+	}
+	if (row.find("file_clientid") != row.end()
+		&& row.find("backup_clientid") != row.end()
+		&& row.find("file_clientid")->second != row.find("backup_clientid")->second)
+	{
+		reason = "file clientid does not match backup clientid";
+		return true;
+	}
+
+	return false;
+}
+
+std::string file_validation_select_columns();
+std::string malformed_file_row_log_message(const db_single_result& row, const std::string& reason, bool apply);
+
 bool insert_client_from_old(IDatabase* db, const db_single_result& old_backup,
 	int64 old_clientid, const std::vector<SColumn>& client_columns)
 {
@@ -871,7 +957,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 }
 
 bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::string& client_filter,
-	const std::string& new_storage_prefix, bool apply, SStats& stats)
+	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
 	{
@@ -887,9 +973,8 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 
 	SCursorProgress progress("Checking current file paths", 0);
 
-	IDatabaseCursor* cursor = db_files->Prepare(
-		"SELECT f.id AS id, f.fullpath AS fullpath, f.hashpath AS hashpath, c.name AS clientname, b.path AS backuppath "
-		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
+	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
 		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_update = NULL;
@@ -903,12 +988,27 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 	while (cursor->next(row))
 	{
 		++processed_rows;
-		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["backuppath"], false);
+		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
 
-		const std::string fullpath = row["fullpath"];
-		const std::string hashpath = row["hashpath"];
-		const std::string migrated_fullpath = migrate_storage_path(fullpath, new_storage_prefix, row["clientname"], row["backuppath"]);
-		const std::string migrated_hashpath = migrate_storage_path(hashpath, new_storage_prefix, row["clientname"], row["backuppath"]);
+		std::string malformed_reason;
+		if (is_malformed_file_row(row, malformed_reason))
+		{
+			if (report_malformed_rows)
+			{
+				++stats.malformed_file_rows;
+				if (stats.malformed_file_rows <= 20)
+				{
+					log_with_cursor_progress(progress, "Skipping malformed file row during path migration. Use --remove-malformed-file-rows to remove it. "
+						+ malformed_file_row_log_message(row, malformed_reason, apply), LL_WARNING);
+				}
+			}
+			continue;
+		}
+
+		const std::string fullpath = row["file_fullpath"];
+		const std::string hashpath = row["file_hashpath"];
+		const std::string migrated_fullpath = migrate_storage_path(fullpath, new_storage_prefix, row["client_name"], row["backup_path"]);
+		const std::string migrated_hashpath = migrate_storage_path(hashpath, new_storage_prefix, row["client_name"], row["backup_path"]);
 
 		if (migrated_fullpath != fullpath || migrated_hashpath != hashpath)
 		{
@@ -916,13 +1016,13 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 			if (stats.paths_to_migrate <= 20)
 			{
 				log_with_cursor_progress(progress, std::string(apply ? "Migrating" : "Would migrate") + " file path id "
-					+ row["id"] + " from \"" + fullpath + "\" to \"" + migrated_fullpath + "\"", LL_INFO);
+					+ row["file_id"] + " from \"" + fullpath + "\" to \"" + migrated_fullpath + "\"", LL_INFO);
 			}
 			if (apply)
 			{
 				q_update->Bind(migrated_fullpath);
 				q_update->Bind(migrated_hashpath);
-				q_update->Bind(watoi64(row["id"]));
+				q_update->Bind(watoi64(row["file_id"]));
 				if (!q_update->Write())
 				{
 					pause_cursor_progress(progress);
@@ -947,8 +1047,115 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 	return ret;
 }
 
+std::string file_validation_select_columns()
+{
+	return "f.id AS file_id, f.backupid AS file_backupid, f.fullpath AS file_fullpath, "
+		"f.hashpath AS file_hashpath, f.shahash AS file_shahash, f.filesize AS file_filesize, "
+		"f.clientid AS file_clientid, f.incremental AS file_incremental, "
+		"typeof(f.backupid) AS file_backupid_type, typeof(f.fullpath) AS file_fullpath_type, "
+		"typeof(f.hashpath) AS file_hashpath_type, typeof(f.shahash) AS file_shahash_type, "
+		"typeof(f.filesize) AS file_filesize_type, typeof(f.clientid) AS file_clientid_type, "
+		"typeof(f.incremental) AS file_incremental_type, length(f.shahash) AS file_shahash_len, "
+		"quote(f.backupid) AS file_backupid_quoted, quote(f.fullpath) AS file_fullpath_quoted, "
+		"quote(f.hashpath) AS file_hashpath_quoted, quote(f.shahash) AS file_shahash_quoted, "
+		"quote(f.filesize) AS file_filesize_quoted, quote(f.clientid) AS file_clientid_quoted, "
+		"quote(f.incremental) AS file_incremental_quoted, "
+		"c.id AS backup_clientid, c.name AS client_name, b.path AS backup_path, "
+		"EXISTS(SELECT 1 FROM files_incoming_stat s WHERE s.id=f.id "
+		"AND f.backupid=s.filesize AND f.fullpath=CAST(s.clientid AS TEXT) "
+		"AND f.shahash=s.backupid AND f.filesize=s.existing_clients "
+		"AND f.created=s.direction AND f.rsize=s.incremental "
+		"AND f.clientid IS NULL AND f.incremental IS NULL) AS incoming_stat_match";
+}
+
+std::string malformed_file_row_log_message(const db_single_result& row, const std::string& reason, bool apply)
+{
+	return std::string(apply ? "Removing" : "Would remove") + " malformed file row id "
+		+ row.find("file_id")->second + " reason \"" + reason + "\""
+		+ " backupid " + row.find("file_backupid_quoted")->second + " type " + row.find("file_backupid_type")->second
+		+ " client \"" + row.find("client_name")->second + "\""
+		+ " file clientid " + row.find("file_clientid_quoted")->second + " type " + row.find("file_clientid_type")->second
+		+ " backup clientid " + row.find("backup_clientid")->second
+		+ " backup path \"" + row.find("backup_path")->second + "\""
+		+ " incremental " + row.find("file_incremental_quoted")->second + " type " + row.find("file_incremental_type")->second
+		+ " filesize " + row.find("file_filesize_quoted")->second + " type " + row.find("file_filesize_type")->second
+		+ " fullpath " + row.find("file_fullpath_quoted")->second + " type " + row.find("file_fullpath_type")->second
+		+ " hashpath " + row.find("file_hashpath_quoted")->second + " type " + row.find("file_hashpath_type")->second
+		+ " shahash type " + row.find("file_shahash_type")->second
+		+ " len " + row.find("file_shahash_len")->second
+		+ " incoming_stat_match " + row.find("incoming_stat_match")->second;
+}
+
+bool remove_malformed_file_rows(IDatabase* db_files, const std::string& client_filter, bool apply, SStats& stats)
+{
+	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
+	{
+		Server->Log("Could not attach current backup_server.db to files database.", LL_ERROR);
+		return false;
+	}
+
+	std::string where;
+	if (!client_filter.empty())
+	{
+		where = " WHERE c.name=" + sql_string(client_filter);
+	}
+
+	SCursorProgress progress("Checking malformed file rows", 0);
+	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
+		+ "INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
+
+	IQuery* q_delete = NULL;
+	if (apply)
+	{
+		q_delete = db_files->Prepare("DELETE FROM files WHERE id=?", false);
+	}
+
+	db_single_result row;
+	_i64 processed_rows = 0;
+	while (cursor->next(row))
+	{
+		++processed_rows;
+		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
+
+		std::string reason;
+		if (is_malformed_file_row(row, reason))
+		{
+			++stats.malformed_file_rows;
+			if (stats.malformed_file_rows <= 20)
+			{
+				log_with_cursor_progress(progress, malformed_file_row_log_message(row, reason, apply), LL_WARNING);
+			}
+			if (apply)
+			{
+				q_delete->Bind(watoi64(row["file_id"]));
+				if (!q_delete->Write())
+				{
+					pause_cursor_progress(progress);
+					db_files->destroyQuery(q_delete);
+					cursor->shutdown();
+					db_files->Write("DETACH DATABASE main_db");
+					return false;
+				}
+				q_delete->Reset();
+				++stats.malformed_file_rows_removed;
+			}
+		}
+	}
+	finish_cursor_progress(progress, processed_rows, "done");
+
+	if (q_delete != NULL)
+	{
+		db_files->destroyQuery(q_delete);
+	}
+	db_files->Write("DETACH DATABASE main_db");
+	const bool ret = !cursor->has_error();
+	cursor->shutdown();
+	return ret;
+}
+
 bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_filter,
-	const std::string& new_storage_prefix, bool apply, SStats& stats)
+	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
 	{
@@ -964,19 +1171,9 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 
 	SCursorProgress progress("Checking missing file rows", 0);
 
-	IDatabaseCursor* cursor = db_files->Prepare(
-		"SELECT f.id AS file_id, f.backupid AS file_backupid, f.fullpath AS file_fullpath, "
-		"f.hashpath AS file_hashpath, f.filesize AS file_filesize, "
-		"f.clientid AS file_clientid, f.incremental AS file_incremental, "
-		"typeof(f.fullpath) AS file_fullpath_type, typeof(f.hashpath) AS file_hashpath_type, "
-		"typeof(f.filesize) AS file_filesize_type, typeof(f.clientid) AS file_clientid_type, "
-		"typeof(f.incremental) AS file_incremental_type, "
-		"quote(f.fullpath) AS file_fullpath_quoted, quote(f.hashpath) AS file_hashpath_quoted, "
-		"quote(f.filesize) AS file_filesize_quoted, quote(f.clientid) AS file_clientid_quoted, "
-		"quote(f.incremental) AS file_incremental_quoted, "
-		"c.name AS client_name, b.path AS backup_path "
-		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
-		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
+	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
+		+ "INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_delete = NULL;
 	if (apply)
@@ -991,19 +1188,29 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 		++processed_rows;
 		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
 
+		std::string malformed_reason;
+		if (is_malformed_file_row(row, malformed_reason))
+		{
+			if (report_malformed_rows)
+			{
+				++stats.malformed_file_rows;
+				if (stats.malformed_file_rows <= 20)
+				{
+					log_with_cursor_progress(progress, "Skipping malformed file row during missing-file scan. Use --remove-malformed-file-rows to remove it. "
+						+ malformed_file_row_log_message(row, malformed_reason, apply), LL_WARNING);
+				}
+			}
+			continue;
+		}
+
 		const std::string physical_path = migrate_storage_path(row["file_fullpath"], new_storage_prefix, row["client_name"], row["backup_path"]);
 		if (!path_exists(physical_path))
 		{
 			++stats.missing_files;
 			if (stats.missing_files <= 20)
 			{
-				const bool malformed_row = row["file_fullpath_type"] != "text"
-					|| row["file_filesize_type"] == "text"
-					|| row["file_clientid_type"] == "null"
-					|| row["file_incremental_type"] == "null";
 				log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove") + " missing file row id "
 					+ row["file_id"] + " backupid " + row["file_backupid"]
-					+ (malformed_row ? " [malformed row]" : "")
 					+ " client \"" + row["client_name"] + "\""
 					+ " clientid " + row["file_clientid_quoted"] + " type " + row["file_clientid_type"]
 					+ " backup path \"" + row["backup_path"] + "\""
@@ -1040,9 +1247,28 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 	return ret;
 }
 
+std::string valid_file_row_sql_predicate()
+{
+	return "typeof(f.backupid)='integer' "
+		"AND typeof(f.fullpath)='text' "
+		"AND substr(f.fullpath,1,1)='/' "
+		"AND typeof(f.filesize)='integer' "
+		"AND f.filesize>=0 "
+		"AND typeof(f.clientid)='integer' "
+		"AND f.clientid=b.clientid "
+		"AND typeof(f.incremental)='integer' "
+		"AND (typeof(f.hashpath)='null' OR typeof(f.hashpath)='text') "
+		"AND NOT EXISTS(SELECT 1 FROM curr_files.files_incoming_stat s WHERE s.id=f.id "
+		"AND f.backupid=s.filesize AND f.fullpath=CAST(s.clientid AS TEXT) "
+		"AND f.shahash=s.backupid AND f.filesize=s.existing_clients "
+		"AND f.created=s.direction AND f.rsize=s.incremental "
+		"AND f.clientid IS NULL AND f.incremental IS NULL)";
+}
+
 bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
 {
-	std::string where = " WHERE NOT EXISTS (SELECT 1 FROM curr_files.files f WHERE f.backupid=b.id)";
+	std::string where = " WHERE NOT EXISTS (SELECT 1 FROM curr_files.files f WHERE f.backupid=b.id AND "
+		+ valid_file_row_sql_predicate() + ")";
 	if (!client_filter.empty())
 	{
 		where += " AND c.name=" + sql_string(client_filter);
@@ -1111,6 +1337,8 @@ void log_summary(const SStats& stats, bool apply)
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
 		+ convert(apply ? stats.missing_files_removed : stats.missing_files), LL_INFO);
+	Server->Log(std::string("  malformed file rows ") + (apply ? "removed: " : "would remove: ")
+		+ convert(apply ? stats.malformed_file_rows_removed : stats.malformed_file_rows), LL_INFO);
 	Server->Log(std::string("  empty file backups ") + (apply ? "removed: " : "would remove: ")
 		+ convert(apply ? stats.empty_backups_removed : stats.empty_backups), LL_INFO);
 }
@@ -1125,6 +1353,7 @@ int reconcile_storage()
 	const bool skip_db_backup = Server->getServerParameter("skip_db_backup") == "true";
 	const bool migrate_existing_file_paths = Server->getServerParameter("migrate_existing_file_paths") == "true";
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
+	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 
 	if (old_db_dir.empty())
@@ -1192,9 +1421,21 @@ int reconcile_storage()
 	}
 
 	ok = ok && reconcile_missing_backups(db, db_files, client_filter, new_storage_prefix, apply, stats);
+	if (remove_malformed_file_rows_enabled)
+	{
+		ok = ok && remove_malformed_file_rows(db_files, client_filter, apply, stats);
+	}
+	else
+	{
+		Server->Log("Skipping malformed file row removal because --remove-malformed-file-rows was not specified.", LL_INFO);
+	}
+
+	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
 	if (migrate_existing_file_paths)
 	{
-		ok = ok && migrate_current_file_paths(db, db_files, client_filter, new_storage_prefix, apply, stats);
+		ok = ok && migrate_current_file_paths(db, db_files, client_filter, new_storage_prefix, apply,
+			report_malformed_rows_in_scan, stats);
+		report_malformed_rows_in_scan = false;
 	}
 	else
 	{
@@ -1202,7 +1443,9 @@ int reconcile_storage()
 	}
 	if (remove_missing_files)
 	{
-		ok = ok && remove_missing_file_rows(db_files, client_filter, new_storage_prefix, apply, stats);
+		ok = ok && remove_missing_file_rows(db_files, client_filter, new_storage_prefix, apply,
+			report_malformed_rows_in_scan, stats);
+		report_malformed_rows_in_scan = false;
 	}
 	else
 	{
