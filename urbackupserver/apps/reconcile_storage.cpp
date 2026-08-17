@@ -78,6 +78,7 @@ struct SCursorProgress
 	}
 
 	std::string label;
+	std::string detail;
 	_i64 total;
 	_i64 current;
 	_i64 last_current;
@@ -230,9 +231,13 @@ void pause_cursor_progress(SCursorProgress& progress)
 {
 	if (progress.drawn)
 	{
-		std::cout << std::endl;
-		progress.drawn = false;
-		progress.max_line_length = 0;
+		std::cout << "\r";
+		for (size_t i = 0; i < progress.max_line_length; ++i)
+		{
+			std::cout << " ";
+		}
+		std::cout << "\r";
+		std::cout.flush();
 	}
 }
 
@@ -240,7 +245,8 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 {
 	const int64 curr_time = Server->getTimeMS();
 	const int64 passed_time = curr_time - progress.last_time;
-	if (!force && passed_time < 1000)
+	const bool update_counters = !progress.drawn || current != progress.current;
+	if (!force && passed_time < 1000 && update_counters)
 	{
 		return;
 	}
@@ -309,16 +315,31 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 	std::cout.flush();
 
 	progress.current = current;
-	progress.last_current = current;
-	progress.last_time = curr_time;
+	progress.detail = detail;
+	if (update_counters)
+	{
+		progress.last_current = current;
+		progress.last_time = curr_time;
+	}
 	progress.drawn = true;
+}
 
-	if (force)
+void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail)
+{
+	draw_cursor_progress(progress, current, detail, true);
+	if (progress.drawn)
 	{
 		std::cout << std::endl;
 		progress.drawn = false;
 		progress.max_line_length = 0;
 	}
+}
+
+void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel)
+{
+	pause_cursor_progress(progress);
+	Server->Log(msg, loglevel);
+	draw_cursor_progress(progress, progress.current, progress.detail, true);
 }
 
 std::string migrate_storage_path(const std::string& path,
@@ -723,7 +744,7 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 		q_insert->Reset();
 		++stats.file_rows_imported;
 	}
-	draw_cursor_progress(progress, processed_rows, clientname + "/" + backup_path, true);
+	finish_cursor_progress(progress, processed_rows, clientname + "/" + backup_path);
 
 	db_files->destroyQuery(q_insert);
 	const bool ret = !cursor->has_error();
@@ -787,8 +808,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 
 		if (row_exists_id(db, "backups", backupid))
 		{
-			pause_cursor_progress(progress);
-			Server->Log("Skipping old backup id " + convert(backupid) + " for client \"" + clientname
+			log_with_cursor_progress(progress, "Skipping old backup id " + convert(backupid) + " for client \"" + clientname
 				+ "\" because this id already exists in the current database.", LL_WARNING);
 			++stats.missing_backups_skipped;
 			continue;
@@ -799,8 +819,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 		{
 			if (row_exists_id(db, "clients", old_clientid))
 			{
-				pause_cursor_progress(progress);
-				Server->Log("Skipping old backup id " + convert(backupid) + " for missing client \"" + clientname
+				log_with_cursor_progress(progress, "Skipping old backup id " + convert(backupid) + " for missing client \"" + clientname
 					+ "\" because old client id " + convert(old_clientid) + " already exists with another name.", LL_WARNING);
 				++stats.missing_backups_skipped;
 				continue;
@@ -823,8 +842,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 			}
 		}
 
-		pause_cursor_progress(progress);
-		Server->Log(std::string(apply ? "Importing" : "Would import") + " file backup id "
+		log_with_cursor_progress(progress, std::string(apply ? "Importing" : "Would import") + " file backup id "
 			+ convert(backupid) + " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_INFO);
 
 		if (apply)
@@ -845,7 +863,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 			++stats.missing_backups_imported;
 		}
 	}
-	draw_cursor_progress(progress, stats.old_backups_seen, "done", true);
+	finish_cursor_progress(progress, stats.old_backups_seen, "done");
 
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
@@ -897,8 +915,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 			++stats.paths_to_migrate;
 			if (stats.paths_to_migrate <= 20)
 			{
-				pause_cursor_progress(progress);
-				Server->Log(std::string(apply ? "Migrating" : "Would migrate") + " file path id "
+				log_with_cursor_progress(progress, std::string(apply ? "Migrating" : "Would migrate") + " file path id "
 					+ row["id"] + " from \"" + fullpath + "\" to \"" + migrated_fullpath + "\"", LL_INFO);
 			}
 			if (apply)
@@ -918,7 +935,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 			}
 		}
 	}
-	draw_cursor_progress(progress, processed_rows, "done", true);
+	finish_cursor_progress(progress, processed_rows, "done");
 
 	if (q_update != NULL)
 	{
@@ -973,8 +990,7 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 			++stats.missing_files;
 			if (stats.missing_files <= 20)
 			{
-				pause_cursor_progress(progress);
-				Server->Log(std::string(apply ? "Removing" : "Would remove") + " missing file row id "
+				log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove") + " missing file row id "
 					+ row["id"] + " backupid " + row["backupid"]
 					+ " client \"" + row["clientname"] + "\""
 					+ " clientid " + row["clientid"]
@@ -1000,7 +1016,7 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 			}
 		}
 	}
-	draw_cursor_progress(progress, processed_rows, "done", true);
+	finish_cursor_progress(progress, processed_rows, "done");
 
 	if (q_delete != NULL)
 	{
@@ -1042,8 +1058,7 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["path"], false);
 
 		++stats.empty_backups;
-		pause_cursor_progress(progress);
-		Server->Log(std::string(apply ? "Removing" : "Would remove") + " empty file backup id "
+		log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove") + " empty file backup id "
 			+ row["id"] + " client \"" + row["clientname"] + "\" path \"" + row["path"] + "\"", LL_INFO);
 		if (apply)
 		{
@@ -1059,7 +1074,7 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 			++stats.empty_backups_removed;
 		}
 	}
-	draw_cursor_progress(progress, processed_rows, "done", true);
+	finish_cursor_progress(progress, processed_rows, "done");
 
 	if (q_delete != NULL)
 	{
