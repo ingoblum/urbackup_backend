@@ -965,9 +965,10 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 	SCursorProgress progress("Checking missing file rows", 0);
 
 	IDatabaseCursor* cursor = db_files->Prepare(
-		"SELECT f.id AS id, f.backupid AS backupid, f.fullpath AS fullpath, f.hashpath AS hashpath, "
-		"f.filesize AS filesize, f.clientid AS clientid, f.incremental AS incremental, "
-		"c.name AS clientname, b.path AS backuppath "
+		"SELECT f.id AS file_id, f.backupid AS file_backupid, f.fullpath AS file_fullpath, "
+		"f.hashpath AS file_hashpath, f.filesize AS file_filesize, "
+		"f.clientid AS file_clientid, f.incremental AS file_incremental, "
+		"c.name AS client_name, b.path AS backup_path "
 		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
 		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
 
@@ -982,28 +983,28 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 	while (cursor->next(row))
 	{
 		++processed_rows;
-		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["backuppath"], false);
+		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
 
-		const std::string physical_path = migrate_storage_path(row["fullpath"], new_storage_prefix, row["clientname"], row["backuppath"]);
+		const std::string physical_path = migrate_storage_path(row["file_fullpath"], new_storage_prefix, row["client_name"], row["backup_path"]);
 		if (!path_exists(physical_path))
 		{
 			++stats.missing_files;
 			if (stats.missing_files <= 20)
 			{
 				log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove") + " missing file row id "
-					+ row["id"] + " backupid " + row["backupid"]
-					+ " client \"" + row["clientname"] + "\""
-					+ " clientid " + row["clientid"]
-					+ " backup path \"" + row["backuppath"] + "\""
-					+ " incremental " + row["incremental"]
-					+ " filesize " + row["filesize"]
-					+ " stored fullpath \"" + row["fullpath"] + "\""
+					+ row["file_id"] + " backupid " + row["file_backupid"]
+					+ " client \"" + row["client_name"] + "\""
+					+ " clientid " + row["file_clientid"]
+					+ " backup path \"" + row["backup_path"] + "\""
+					+ " incremental " + row["file_incremental"]
+					+ " filesize " + row["file_filesize"]
+					+ " stored fullpath \"" + row["file_fullpath"] + "\""
 					+ " expected physical path \"" + physical_path + "\""
-					+ " hashpath \"" + row["hashpath"] + "\"", LL_INFO);
+					+ " hashpath \"" + row["file_hashpath"] + "\"", LL_INFO);
 			}
 			if (apply)
 			{
-				q_delete->Bind(watoi64(row["id"]));
+				q_delete->Bind(watoi64(row["file_id"]));
 				if (!q_delete->Write())
 				{
 					pause_cursor_progress(progress);
