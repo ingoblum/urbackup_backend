@@ -17,6 +17,7 @@
 #include "../../stringtools.h"
 
 #include <algorithm>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <set>
@@ -66,6 +67,23 @@ struct SCopyProgress
 	_i64 copied_bytes;
 	_i64 last_progress_bytes;
 	int64 last_log_time;
+};
+
+struct SCursorProgress
+{
+	SCursorProgress(const std::string& label, _i64 total)
+		: label(label), total(total), current(0), last_current(0),
+		last_time(0), max_line_length(0), drawn(false)
+	{
+	}
+
+	std::string label;
+	_i64 total;
+	_i64 current;
+	_i64 last_current;
+	int64 last_time;
+	size_t max_line_length;
+	bool drawn;
 };
 
 std::string strip_trailing_sep(std::string path)
@@ -206,6 +224,101 @@ void log_copy_progress(SCopyProgress& progress, const std::string& curr_file, bo
 
 	progress.last_progress_bytes = progress.copied_bytes;
 	progress.last_log_time = curr_time;
+}
+
+void pause_cursor_progress(SCursorProgress& progress)
+{
+	if (progress.drawn)
+	{
+		std::cout << std::endl;
+		progress.drawn = false;
+		progress.max_line_length = 0;
+	}
+}
+
+void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force)
+{
+	const int64 curr_time = Server->getTimeMS();
+	const int64 passed_time = curr_time - progress.last_time;
+	if (!force && passed_time < 1000)
+	{
+		return;
+	}
+
+	const _i64 new_rows = current - progress.last_current;
+	const int64 rows_per_second = passed_time > 0 ? (new_rows * 1000) / passed_time : 0;
+	std::string line;
+	if (progress.total > 0)
+	{
+		const float pc_done = static_cast<float>(current) / static_cast<float>(progress.total);
+		const size_t draw_segments = 30;
+		size_t segments = static_cast<size_t>(pc_done * draw_segments);
+		if (segments > draw_segments)
+		{
+			segments = draw_segments;
+		}
+
+		line = "\r[";
+		for (size_t i = 0; i < draw_segments; ++i)
+		{
+			if (i < segments)
+			{
+				line += "=";
+			}
+			else if (i == segments && current < progress.total)
+			{
+				line += ">";
+			}
+			else
+			{
+				line += " ";
+			}
+		}
+
+		int pc = static_cast<int>(pc_done * 100.f);
+		if (pc > 100)
+		{
+			pc = 100;
+		}
+
+		line += "] " + convert(pc) + "% " + progress.label
+			+ " " + convert(current) + "/" + convert(progress.total)
+			+ " rows, " + convert(rows_per_second) + " rows/s";
+	}
+	else
+	{
+		line = "\r" + progress.label + " " + convert(current)
+			+ " rows, " + convert(rows_per_second) + " rows/s";
+	}
+
+	if (!detail.empty())
+	{
+		line += " " + detail;
+	}
+
+	if (line.size() > progress.max_line_length)
+	{
+		progress.max_line_length = line.size();
+	}
+	while (line.size() < progress.max_line_length)
+	{
+		line += " ";
+	}
+
+	std::cout << line;
+	std::cout.flush();
+
+	progress.current = current;
+	progress.last_current = current;
+	progress.last_time = curr_time;
+	progress.drawn = true;
+
+	if (force)
+	{
+		std::cout << std::endl;
+		progress.drawn = false;
+		progress.max_line_length = 0;
+	}
 }
 
 std::string migrate_storage_path(const std::string& path,
@@ -581,9 +694,14 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 	IQuery* q_insert = db_files->Prepare("INSERT INTO files (" + column_list(file_columns, "")
 		+ ") VALUES (" + bind_list(file_columns.size()) + ")", false);
 
+	SCursorProgress progress("Importing file rows for backup " + convert(backupid), file_count);
+	_i64 processed_rows = 0;
 	db_single_result row;
 	while (cursor->next(row))
 	{
+		++processed_rows;
+		draw_cursor_progress(progress, processed_rows, clientname + "/" + backup_path, false);
+
 		std::map<std::string, std::string> overrides;
 		if (row.find("fullpath") != row.end())
 		{
@@ -597,6 +715,7 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 		bind_row(q_insert, file_columns, row, overrides);
 		if (!q_insert->Write())
 		{
+			pause_cursor_progress(progress);
 			db_files->destroyQuery(q_insert);
 			cursor->shutdown();
 			return false;
@@ -604,6 +723,7 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 		q_insert->Reset();
 		++stats.file_rows_imported;
 	}
+	draw_cursor_progress(progress, processed_rows, clientname + "/" + backup_path, true);
 
 	db_files->destroyQuery(q_insert);
 	const bool ret = !cursor->has_error();
@@ -633,6 +753,11 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 		where = " WHERE c.name=" + sql_string(client_filter);
 	}
 
+	db_results count_res = db->Read("SELECT COUNT(*) AS c FROM old_main.backups b "
+		"INNER JOIN old_main.clients c ON c.id=b.clientid" + where);
+	const _i64 old_backup_count = count_res.empty() ? 0 : watoi64(count_res[0]["c"]);
+	SCursorProgress progress("Scanning old file backups", old_backup_count);
+
 	IDatabaseCursor* cursor = db->Prepare("SELECT " + column_list(backup_columns, "b")
 		+ ", c.name AS clientname FROM old_main.backups b INNER JOIN old_main.clients c ON c.id=b.clientid"
 		+ where + " ORDER BY c.name, b.id")->Cursor();
@@ -641,6 +766,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 	while (cursor->next(row))
 	{
 		++stats.old_backups_seen;
+		draw_cursor_progress(progress, stats.old_backups_seen, row["clientname"] + "/" + row["path"], false);
 
 		const int64 backupid = watoi64(row["id"]);
 		const int64 old_clientid = watoi64(row["clientid"]);
@@ -661,6 +787,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 
 		if (row_exists_id(db, "backups", backupid))
 		{
+			pause_cursor_progress(progress);
 			Server->Log("Skipping old backup id " + convert(backupid) + " for client \"" + clientname
 				+ "\" because this id already exists in the current database.", LL_WARNING);
 			++stats.missing_backups_skipped;
@@ -672,6 +799,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 		{
 			if (row_exists_id(db, "clients", old_clientid))
 			{
+				pause_cursor_progress(progress);
 				Server->Log("Skipping old backup id " + convert(backupid) + " for missing client \"" + clientname
 					+ "\" because old client id " + convert(old_clientid) + " already exists with another name.", LL_WARNING);
 				++stats.missing_backups_skipped;
@@ -695,6 +823,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 			}
 		}
 
+		pause_cursor_progress(progress);
 		Server->Log(std::string(apply ? "Importing" : "Would import") + " file backup id "
 			+ convert(backupid) + " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_INFO);
 
@@ -716,6 +845,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 			++stats.missing_backups_imported;
 		}
 	}
+	draw_cursor_progress(progress, stats.old_backups_seen, "done", true);
 
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
@@ -737,6 +867,8 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 		where = " WHERE c.name=" + sql_string(client_filter);
 	}
 
+	SCursorProgress progress("Checking current file paths", 0);
+
 	IDatabaseCursor* cursor = db_files->Prepare(
 		"SELECT f.id AS id, f.fullpath AS fullpath, f.hashpath AS hashpath, c.name AS clientname, b.path AS backuppath "
 		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
@@ -749,8 +881,12 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 	}
 
 	db_single_result row;
+	_i64 processed_rows = 0;
 	while (cursor->next(row))
 	{
+		++processed_rows;
+		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["backuppath"], false);
+
 		const std::string fullpath = row["fullpath"];
 		const std::string hashpath = row["hashpath"];
 		const std::string migrated_fullpath = migrate_storage_path(fullpath, new_storage_prefix, row["clientname"], row["backuppath"]);
@@ -761,6 +897,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 			++stats.paths_to_migrate;
 			if (stats.paths_to_migrate <= 20)
 			{
+				pause_cursor_progress(progress);
 				Server->Log(std::string(apply ? "Migrating" : "Would migrate") + " file path id "
 					+ row["id"] + " from \"" + fullpath + "\" to \"" + migrated_fullpath + "\"", LL_INFO);
 			}
@@ -771,6 +908,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 				q_update->Bind(watoi64(row["id"]));
 				if (!q_update->Write())
 				{
+					pause_cursor_progress(progress);
 					db_files->destroyQuery(q_update);
 					cursor->shutdown();
 					return false;
@@ -780,6 +918,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 			}
 		}
 	}
+	draw_cursor_progress(progress, processed_rows, "done", true);
 
 	if (q_update != NULL)
 	{
@@ -806,6 +945,8 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 		where = " WHERE c.name=" + sql_string(client_filter);
 	}
 
+	SCursorProgress progress("Checking missing file rows", 0);
+
 	IDatabaseCursor* cursor = db_files->Prepare(
 		"SELECT f.id AS id, f.backupid AS backupid, f.fullpath AS fullpath, f.hashpath AS hashpath, "
 		"f.filesize AS filesize, f.clientid AS clientid, f.incremental AS incremental, "
@@ -820,14 +961,19 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 	}
 
 	db_single_result row;
+	_i64 processed_rows = 0;
 	while (cursor->next(row))
 	{
+		++processed_rows;
+		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["backuppath"], false);
+
 		const std::string physical_path = migrate_storage_path(row["fullpath"], new_storage_prefix, row["clientname"], row["backuppath"]);
 		if (!path_exists(physical_path))
 		{
 			++stats.missing_files;
 			if (stats.missing_files <= 20)
 			{
+				pause_cursor_progress(progress);
 				Server->Log(std::string(apply ? "Removing" : "Would remove") + " missing file row id "
 					+ row["id"] + " backupid " + row["backupid"]
 					+ " client \"" + row["clientname"] + "\""
@@ -844,6 +990,7 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 				q_delete->Bind(watoi64(row["id"]));
 				if (!q_delete->Write())
 				{
+					pause_cursor_progress(progress);
 					db_files->destroyQuery(q_delete);
 					cursor->shutdown();
 					return false;
@@ -853,6 +1000,7 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 			}
 		}
 	}
+	draw_cursor_progress(progress, processed_rows, "done", true);
 
 	if (q_delete != NULL)
 	{
@@ -872,6 +1020,11 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 		where += " AND c.name=" + sql_string(client_filter);
 	}
 
+	db_results count_res = db->Read("SELECT COUNT(*) AS c "
+		"FROM backups b INNER JOIN clients c ON c.id=b.clientid" + where);
+	const _i64 row_count = count_res.empty() ? 0 : watoi64(count_res[0]["c"]);
+	SCursorProgress progress("Checking empty file backups", row_count);
+
 	IDatabaseCursor* cursor = db->Prepare("SELECT b.id AS id, c.name AS clientname, b.path AS path "
 		"FROM backups b INNER JOIN clients c ON c.id=b.clientid" + where)->Cursor();
 
@@ -882,9 +1035,14 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 	}
 
 	db_single_result row;
+	_i64 processed_rows = 0;
 	while (cursor->next(row))
 	{
+		++processed_rows;
+		draw_cursor_progress(progress, processed_rows, row["clientname"] + "/" + row["path"], false);
+
 		++stats.empty_backups;
+		pause_cursor_progress(progress);
 		Server->Log(std::string(apply ? "Removing" : "Would remove") + " empty file backup id "
 			+ row["id"] + " client \"" + row["clientname"] + "\" path \"" + row["path"] + "\"", LL_INFO);
 		if (apply)
@@ -892,6 +1050,7 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 			q_delete->Bind(watoi64(row["id"]));
 			if (!q_delete->Write())
 			{
+				pause_cursor_progress(progress);
 				db->destroyQuery(q_delete);
 				cursor->shutdown();
 				return false;
@@ -900,6 +1059,7 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 			++stats.empty_backups_removed;
 		}
 	}
+	draw_cursor_progress(progress, processed_rows, "done", true);
 
 	if (q_delete != NULL)
 	{
