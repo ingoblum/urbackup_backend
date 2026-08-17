@@ -55,6 +55,19 @@ struct SStats
 	int64 empty_backups_removed;
 };
 
+struct SCopyProgress
+{
+	SCopyProgress()
+		: total_bytes(0), copied_bytes(0), last_progress_bytes(0), last_log_time(0)
+	{
+	}
+
+	_i64 total_bytes;
+	_i64 copied_bytes;
+	_i64 last_progress_bytes;
+	int64 last_log_time;
+};
+
 std::string strip_trailing_sep(std::string path)
 {
 	while (path.size() > 1
@@ -142,6 +155,57 @@ bool path_exists(const std::string& path)
 	}
 	const std::string prefixed = os_file_prefix(path);
 	return FileExists(prefixed) || os_directory_exists(prefixed);
+}
+
+bool get_file_size(const std::string& path, _i64& size)
+{
+	if (!FileExists(os_file_prefix(path)))
+	{
+		size = 0;
+		return true;
+	}
+
+	std::auto_ptr<IFile> f(Server->openFile(os_file_prefix(path), MODE_READ));
+	if (f.get() == NULL)
+	{
+		Server->Log("Could not open database file \"" + path + "\" for reading. " + os_last_error_str(), LL_ERROR);
+		return false;
+	}
+
+	size = f->Size();
+	if (size < 0)
+	{
+		size = 0;
+	}
+	return true;
+}
+
+void log_copy_progress(SCopyProgress& progress, const std::string& curr_file, bool force)
+{
+	if (progress.total_bytes <= 0)
+	{
+		return;
+	}
+
+	const int64 curr_time = Server->getTimeMS();
+	const int64 passed_time = curr_time - progress.last_log_time;
+	if (!force && passed_time < 1000)
+	{
+		return;
+	}
+
+	const _i64 new_bytes = progress.copied_bytes - progress.last_progress_bytes;
+	const std::string speed_str = passed_time > 0
+		? PrettyPrintSpeed(static_cast<size_t>((new_bytes * 1000) / passed_time))
+		: PrettyPrintSpeed(0);
+	const int pc_done = static_cast<int>((progress.copied_bytes * 100) / progress.total_bytes);
+
+	Server->Log("Database backup copy progress: " + convert(pc_done) + "% ("
+		+ PrettyPrintBytes(progress.copied_bytes) + " of " + PrettyPrintBytes(progress.total_bytes)
+		+ ", " + speed_str + ") current file \"" + curr_file + "\"", LL_INFO);
+
+	progress.last_progress_bytes = progress.copied_bytes;
+	progress.last_log_time = curr_time;
 }
 
 std::string migrate_storage_path(const std::string& path,
@@ -264,7 +328,7 @@ bool bind_row(IQuery* query, const std::vector<SColumn>& columns,
 	return true;
 }
 
-bool copy_existing_file(const std::string& src, const std::string& dst)
+bool copy_existing_file(const std::string& src, const std::string& dst, SCopyProgress& progress)
 {
 	if (!FileExists(os_file_prefix(src)))
 	{
@@ -311,6 +375,8 @@ bool copy_existing_file(const std::string& src, const std::string& dst)
 				return false;
 			}
 			written += curr;
+			progress.copied_bytes += curr;
+			log_copy_progress(progress, ExtractFileName(src), false);
 		}
 	}
 }
@@ -353,13 +419,28 @@ bool backup_current_database(const std::string& backup_database_dir)
 		"backup_server_settings.db-shm"
 	};
 
+	SCopyProgress progress;
 	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
 	{
-		if (!copy_existing_file(join_path(src_dir, names[i]), join_path(backup_database_dir, names[i])))
+		_i64 size = 0;
+		if (!get_file_size(join_path(src_dir, names[i]), size))
+		{
+			return false;
+		}
+		progress.total_bytes += size;
+	}
+
+	Server->Log("Backing up database files to \"" + backup_database_dir + "\" ("
+		+ PrettyPrintBytes(progress.total_bytes) + " total)", LL_INFO);
+
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+	{
+		if (!copy_existing_file(join_path(src_dir, names[i]), join_path(backup_database_dir, names[i]), progress))
 		{
 			return false;
 		}
 	}
+	log_copy_progress(progress, "complete", true);
 
 	if (!FileExists(os_file_prefix(join_path(backup_database_dir, "backup_server.db")))
 		|| !FileExists(os_file_prefix(join_path(backup_database_dir, "backup_server_files.db")))
