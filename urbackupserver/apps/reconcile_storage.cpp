@@ -37,6 +37,7 @@ struct SStats
 	SStats()
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
+		file_rows_reused(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
@@ -48,6 +49,7 @@ struct SStats
 	int64 missing_backups_skipped;
 	int64 file_rows_importable;
 	int64 file_rows_imported;
+	int64 file_rows_reused;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
 	int64 missing_files;
@@ -816,6 +818,7 @@ bool import_file_rows(IDatabase* db_main, int64 backupid,
 
 	IQuery* q_insert = db_main->Prepare("INSERT INTO curr_files.files (" + column_list(file_columns, "")
 		+ ") VALUES (" + bind_list(file_columns.size()) + ")", false);
+	IQuery* q_existing = db_main->Prepare("SELECT backupid, fullpath FROM curr_files.files WHERE id=?", false);
 
 	SCursorProgress progress("Importing file rows for backup " + convert(backupid), file_count);
 	_i64 processed_rows = 0;
@@ -835,10 +838,42 @@ bool import_file_rows(IDatabase* db_main, int64 backupid,
 			overrides["hashpath"] = migrate_storage_path(row["hashpath"], new_storage_prefix, clientname, backup_path);
 		}
 
+		if (row.find("id") != row.end())
+		{
+			q_existing->Bind(watoi64(row["id"]));
+			db_results existing_rows = q_existing->Read();
+			q_existing->Reset();
+			if (!existing_rows.empty())
+			{
+				const int64 existing_backupid = watoi64(existing_rows[0]["backupid"]);
+				if (existing_backupid == backupid)
+				{
+					++stats.file_rows_reused;
+					if (stats.file_rows_reused <= 20)
+					{
+						log_with_cursor_progress(progress, "Reusing existing file row id " + row["id"]
+							+ " for reimported backup id " + convert(backupid)
+							+ " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_INFO);
+					}
+					continue;
+				}
+
+				pause_cursor_progress(progress);
+				Server->Log("Cannot import file row id " + row["id"] + " for backup id " + convert(backupid)
+					+ " because the same file row id already belongs to backup id "
+					+ convert(existing_backupid) + " with fullpath \"" + existing_rows[0]["fullpath"] + "\"", LL_ERROR);
+				db_main->destroyQuery(q_existing);
+				db_main->destroyQuery(q_insert);
+				cursor->shutdown();
+				return false;
+			}
+		}
+
 		bind_row(q_insert, file_columns, row, overrides);
 		if (!q_insert->Write())
 		{
 			pause_cursor_progress(progress);
+			db_main->destroyQuery(q_existing);
 			db_main->destroyQuery(q_insert);
 			cursor->shutdown();
 			return false;
@@ -848,6 +883,7 @@ bool import_file_rows(IDatabase* db_main, int64 backupid,
 	}
 	finish_cursor_progress(progress, processed_rows, clientname + "/" + backup_path);
 
+	db_main->destroyQuery(q_existing);
 	db_main->destroyQuery(q_insert);
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
@@ -1328,6 +1364,10 @@ void log_summary(const SStats& stats, bool apply)
 		+ convert(apply ? stats.missing_backups_imported : stats.missing_backups_importable), LL_INFO);
 	Server->Log(std::string("  file rows ") + (apply ? "imported: " : "would import: ")
 		+ convert(apply ? stats.file_rows_imported : stats.file_rows_importable), LL_INFO);
+	if (apply || stats.file_rows_reused > 0)
+	{
+		Server->Log("  file rows reused: " + convert(stats.file_rows_reused), LL_INFO);
+	}
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
