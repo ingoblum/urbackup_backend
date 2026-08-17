@@ -27,9 +27,39 @@
 #include "server_settings.h"
 #include "../Interface/Server.h"
 #include "server.h"
+#include <stdint.h>
 
 IMutex *ServerSettings::g_mutex=NULL;
 std::map<int, SSettings*> ServerSettings::g_settings_cache;
+
+namespace
+{
+	std::string ptrToString(const void* ptr)
+	{
+		return "0x" + bytesToHex(reinterpret_cast<const unsigned char*>(&ptr), sizeof(ptr));
+	}
+
+	void logSettingsLifecycle(const std::string& event, int clientid, const SSettings* settings,
+		const std::string& details, int loglevel = LL_INFO)
+	{
+		std::string msg = "[settings-lifetime] event=" + event
+			+ " clientid=" + convert(clientid)
+			+ " settings_ptr=" + ptrToString(settings);
+
+		if (settings != NULL)
+		{
+			msg += " refcount=" + convert(settings->refcount)
+				+ " needs_update=" + convert(settings->needs_update ? 1 : 0);
+		}
+
+		if (!details.empty())
+		{
+			msg += " " + details;
+		}
+
+		Server->Log(msg, loglevel);
+	}
+}
 
 #ifndef DEFAULT_BACKUP_FOLDER
 #ifdef _WIN32
@@ -90,6 +120,8 @@ ServerSettings::ServerSettings(IDatabase *db, int pClientid)
 	{
 		++iter->second->refcount;
 		local_settings = iter->second;
+		logSettingsLifecycle("ctor-cache-hit", clientid, local_settings,
+			"server_settings_ptr=" + ptrToString(this));
 	}
 	else
 	{
@@ -110,6 +142,8 @@ ServerSettings::ServerSettings(IDatabase *db, int pClientid)
 		else
 		{
 			g_settings_cache.insert(std::make_pair(clientid, local_settings));
+			logSettingsLifecycle("ctor-cache-insert", clientid, local_settings,
+				"server_settings_ptr=" + ptrToString(this));
 		}
 	}	
 }
@@ -135,6 +169,12 @@ void ServerSettings::createSettingsReaders(IDatabase* db, int clientid, std::aut
 	}
 
 	settings_default.reset(Server->createDBMemSettingsReader(db, "settings", "SELECT key,value FROM settings_db.settings WHERE clientid="+convert(settings_default_id)));
+
+	Server->Log("[settings-lifetime] event=createSettingsReaders clientid=" + convert(clientid)
+		+ " settings_default_id=" + convert(settings_default_id)
+		+ " reader_client=" + ptrToString(settings_client.get())
+		+ " reader_default=" + ptrToString(settings_default.get())
+		+ " reader_global=" + ptrToString(settings_global.get()), LL_INFO);
 }
 
 ServerSettings::~ServerSettings(void)
@@ -143,6 +183,8 @@ ServerSettings::~ServerSettings(void)
 		IScopedLock lock(g_mutex);
 
 		assert(local_settings->refcount > 0);
+		logSettingsLifecycle("dtor-before-dec", clientid, local_settings,
+			"server_settings_ptr=" + ptrToString(this));
 		--local_settings->refcount;
 
 		if (local_settings->refcount == 0)
@@ -165,8 +207,20 @@ ServerSettings::~ServerSettings(void)
 					g_settings_cache.erase(iter);
 				}
 
+				logSettingsLifecycle("dtor-delete-needs-update", clientid, local_settings,
+					"server_settings_ptr=" + ptrToString(this));
 				delete local_settings;
 			}
+			else
+			{
+				logSettingsLifecycle("dtor-refcount-zero-keep-cache", clientid, local_settings,
+					"server_settings_ptr=" + ptrToString(this));
+			}
+		}
+		else
+		{
+			logSettingsLifecycle("dtor-after-dec", clientid, local_settings,
+				"server_settings_ptr=" + ptrToString(this));
 		}
 	}
 }
@@ -187,6 +241,7 @@ void ServerSettings::updateAll(void)
 		}
 		else
 		{
+			logSettingsLifecycle("updateAll-mark-needs-update", it->first, it->second, "");
 			it->second->needs_update=true;
 			++it;
 		}
@@ -207,6 +262,7 @@ void ServerSettings::updateClient(int clientid)
 		}
 		else
 		{
+			logSettingsLifecycle("updateClient-mark-needs-update", clientid, it->second, "");
 			it->second->needs_update = true;
 		}
 	}
@@ -216,6 +272,9 @@ void ServerSettings::update(bool force_update)
 {
 	while(local_settings->needs_update || force_update)
 	{
+		logSettingsLifecycle("update-begin", clientid, local_settings,
+			"server_settings_ptr=" + ptrToString(this)
+			+ " force_update=" + convert(force_update ? 1 : 0));
 		force_update = false;
 
 		IScopedLock lock(g_mutex);
@@ -224,6 +283,8 @@ void ServerSettings::update(bool force_update)
 
 		assert(local_settings->refcount > 0);
 		--local_settings->refcount;
+		logSettingsLifecycle("update-after-dec", clientid, local_settings,
+			"server_settings_ptr=" + ptrToString(this));
 
 		if (local_settings->refcount == 0)
 		{
@@ -239,11 +300,13 @@ void ServerSettings::update(bool force_update)
 				if (iter != g_settings_cache.end()
 					&& iter->second != local_settings)
 				{
-					delete local_settings;
-					++iter->second->refcount;
-					local_settings = iter->second;
-					continue;
-				}
+				delete local_settings;
+				++iter->second->refcount;
+				local_settings = iter->second;
+				logSettingsLifecycle("update-switch-existing-cache", clientid, local_settings,
+					"server_settings_ptr=" + ptrToString(this));
+				continue;
+			}
 				else
 				{
 					delete local_settings;
@@ -257,6 +320,8 @@ void ServerSettings::update(bool force_update)
 		{
 			++iter->second->refcount;
 			local_settings = iter->second;
+			logSettingsLifecycle("update-reuse-existing-cache", clientid, local_settings,
+				"server_settings_ptr=" + ptrToString(this));
 			continue;
 		}
 
@@ -274,12 +339,16 @@ void ServerSettings::update(bool force_update)
 			|| iter->second == old_local_settings)
 		{
 			g_settings_cache[clientid] = local_settings;
+			logSettingsLifecycle("update-installed-new-settings", clientid, local_settings,
+				"server_settings_ptr=" + ptrToString(this));
 		}
 		else
 		{
 			delete local_settings;
 			++iter->second->refcount;
 			local_settings = iter->second;
+			logSettingsLifecycle("update-lost-race-reuse-cache", clientid, local_settings,
+				"server_settings_ptr=" + ptrToString(this));
 		}
 	}
 }
@@ -1268,6 +1337,8 @@ void ServerSettings::readSettings()
 	local_settings = new SSettings();
 	local_settings->refcount = 1;
 	local_settings->clientid = clientid;
+	logSettingsLifecycle("readSettings-begin", clientid, local_settings,
+		"server_settings_ptr=" + ptrToString(this));
 	std::auto_ptr<ISettingsReader> settings_client, settings_default, settings_global;
 	int settings_default_id;
 
@@ -1296,6 +1367,10 @@ void ServerSettings::readSettings()
 	}
 
 	db->destroyQuery(q_get_client_setting);
+	logSettingsLifecycle("readSettings-end", clientid_backup, local_settings,
+		"server_settings_ptr=" + ptrToString(this)
+		+ " backupfolder=" + local_settings->backupfolder
+		+ " tmpdir=" + local_settings->tmpdir);
 }
 
 namespace
@@ -1560,4 +1635,3 @@ std::map<std::string, ServerSettings::SClientSetting> ServerSettings::getClientS
 }
 
 #endif //CLIENT_ONLY
-

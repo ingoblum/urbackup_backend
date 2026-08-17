@@ -28,11 +28,17 @@
 #include "server_status.h"
 #include "server_cleanup.h"
 #include "LogReport.h"
+#include <stdint.h>
 
 extern IUrlFactory *url_fak;
 
 namespace
 {
+	std::string ptrToString(const void* ptr)
+	{
+		return "0x" + bytesToHex(reinterpret_cast<const unsigned char*>(&ptr), sizeof(ptr));
+	}
+
 	class DelayedWakeup : public IThread
 	{
 	public:
@@ -70,6 +76,13 @@ void Backup::operator()()
 	logid = ServerLogger::getLogId(clientid);
 	db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
 	server_settings.reset(new ServerSettings(db, clientid));
+	ServerLogger::Log(logid, "[settings-lifetime] event=backup-start clientid=" + convert(clientid)
+		+ " clientname=" + clientname
+		+ " backup_type=" + std::string(is_file_backup ? "file" : "image")
+		+ " incremental=" + convert(r_incremental ? 1 : 0)
+		+ " resumed=" + convert(r_resumed ? 1 : 0)
+		+ " server_settings_ptr=" + ptrToString(server_settings.get())
+		+ " settings_ptr=" + ptrToString(server_settings->getSettings()), LL_INFO);
 	ScopedFreeObjRef<ServerBackupDao*> backup_dao_free(backup_dao);
 	backup_dao = new ServerBackupDao(db);
 
@@ -152,6 +165,16 @@ void Backup::operator()()
 	{
 		saveClientLogdata(is_file_backup?0:1, r_incremental?1:0, backup_result && !has_early_error, r_resumed); 
 	}
+
+	ServerLogger::Log(logid, "[settings-lifetime] event=backup-end clientid=" + convert(clientid)
+		+ " clientname=" + clientname
+		+ " backup_type=" + std::string(is_file_backup ? "file" : "image")
+		+ " incremental=" + convert(r_incremental ? 1 : 0)
+		+ " result=" + convert(backup_result ? 1 : 0)
+		+ " early_error=" + convert(has_early_error ? 1 : 0)
+		+ " issues=" + convert(static_cast<int64>(num_issues))
+		+ " server_settings_ptr=" + ptrToString(server_settings.get())
+		+ " settings_ptr=" + ptrToString(server_settings->getSettings()), LL_INFO);
 
 	ServerLogger::reset(logid);	
 	ServerStatus::stopProcess(clientname, status_id);
