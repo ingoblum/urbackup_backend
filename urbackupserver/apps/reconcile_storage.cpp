@@ -807,7 +807,9 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 	}
 
 	IDatabaseCursor* cursor = db_files->Prepare(
-		"SELECT f.id AS id, f.fullpath AS fullpath, c.name AS clientname, b.path AS backuppath "
+		"SELECT f.id AS id, f.backupid AS backupid, f.fullpath AS fullpath, f.hashpath AS hashpath, "
+		"f.filesize AS filesize, f.clientid AS clientid, f.incremental AS incremental, "
+		"c.name AS clientname, b.path AS backuppath "
 		"FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
 		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
 
@@ -827,7 +829,15 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 			if (stats.missing_files <= 20)
 			{
 				Server->Log(std::string(apply ? "Removing" : "Would remove") + " missing file row id "
-					+ row["id"] + " path \"" + physical_path + "\"", LL_INFO);
+					+ row["id"] + " backupid " + row["backupid"]
+					+ " client \"" + row["clientname"] + "\""
+					+ " clientid " + row["clientid"]
+					+ " backup path \"" + row["backuppath"] + "\""
+					+ " incremental " + row["incremental"]
+					+ " filesize " + row["filesize"]
+					+ " stored fullpath \"" + row["fullpath"] + "\""
+					+ " expected physical path \"" + physical_path + "\""
+					+ " hashpath \"" + row["hashpath"] + "\"", LL_INFO);
 			}
 			if (apply)
 			{
