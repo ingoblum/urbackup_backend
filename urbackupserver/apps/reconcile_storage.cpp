@@ -782,7 +782,7 @@ bool insert_backup_from_old(IDatabase* db, const db_single_result& old_backup,
 	return ret;
 }
 
-bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
+bool import_file_rows(IDatabase* db_main, int64 backupid,
 	const std::vector<SColumn>& file_columns, const std::string& new_storage_prefix,
 	const std::string& clientname, const std::string& backup_path, bool apply, SStats& stats)
 {
@@ -798,7 +798,7 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 	IDatabaseCursor* cursor = db_main->Prepare("SELECT " + column_list(file_columns, "")
 		+ " FROM old_files.files WHERE backupid=" + convert(backupid))->Cursor();
 
-	IQuery* q_insert = db_files->Prepare("INSERT INTO files (" + column_list(file_columns, "")
+	IQuery* q_insert = db_main->Prepare("INSERT INTO curr_files.files (" + column_list(file_columns, "")
 		+ ") VALUES (" + bind_list(file_columns.size()) + ")", false);
 
 	SCursorProgress progress("Importing file rows for backup " + convert(backupid), file_count);
@@ -823,7 +823,7 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 		if (!q_insert->Write())
 		{
 			pause_cursor_progress(progress);
-			db_files->destroyQuery(q_insert);
+			db_main->destroyQuery(q_insert);
 			cursor->shutdown();
 			return false;
 		}
@@ -832,13 +832,13 @@ bool import_file_rows(IDatabase* db_files, IDatabase* db_main, int64 backupid,
 	}
 	finish_cursor_progress(progress, processed_rows, clientname + "/" + backup_path);
 
-	db_files->destroyQuery(q_insert);
+	db_main->destroyQuery(q_insert);
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
 	return ret;
 }
 
-bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::string& client_filter,
+bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 	const std::string& new_storage_prefix, bool apply, SStats& stats)
 {
 	std::vector<SColumn> backup_columns = intersect_columns(table_columns(db, "main", "backups"),
@@ -939,7 +939,7 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 				cursor->shutdown();
 				return false;
 			}
-			if (!import_file_rows(db_files, db, backupid, file_columns, new_storage_prefix,
+			if (!import_file_rows(db, backupid, file_columns, new_storage_prefix,
 				clientname, backup_path, true, stats))
 			{
 				Server->Log("Could not import file rows for backup id " + convert(backupid), LL_ERROR);
@@ -956,15 +956,9 @@ bool reconcile_missing_backups(IDatabase* db, IDatabase* db_files, const std::st
 	return ret;
 }
 
-bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::string& client_filter,
+bool migrate_current_file_paths(IDatabase* db, const std::string& client_filter,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
-	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
-	{
-		Server->Log("Could not attach current backup_server.db to files database.", LL_ERROR);
-		return false;
-	}
-
 	std::string where;
 	if (!client_filter.empty())
 	{
@@ -973,14 +967,14 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 
 	SCursorProgress progress("Checking current file paths", 0);
 
-	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
-		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
-		"INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
+	IDatabaseCursor* cursor = db->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM curr_files.files f INNER JOIN backups b ON b.id=f.backupid "
+		"INNER JOIN clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_update = NULL;
 	if (apply)
 	{
-		q_update = db_files->Prepare("UPDATE files SET fullpath=?, hashpath=? WHERE id=?", false);
+		q_update = db->Prepare("UPDATE curr_files.files SET fullpath=?, hashpath=? WHERE id=?", false);
 	}
 
 	db_single_result row;
@@ -1026,7 +1020,7 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 				if (!q_update->Write())
 				{
 					pause_cursor_progress(progress);
-					db_files->destroyQuery(q_update);
+					db->destroyQuery(q_update);
 					cursor->shutdown();
 					return false;
 				}
@@ -1039,9 +1033,8 @@ bool migrate_current_file_paths(IDatabase* db, IDatabase* db_files, const std::s
 
 	if (q_update != NULL)
 	{
-		db_files->destroyQuery(q_update);
+		db->destroyQuery(q_update);
 	}
-	db_files->Write("DETACH DATABASE main_db");
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
 	return ret;
@@ -1061,7 +1054,7 @@ std::string file_validation_select_columns()
 		"quote(f.filesize) AS file_filesize_quoted, quote(f.clientid) AS file_clientid_quoted, "
 		"quote(f.incremental) AS file_incremental_quoted, "
 		"c.id AS backup_clientid, c.name AS client_name, b.path AS backup_path, "
-		"EXISTS(SELECT 1 FROM files_incoming_stat s WHERE s.id=f.id "
+		"EXISTS(SELECT 1 FROM curr_files.files_incoming_stat s WHERE s.id=f.id "
 		"AND f.backupid=s.filesize AND f.fullpath=CAST(s.clientid AS TEXT) "
 		"AND f.shahash=s.backupid AND f.filesize=s.existing_clients "
 		"AND f.created=s.direction AND f.rsize=s.incremental "
@@ -1086,14 +1079,8 @@ std::string malformed_file_row_log_message(const db_single_result& row, const st
 		+ " incoming_stat_match " + row.find("incoming_stat_match")->second;
 }
 
-bool remove_malformed_file_rows(IDatabase* db_files, const std::string& client_filter, bool apply, SStats& stats)
+bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
 {
-	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
-	{
-		Server->Log("Could not attach current backup_server.db to files database.", LL_ERROR);
-		return false;
-	}
-
 	std::string where;
 	if (!client_filter.empty())
 	{
@@ -1101,14 +1088,14 @@ bool remove_malformed_file_rows(IDatabase* db_files, const std::string& client_f
 	}
 
 	SCursorProgress progress("Checking malformed file rows", 0);
-	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
-		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
-		+ "INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
+	IDatabaseCursor* cursor = db->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM curr_files.files f INNER JOIN backups b ON b.id=f.backupid "
+		+ "INNER JOIN clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_delete = NULL;
 	if (apply)
 	{
-		q_delete = db_files->Prepare("DELETE FROM files WHERE id=?", false);
+		q_delete = db->Prepare("DELETE FROM curr_files.files WHERE id=?", false);
 	}
 
 	db_single_result row;
@@ -1132,9 +1119,8 @@ bool remove_malformed_file_rows(IDatabase* db_files, const std::string& client_f
 				if (!q_delete->Write())
 				{
 					pause_cursor_progress(progress);
-					db_files->destroyQuery(q_delete);
+					db->destroyQuery(q_delete);
 					cursor->shutdown();
-					db_files->Write("DETACH DATABASE main_db");
 					return false;
 				}
 				q_delete->Reset();
@@ -1146,23 +1132,16 @@ bool remove_malformed_file_rows(IDatabase* db_files, const std::string& client_f
 
 	if (q_delete != NULL)
 	{
-		db_files->destroyQuery(q_delete);
+		db->destroyQuery(q_delete);
 	}
-	db_files->Write("DETACH DATABASE main_db");
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
 	return ret;
 }
 
-bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_filter,
+bool remove_missing_file_rows(IDatabase* db, const std::string& client_filter,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
-	if (!db_files->Write("ATTACH DATABASE 'urbackup/backup_server.db' AS main_db"))
-	{
-		Server->Log("Could not attach current backup_server.db to files database.", LL_ERROR);
-		return false;
-	}
-
 	std::string where;
 	if (!client_filter.empty())
 	{
@@ -1171,14 +1150,14 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 
 	SCursorProgress progress("Checking missing file rows", 0);
 
-	IDatabaseCursor* cursor = db_files->Prepare("SELECT " + file_validation_select_columns()
-		+ " FROM files f INNER JOIN main_db.backups b ON b.id=f.backupid "
-		+ "INNER JOIN main_db.clients c ON c.id=b.clientid" + where)->Cursor();
+	IDatabaseCursor* cursor = db->Prepare("SELECT " + file_validation_select_columns()
+		+ " FROM curr_files.files f INNER JOIN backups b ON b.id=f.backupid "
+		+ "INNER JOIN clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_delete = NULL;
 	if (apply)
 	{
-		q_delete = db_files->Prepare("DELETE FROM files WHERE id=?", false);
+		q_delete = db->Prepare("DELETE FROM curr_files.files WHERE id=?", false);
 	}
 
 	db_single_result row;
@@ -1226,7 +1205,7 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 				if (!q_delete->Write())
 				{
 					pause_cursor_progress(progress);
-					db_files->destroyQuery(q_delete);
+					db->destroyQuery(q_delete);
 					cursor->shutdown();
 					return false;
 				}
@@ -1239,9 +1218,8 @@ bool remove_missing_file_rows(IDatabase* db_files, const std::string& client_fil
 
 	if (q_delete != NULL)
 	{
-		db_files->destroyQuery(q_delete);
+		db->destroyQuery(q_delete);
 	}
-	db_files->Write("DETACH DATABASE main_db");
 	const bool ret = !cursor->has_error();
 	cursor->shutdown();
 	return ret;
@@ -1381,10 +1359,9 @@ int reconcile_storage()
 	open_settings_database();
 
 	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
-	IDatabase* db_files = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES);
-	if (db == NULL || db_files == NULL)
+	if (db == NULL)
 	{
-		Server->Log("Could not open current UrBackup databases", LL_ERROR);
+		Server->Log("Could not open current UrBackup database", LL_ERROR);
 		return 1;
 	}
 
@@ -1416,14 +1393,28 @@ int reconcile_storage()
 
 	if (apply)
 	{
-		db->BeginWriteTransaction();
-		db_files->BeginWriteTransaction();
+		/*
+		reconcile-storage attaches backup_server_files.db as curr_files to the
+		main backup_server.db connection. A single BEGIN IMMEDIATE on this
+		connection is enough to make writes to both databases transactional.
+		Do not also open a write transaction on URBACKUPDB_SERVER_FILES here:
+		that is a second SQLite connection to the same physical
+		backup_server_files.db file and it can block on the write lock already
+		held by this connection. The externally visible symptom is an endless
+		SQLITE_BUSY loop on "BEGIN IMMEDIATE" even when reconcile-storage is the
+		only running urbackupsrv process.
+		*/
+		if (!db->BeginWriteTransaction())
+		{
+			Server->Log("Could not start reconcile-storage write transaction.", LL_ERROR);
+			return 1;
+		}
 	}
 
-	ok = ok && reconcile_missing_backups(db, db_files, client_filter, new_storage_prefix, apply, stats);
+	ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
 	if (remove_malformed_file_rows_enabled)
 	{
-		ok = ok && remove_malformed_file_rows(db_files, client_filter, apply, stats);
+		ok = ok && remove_malformed_file_rows(db, client_filter, apply, stats);
 	}
 	else
 	{
@@ -1433,7 +1424,7 @@ int reconcile_storage()
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
 	if (migrate_existing_file_paths)
 	{
-		ok = ok && migrate_current_file_paths(db, db_files, client_filter, new_storage_prefix, apply,
+		ok = ok && migrate_current_file_paths(db, client_filter, new_storage_prefix, apply,
 			report_malformed_rows_in_scan, stats);
 		report_malformed_rows_in_scan = false;
 	}
@@ -1443,7 +1434,7 @@ int reconcile_storage()
 	}
 	if (remove_missing_files)
 	{
-		ok = ok && remove_missing_file_rows(db_files, client_filter, new_storage_prefix, apply,
+		ok = ok && remove_missing_file_rows(db, client_filter, new_storage_prefix, apply,
 			report_malformed_rows_in_scan, stats);
 		report_malformed_rows_in_scan = false;
 	}
@@ -1464,12 +1455,10 @@ int reconcile_storage()
 	{
 		if (ok)
 		{
-			db_files->EndTransaction();
 			db->EndTransaction();
 		}
 		else
 		{
-			db_files->RollbackTransaction();
 			db->RollbackTransaction();
 		}
 	}
