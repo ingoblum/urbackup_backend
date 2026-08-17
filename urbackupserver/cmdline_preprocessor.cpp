@@ -1140,6 +1140,119 @@ int action_skiphash_copy(std::vector<std::string> args)
 	return run_real_main(real_args);
 }
 
+int action_reconcile_storage(std::vector<std::string> args)
+{
+	TCLAP::CmdLine cmd("Reconcile UrBackup database entries with migrated backup storage", ' ', cmdline_version);
+
+	TCLAP::ValueArg<std::string> old_db_dir_arg("", "old-db-dir",
+		"Directory containing the old UrBackup database files",
+		true, "", "path", cmd);
+
+	TCLAP::ValueArg<std::string> backup_database_arg("", "backup-database",
+		"Non-existing directory where the current UrBackup database files are backed up before the run",
+		false, "", "path", cmd);
+
+	TCLAP::ValueArg<std::string> new_storage_prefix_arg("", "new-storage-prefix",
+		"New backup storage prefix. Defaults to the configured backupfolder setting.",
+		false, "", "path", cmd);
+
+	TCLAP::ValueArg<std::string> client_arg("", "client",
+		"Only reconcile one client. Defaults to all clients.",
+		false, "", "client name", cmd);
+
+	TCLAP::SwitchArg apply_arg("", "apply",
+		"Apply database changes. Without this option the command only performs a dry-run.",
+		cmd, false);
+
+	TCLAP::SwitchArg dry_run_arg("", "dry-run",
+		"Perform a dry-run. This is the default unless --apply is specified.",
+		cmd, false);
+
+	TCLAP::SwitchArg skip_db_backup_arg("", "skip-db-backup",
+		"Skip the pre-run database backup. Intended for repeated test dry-runs only.",
+		cmd, false);
+
+	TCLAP::SwitchArg migrate_existing_file_paths_arg("", "migrate-existing-file-paths",
+		"Also scan and migrate existing file metadata paths in the current files database.",
+		cmd, false);
+
+	TCLAP::SwitchArg remove_missing_files_arg("", "remove-missing-files",
+		"Remove file metadata rows for files that are no longer physically present.",
+		cmd, false);
+
+	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
+		"Remove file backup rows that have no file metadata rows after reconciliation.",
+		cmd, false);
+
+	TCLAP::ValueArg<std::string> user_arg("u", "user",
+		"Change process to run as specific user",
+		false, "root", "user", cmd);
+
+	std::vector<std::string> real_args;
+	real_args.push_back(args[0]);
+
+	cmd.parse(args);
+
+	real_args.push_back("--no-server");
+	real_args.push_back("--workingdir");
+	real_args.push_back(VARDIR);
+	real_args.push_back("--user");
+	real_args.push_back(user_arg.getValue());
+	real_args.push_back("--loglevel");
+	real_args.push_back("debug");
+	real_args.push_back("--app");
+	real_args.push_back("reconcile_storage");
+	real_args.push_back("--old_db_dir");
+	real_args.push_back(old_db_dir_arg.getValue());
+	if(!backup_database_arg.getValue().empty())
+	{
+		real_args.push_back("--backup_database");
+		real_args.push_back(backup_database_arg.getValue());
+	}
+	if(!new_storage_prefix_arg.getValue().empty())
+	{
+		real_args.push_back("--new_storage_prefix");
+		real_args.push_back(new_storage_prefix_arg.getValue());
+	}
+	if(!client_arg.getValue().empty())
+	{
+		real_args.push_back("--client");
+		real_args.push_back(client_arg.getValue());
+	}
+	if(apply_arg.getValue())
+	{
+		real_args.push_back("--apply");
+		real_args.push_back("true");
+	}
+	if(dry_run_arg.getValue())
+	{
+		real_args.push_back("--dry_run");
+		real_args.push_back("true");
+	}
+	if(skip_db_backup_arg.getValue())
+	{
+		real_args.push_back("--skip_db_backup");
+		real_args.push_back("true");
+	}
+	if(migrate_existing_file_paths_arg.getValue())
+	{
+		real_args.push_back("--migrate_existing_file_paths");
+		real_args.push_back("true");
+	}
+	if(remove_missing_files_arg.getValue())
+	{
+		real_args.push_back("--remove_missing_files");
+		real_args.push_back("true");
+	}
+	if(drop_empty_backups_arg.getValue())
+	{
+		real_args.push_back("--drop_empty_backups");
+		real_args.push_back("true");
+	}
+
+	return run_real_main(real_args);
+}
+
 void action_help(std::string cmd)
 {
 	std::cout << std::endl;
@@ -1190,6 +1303,9 @@ void action_help(std::string cmd)
 	std::cout << "\t" << cmd << " skiphash-copy" << std::endl;
 	std::cout << "\t\t" "Copy a file to another file, using a hashes to copy only changed content" << std::endl;
 	std::cout << std::endl;
+	std::cout << "\t" << cmd << " reconcile-storage" << std::endl;
+	std::cout << "\t\t" "Reconcile migrated backup storage with an older UrBackup database backup" << std::endl;
+	std::cout << std::endl;
 }
 
 int main(int argc, char* argv[])
@@ -1232,6 +1348,8 @@ int main(int argc, char* argv[])
 	action_funs.push_back(action_blockalign);
 	actions.push_back("skiphash-copy");
 	action_funs.push_back(action_skiphash_copy);
+	actions.push_back("reconcile-storage");
+	action_funs.push_back(action_reconcile_storage);
 
 	bool has_help=false;
 	bool has_version=false;

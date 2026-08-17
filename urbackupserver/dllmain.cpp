@@ -79,6 +79,7 @@ SStartupStatus startup_status;
 #include "apps/repair_cmd.h"
 #include "apps/export_auth_log.h"
 #include "apps/skiphash_copy.h"
+#include "apps/reconcile_storage.h"
 #include "apps/patch.h"
 #include "create_files_index.h"
 #include "server_dir_links.h"
@@ -505,6 +506,10 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		{
 			rc=skiphash_copy_file();
 		}
+		else if(app=="reconcile_storage")
+		{
+			rc=reconcile_storage();
+		}
 		else if (app == "md5sum_check")
 		{
 			rc = md5sum_check();
@@ -533,7 +538,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		else
 		{
 			rc=100;
-			Server->Log("App not found. Available apps: cleanup, remove_unknown, cleanup_database, repair_database, defrag_database, export_auth_log, check_fileindex, skiphash_copy, md5sum_check, hash, blockalign");
+			Server->Log("App not found. Available apps: cleanup, remove_unknown, cleanup_database, repair_database, defrag_database, export_auth_log, check_fileindex, skiphash_copy, reconcile_storage, md5sum_check, hash, blockalign");
 		}
 		exit(rc);
 	}

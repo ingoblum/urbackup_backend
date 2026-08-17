@@ -439,8 +439,15 @@ int main_fkt(int argc, char *argv[])
 #endif
 
 #ifndef _WIN32
-	if (signal(SIGINT, termination_handler) == SIG_IGN)
+	const bool app_run = !Server->getServerParameter("app").empty();
+	if (app_run)
+	{
+		signal(SIGINT, SIG_DFL);
+	}
+	else if (signal(SIGINT, termination_handler) == SIG_IGN)
+	{
 		signal(SIGINT, SIG_IGN);
+	}
 	/*if(!daemon)
 	{
 		if (signal (SIGHUP, termination_handler) == SIG_IGN)
@@ -451,8 +458,14 @@ int main_fkt(int argc, char *argv[])
 		if (signal(SIGHUP, hub_handler) == SIG_IGN)
 			signal(SIGHUP, SIG_IGN);
 	}
-	if (signal(SIGTERM, termination_handler) == SIG_IGN)
+	if (app_run)
+	{
+		signal(SIGTERM, SIG_DFL);
+	}
+	else if (signal(SIGTERM, termination_handler) == SIG_IGN)
+	{
 		signal(SIGTERM, SIG_IGN);
+	}
 #else
 	signal(SIGABRT, abort_handler);
 	_set_invalid_parameter_handler(invalid_parameter_handler);
