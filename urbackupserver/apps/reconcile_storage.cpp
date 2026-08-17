@@ -74,8 +74,9 @@ struct SCopyProgress
 struct SCursorProgress
 {
 	SCursorProgress(const std::string& label, _i64 total)
-		: label(label), total(total), current(0), last_current(0),
-		last_time(0), max_line_length(0), drawn(false)
+		: label(label), total(total), current(0), last_rate_current(0),
+		last_rate_time(0), last_draw_time(0), rows_per_second(0),
+		max_line_length(0), drawn(false)
 	{
 	}
 
@@ -83,8 +84,10 @@ struct SCursorProgress
 	std::string detail;
 	_i64 total;
 	_i64 current;
-	_i64 last_current;
-	int64 last_time;
+	_i64 last_rate_current;
+	int64 last_rate_time;
+	int64 last_draw_time;
+	int64 rows_per_second;
 	size_t max_line_length;
 	bool drawn;
 };
@@ -246,15 +249,32 @@ void pause_cursor_progress(SCursorProgress& progress)
 void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force)
 {
 	const int64 curr_time = Server->getTimeMS();
-	const int64 passed_time = curr_time - progress.last_time;
-	const bool update_counters = !progress.drawn || current != progress.current;
-	if (!force && passed_time < 1000 && update_counters)
+	const bool first_draw = !progress.drawn;
+	const bool detail_changed = detail != progress.detail;
+	const int64 draw_interval_ms = 200;
+	if (!force && !first_draw && !detail_changed
+		&& curr_time - progress.last_draw_time < draw_interval_ms)
 	{
+		progress.current = current;
+		progress.detail = detail;
 		return;
 	}
 
-	const _i64 new_rows = current - progress.last_current;
-	const int64 rows_per_second = passed_time > 0 ? (new_rows * 1000) / passed_time : 0;
+	if (first_draw || progress.last_rate_time == 0)
+	{
+		progress.last_rate_current = current;
+		progress.last_rate_time = curr_time;
+		progress.rows_per_second = 0;
+	}
+	else if (curr_time - progress.last_rate_time >= 1000)
+	{
+		const int64 passed_time = curr_time - progress.last_rate_time;
+		const _i64 new_rows = current - progress.last_rate_current;
+		progress.rows_per_second = passed_time > 0 ? (new_rows * 1000) / passed_time : 0;
+		progress.last_rate_current = current;
+		progress.last_rate_time = curr_time;
+	}
+
 	std::string line;
 	if (progress.total > 0)
 	{
@@ -291,12 +311,12 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 
 		line += "] " + convert(pc) + "% " + progress.label
 			+ " " + convert(current) + "/" + convert(progress.total)
-			+ " rows, " + convert(rows_per_second) + " rows/s";
+			+ " rows, " + convert(progress.rows_per_second) + " rows/s";
 	}
 	else
 	{
 		line = "\r" + progress.label + " " + convert(current)
-			+ " rows, " + convert(rows_per_second) + " rows/s";
+			+ " rows, " + convert(progress.rows_per_second) + " rows/s";
 	}
 
 	if (!detail.empty())
@@ -318,11 +338,7 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 
 	progress.current = current;
 	progress.detail = detail;
-	if (update_counters)
-	{
-		progress.last_current = current;
-		progress.last_time = curr_time;
-	}
+	progress.last_draw_time = curr_time;
 	progress.drawn = true;
 }
 
@@ -1165,7 +1181,8 @@ bool remove_missing_file_rows(IDatabase* db, const std::string& client_filter,
 	while (cursor->next(row))
 	{
 		++processed_rows;
-		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
+		const std::string detail = row["client_name"] + "/" + row["backup_path"] + " checking filesystem";
+		draw_cursor_progress(progress, processed_rows, detail, false);
 
 		std::string malformed_reason;
 		if (is_malformed_file_row(row, malformed_reason))
