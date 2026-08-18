@@ -254,7 +254,7 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 	const int64 curr_time = Server->getTimeMS();
 	const bool first_draw = !progress.drawn;
 	const bool detail_changed = detail != progress.detail;
-	const int64 draw_interval_ms = 200;
+	const int64 draw_interval_ms = 500;
 	if (!force && !first_draw && !detail_changed
 		&& curr_time - progress.last_draw_time < draw_interval_ms)
 	{
@@ -609,17 +609,17 @@ bool backup_current_database(const std::string& backup_database_dir)
 	return true;
 }
 
-bool attach_old_databases(IDatabase* db, const std::string& old_db_dir)
+bool attach_import_databases(IDatabase* db, const std::string& import_db_dir)
 {
-	const std::string old_main = join_path(old_db_dir, "backup_server.db");
-	const std::string old_files = join_path(old_db_dir, "backup_server_files.db");
-	const std::string old_settings = join_path(old_db_dir, "backup_server_settings.db");
+	const std::string old_main = join_path(import_db_dir, "backup_server.db");
+	const std::string old_files = join_path(import_db_dir, "backup_server_files.db");
+	const std::string old_settings = join_path(import_db_dir, "backup_server_settings.db");
 
 	if (!FileExists(os_file_prefix(old_main))
 		|| !FileExists(os_file_prefix(old_files))
 		|| !FileExists(os_file_prefix(old_settings)))
 	{
-		Server->Log("Old database directory \"" + old_db_dir + "\" does not contain the required database files.", LL_ERROR);
+		Server->Log("Import database directory \"" + import_db_dir + "\" does not contain the required database files.", LL_ERROR);
 		return false;
 	}
 
@@ -1423,7 +1423,11 @@ void log_summary(const SStats& stats, bool apply)
 
 int reconcile_storage()
 {
-	const std::string old_db_dir = strip_trailing_sep(Server->getServerParameter("old_db_dir"));
+	std::string import_db_dir = strip_trailing_sep(Server->getServerParameter("import_db_dir"));
+	if (import_db_dir.empty())
+	{
+		import_db_dir = strip_trailing_sep(Server->getServerParameter("old_db_dir"));
+	}
 	const std::string backup_database_dir = strip_trailing_sep(Server->getServerParameter("backup_database"));
 	const std::string client_filter = Server->getServerParameter("client");
 	const bool apply = Server->getServerParameter("apply") == "true";
@@ -1432,12 +1436,6 @@ int reconcile_storage()
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
-
-	if (old_db_dir.empty())
-	{
-		Server->Log("--old-db-dir is mandatory", LL_ERROR);
-		return 1;
-	}
 
 	if (skip_db_backup)
 	{
@@ -1452,6 +1450,10 @@ int reconcile_storage()
 	if (!client_filter.empty())
 	{
 		Server->Log("Restricting reconciliation to client \"" + client_filter + "\"", LL_INFO);
+	}
+	if (import_db_dir.empty())
+	{
+		Server->Log("No --import-db-dir specified. Missing backup import is disabled; only current database actions will run.", LL_INFO);
 	}
 
 	open_server_database(true);
@@ -1482,7 +1484,8 @@ int reconcile_storage()
 		Server->Log("Could not attach current files database.", LL_ERROR);
 		return 1;
 	}
-	if (!attach_old_databases(db, old_db_dir))
+	const bool have_import_db = !import_db_dir.empty();
+	if (have_import_db && !attach_import_databases(db, import_db_dir))
 	{
 		return 1;
 	}
@@ -1519,7 +1522,14 @@ int reconcile_storage()
 		Server->Log("Skipping malformed file row removal because --remove-malformed-file-rows was not specified.", LL_INFO);
 	}
 
-	ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
+	if (have_import_db)
+	{
+		ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
+	}
+	else
+	{
+		Server->Log("Skipping missing backup import because --import-db-dir was not specified.", LL_INFO);
+	}
 
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
 	if (migrate_existing_file_paths)

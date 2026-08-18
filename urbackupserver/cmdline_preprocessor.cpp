@@ -1144,9 +1144,9 @@ int action_reconcile_storage(std::vector<std::string> args)
 {
 	TCLAP::CmdLine cmd("Reconcile UrBackup database entries with migrated backup storage", ' ', cmdline_version);
 
-	TCLAP::ValueArg<std::string> old_db_dir_arg("", "old-db-dir",
-		"Directory containing the old UrBackup database files",
-		true, "", "path", cmd);
+	TCLAP::ValueArg<std::string> import_db_dir_arg("", "import-db-dir",
+		"Directory containing UrBackup database files to import missing backups from. If omitted, only the current database is reconciled.",
+		false, "", "path", cmd);
 
 	TCLAP::ValueArg<std::string> backup_database_arg("", "backup-database",
 		"Non-existing directory where the current UrBackup database files are backed up before the run",
@@ -1195,6 +1195,18 @@ int action_reconcile_storage(std::vector<std::string> args)
 	std::vector<std::string> real_args;
 	real_args.push_back(args[0]);
 
+	for(size_t i=0;i<args.size();++i)
+	{
+		if(args[i]=="--old-db-dir")
+		{
+			args[i]="--import-db-dir";
+		}
+		else if(args[i].find("--old-db-dir=")==0)
+		{
+			args[i]="--import-db-dir="+args[i].substr(std::string("--old-db-dir=").size());
+		}
+	}
+
 	cmd.parse(args);
 
 	real_args.push_back("--no-server");
@@ -1206,8 +1218,12 @@ int action_reconcile_storage(std::vector<std::string> args)
 	real_args.push_back("debug");
 	real_args.push_back("--app");
 	real_args.push_back("reconcile_storage");
-	real_args.push_back("--old_db_dir");
-	real_args.push_back(old_db_dir_arg.getValue());
+	const std::string import_db_dir = import_db_dir_arg.getValue();
+	if(!import_db_dir.empty())
+	{
+		real_args.push_back("--import_db_dir");
+		real_args.push_back(import_db_dir);
+	}
 	if(!backup_database_arg.getValue().empty())
 	{
 		real_args.push_back("--backup_database");
