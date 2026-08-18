@@ -91,6 +91,27 @@ SStartupStatus startup_status;
 #include "../urbackupcommon/settings.h"
 #include "../urbackupcommon/filelist_utils.h"
 
+#ifndef _WIN32
+#include "config.h"
+#else
+#define PACKAGE_VERSION "unknown"
+#endif
+
+#ifndef PACKAGE_VERSION
+#define PACKAGE_VERSION "unknown"
+#endif
+
+#ifndef URBACKUP_GIT_BRANCH
+#define URBACKUP_GIT_BRANCH unknown
+#endif
+
+#ifndef URBACKUP_GIT_COMMIT
+#define URBACKUP_GIT_COMMIT unknown
+#endif
+
+#define URBACKUP_STRINGIFY_VALUE(x) #x
+#define URBACKUP_STRINGIFY(x) URBACKUP_STRINGIFY_VALUE(x)
+
 #include <stdlib.h>
 #include "../Interface/DatabaseCursor.h"
 #include <set>
@@ -393,6 +414,10 @@ void detach_other_dbs(IDatabase* db)
 DLLEXPORT void LoadActions(IServer* pServer)
 {
 	Server=pServer;
+
+	Server->Log("UrBackup server build: version " + std::string(PACKAGE_VERSION)
+		+ ", branch " + std::string(URBACKUP_STRINGIFY(URBACKUP_GIT_BRANCH))
+		+ ", commit " + std::string(URBACKUP_STRINGIFY(URBACKUP_GIT_COMMIT)), LL_INFO);
 
 	/*if(!testEscape())
 	{

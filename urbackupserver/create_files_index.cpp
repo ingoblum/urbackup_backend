@@ -158,7 +158,7 @@ bool create_files_index_common(FileIndex& fileindex, SStartupStatus& status)
 
 	Server->Log("Starting creating files index...", LL_INFO);
 
-	IQuery *q_read=db->Prepare("SELECT id, shahash, filesize, clientid, next_entry, prev_entry, pointed_to FROM files ORDER BY shahash ASC, filesize ASC, clientid ASC, created DESC");
+	IQuery *q_read=db->Prepare("SELECT id, backupid, fullpath, hashpath, shahash, typeof(shahash) AS shahash_type, length(shahash) AS shahash_len, filesize, typeof(filesize) AS filesize_type, clientid, typeof(clientid) AS clientid_type, next_entry, prev_entry, pointed_to, created FROM files ORDER BY shahash ASC, filesize ASC, clientid ASC, created DESC");
 
 	SCallbackData data;
 	data.cur=q_read->Cursor();

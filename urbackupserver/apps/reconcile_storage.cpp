@@ -253,9 +253,8 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 {
 	const int64 curr_time = Server->getTimeMS();
 	const bool first_draw = !progress.drawn;
-	const bool detail_changed = detail != progress.detail;
 	const int64 draw_interval_ms = 500;
-	if (!force && !first_draw && !detail_changed
+	if (!force && !first_draw
 		&& curr_time - progress.last_draw_time < draw_interval_ms)
 	{
 		progress.current = current;

@@ -41,6 +41,65 @@ THREADPOOL_TICKET LMDBFileIndex::fileindex_ticket = ILLEGAL_THREADPOOL_TICKET;
 const size_t c_initial_map_size=1*1024*1024;
 const size_t c_create_commit_n = 10000;
 
+namespace
+{
+	std::string row_value(const db_single_result& row, const std::string& key)
+	{
+		db_single_result::const_iterator it = row.find(key);
+		if (it == row.end())
+		{
+			return std::string();
+		}
+		return it->second;
+	}
+
+	std::string log_string_value(const std::string& value, size_t max_len)
+	{
+		std::string ret;
+		for (size_t i = 0; i < value.size() && i < max_len; ++i)
+		{
+			if (value[i] == '\n' || value[i] == '\r' || value[i] == '\t')
+			{
+				ret += ' ';
+			}
+			else
+			{
+				ret += value[i];
+			}
+		}
+		if (value.size() > max_len)
+		{
+			ret += "...";
+		}
+		return ret;
+	}
+
+	std::string fileindex_key_to_log(const FileIndex::SIndexKey& key)
+	{
+		return "hash16=" + bytesToHex(reinterpret_cast<const unsigned char*>(key.getHash()), bytes_in_index)
+			+ " filesize=" + convert(key.getFilesize())
+			+ " clientid=" + convert(key.getClientid());
+	}
+
+	std::string fileindex_row_to_log(const db_single_result& row)
+	{
+		return "id=" + row_value(row, "id")
+			+ " backupid=" + row_value(row, "backupid")
+			+ " fullpath=\"" + log_string_value(row_value(row, "fullpath"), 160) + "\""
+			+ " hashpath=\"" + log_string_value(row_value(row, "hashpath"), 160) + "\""
+			+ " shahash_type=" + row_value(row, "shahash_type")
+			+ " shahash_len=" + row_value(row, "shahash_len")
+			+ " filesize=" + row_value(row, "filesize")
+			+ " filesize_type=" + row_value(row, "filesize_type")
+			+ " clientid=" + row_value(row, "clientid")
+			+ " clientid_type=" + row_value(row, "clientid_type")
+			+ " created=" + row_value(row, "created")
+			+ " next_entry=" + row_value(row, "next_entry")
+			+ " prev_entry=" + row_value(row, "prev_entry")
+			+ " pointed_to=" + row_value(row, "pointed_to");
+	}
+}
+
 
 bool LMDBFileIndex::initFileIndex()
 {
@@ -116,6 +175,9 @@ void LMDBFileIndex::create(get_data_callback_t get_data_callback, void *userdata
 	SIndexKey last;
 	int64 last_prev_entry;
 	int64 last_id;
+	SIndexKey last_put_key;
+	db_single_result last_put_row;
+	bool have_last_put=false;
 	db_results res;
 	do
 	{
@@ -167,10 +229,26 @@ void LMDBFileIndex::create(get_data_callback_t get_data_callback, void *userdata
 				}
 			}
 			
+			if(have_last_put && key < last_put_key)
+			{
+				Server->Log("File index input order regression before LMDB insert. Current key sorts before previous inserted key. Current row: "
+					+ fileindex_row_to_log(res[i]) + " current key: " + fileindex_key_to_log(key), LL_ERROR);
+				Server->Log("Previous inserted file index row: "
+					+ fileindex_row_to_log(last_put_row) + " previous key: " + fileindex_key_to_log(last_put_key), LL_ERROR);
+			}
+
 			put(key, id, MDB_APPEND);
 
 			if(_has_error)
 			{
+				Server->Log("File index LMDB insert failed for current row: "
+					+ fileindex_row_to_log(res[i]) + " current key: " + fileindex_key_to_log(key), LL_ERROR);
+				if(have_last_put)
+				{
+					Server->Log("Previous inserted file index row: "
+						+ fileindex_row_to_log(last_put_row) + " previous key: " + fileindex_key_to_log(last_put_key), LL_ERROR);
+				}
+				Server->Log("File index creation expects rows to be ordered exactly like the LMDB key (first 16 bytes of shahash, filesize, clientid). If SQLite contains malformed rows or values with unexpected storage classes, SQLite ORDER BY can group them differently than LMDB MDB_APPEND, causing MDB_KEYEXIST here.", LL_ERROR);
 				Server->Log("LMDB error after putting element. Error state interrupting..", LL_ERROR);
 				return;
 			}
@@ -194,6 +272,10 @@ void LMDBFileIndex::create(get_data_callback_t get_data_callback, void *userdata
 			}
 
 			++n_done;
+
+			last_put_key=key;
+			last_put_row=res[i];
+			have_last_put=true;
 
 			last=key;
 			last_id=id;
