@@ -37,7 +37,7 @@ struct SStats
 	SStats()
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
-		file_rows_reused(0),
+		file_rows_reused(0), file_rows_skipped_malformed(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
@@ -50,6 +50,7 @@ struct SStats
 	int64 file_rows_importable;
 	int64 file_rows_imported;
 	int64 file_rows_reused;
+	int64 file_rows_skipped_malformed;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
 	int64 missing_files;
@@ -731,6 +732,16 @@ bool is_malformed_file_row(const db_single_result& row, std::string& reason)
 		reason = "hashpath has type " + row.find("file_hashpath_type")->second;
 		return true;
 	}
+	if (row.find("file_shahash_type") != row.end() && row.find("file_shahash_type")->second != "blob")
+	{
+		reason = "shahash has type " + row.find("file_shahash_type")->second;
+		return true;
+	}
+	if (row.find("file_shahash_len") != row.end() && watoi64(row.find("file_shahash_len")->second) < 16)
+	{
+		reason = "shahash is shorter than file index key";
+		return true;
+	}
 	if (row.find("file_filesize_type") != row.end() && row.find("file_filesize_type")->second != "integer")
 	{
 		reason = "filesize has type " + row.find("file_filesize_type")->second;
@@ -800,13 +811,39 @@ bool insert_backup_from_old(IDatabase* db, const db_single_result& old_backup,
 	return ret;
 }
 
+std::string indexable_file_row_sql_predicate(const std::string& alias)
+{
+	const std::string prefix = alias.empty() ? "" : alias + ".";
+	return "typeof(" + prefix + "id)='integer' "
+		"AND typeof(" + prefix + "backupid)='integer' "
+		"AND typeof(" + prefix + "fullpath)='text' "
+		"AND typeof(" + prefix + "shahash)='blob' "
+		"AND length(" + prefix + "shahash)>=16 "
+		"AND typeof(" + prefix + "filesize)='integer' "
+		"AND " + prefix + "filesize>=0 "
+		"AND typeof(" + prefix + "clientid)='integer' "
+		"AND " + prefix + "clientid>=0 "
+		"AND typeof(" + prefix + "incremental)='integer'";
+}
+
 bool import_file_rows(IDatabase* db_main, int64 backupid,
 	const std::vector<SColumn>& file_columns, const std::string& new_storage_prefix,
 	const std::string& clientname, const std::string& backup_path, bool apply, SStats& stats)
 {
 	db_results count_res = db_main->Read("SELECT COUNT(*) AS c FROM old_files.files WHERE backupid=" + convert(backupid));
-	const int64 file_count = count_res.empty() ? 0 : watoi64(count_res[0]["c"]);
+	const int64 total_file_count = count_res.empty() ? 0 : watoi64(count_res[0]["c"]);
+	db_results valid_count_res = db_main->Read("SELECT COUNT(*) AS c FROM old_files.files WHERE backupid="
+		+ convert(backupid) + " AND " + indexable_file_row_sql_predicate(""));
+	const int64 file_count = valid_count_res.empty() ? 0 : watoi64(valid_count_res[0]["c"]);
+	const int64 skipped_file_count = total_file_count - file_count;
 	stats.file_rows_importable += file_count;
+	stats.file_rows_skipped_malformed += skipped_file_count;
+
+	if (skipped_file_count > 0)
+	{
+		Server->Log("Skipping " + convert(skipped_file_count) + " malformed file rows while importing backup id "
+			+ convert(backupid) + " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_WARNING);
+	}
 
 	if (!apply)
 	{
@@ -814,7 +851,8 @@ bool import_file_rows(IDatabase* db_main, int64 backupid,
 	}
 
 	IDatabaseCursor* cursor = db_main->Prepare("SELECT " + column_list(file_columns, "")
-		+ " FROM old_files.files WHERE backupid=" + convert(backupid))->Cursor();
+		+ " FROM old_files.files WHERE backupid=" + convert(backupid)
+		+ " AND " + indexable_file_row_sql_predicate(""))->Cursor();
 
 	IQuery* q_insert = db_main->Prepare("INSERT INTO curr_files.files (" + column_list(file_columns, "")
 		+ ") VALUES (" + bind_list(file_columns.size()) + ")", false);
@@ -973,7 +1011,8 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 		++stats.missing_backups_importable;
 		if (!apply)
 		{
-			db_results count_res = db->Read("SELECT COUNT(*) AS c FROM old_files.files WHERE backupid=" + convert(backupid));
+			db_results count_res = db->Read("SELECT COUNT(*) AS c FROM old_files.files WHERE backupid="
+				+ convert(backupid) + " AND " + indexable_file_row_sql_predicate(""));
 			if (!count_res.empty())
 			{
 				stats.file_rows_importable += watoi64(count_res[0]["c"]);
@@ -1283,6 +1322,8 @@ std::string valid_file_row_sql_predicate()
 	return "typeof(f.backupid)='integer' "
 		"AND typeof(f.fullpath)='text' "
 		"AND substr(f.fullpath,1,1)='/' "
+		"AND typeof(f.shahash)='blob' "
+		"AND length(f.shahash)>=16 "
 		"AND typeof(f.filesize)='integer' "
 		"AND f.filesize>=0 "
 		"AND typeof(f.clientid)='integer' "
@@ -1368,6 +1409,7 @@ void log_summary(const SStats& stats, bool apply)
 	{
 		Server->Log("  file rows reused: " + convert(stats.file_rows_reused), LL_INFO);
 	}
+	Server->Log("  malformed file rows skipped during import: " + convert(stats.file_rows_skipped_malformed), LL_INFO);
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
@@ -1468,7 +1510,6 @@ int reconcile_storage()
 		}
 	}
 
-	ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
 	if (remove_malformed_file_rows_enabled)
 	{
 		ok = ok && remove_malformed_file_rows(db, client_filter, apply, stats);
@@ -1477,6 +1518,8 @@ int reconcile_storage()
 	{
 		Server->Log("Skipping malformed file row removal because --remove-malformed-file-rows was not specified.", LL_INFO);
 	}
+
+	ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
 
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
 	if (migrate_existing_file_paths)

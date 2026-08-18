@@ -791,6 +791,8 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		}
 	}
 
+	ADD_ACTION(progress);
+
 	if(!create_files_index(startup_status))
 	{
 		Server->Log("Could not create or open file entry index. Exiting.", LL_ERROR);
@@ -871,7 +873,6 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		
 
 	ADD_ACTION(server_status);
-	ADD_ACTION(progress);
 	ADD_ACTION(salt);
 	ADD_ACTION(lastacts);
 	ADD_ACTION(piegraph);
