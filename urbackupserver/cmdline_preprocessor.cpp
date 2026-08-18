@@ -1184,6 +1184,12 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Remove structurally invalid file metadata rows, e.g. rows misrecovered from files_incoming_stat.",
 		cmd, false);
 
+	// Recreate the visible backup-directory symlinks from configured ZFS datasets when
+	// the database still contains the backup rows but the link objects disappeared.
+	TCLAP::SwitchArg recreate_dataset_links_arg("", "recreate-missing-dataset-links",
+		"Recreate missing visible backup-directory links from configured dataset and dataset_file parents.",
+		cmd, false);
+
 	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
@@ -1267,6 +1273,11 @@ int action_reconcile_storage(std::vector<std::string> args)
 	if(remove_malformed_file_rows_arg.getValue())
 	{
 		real_args.push_back("--remove_malformed_file_rows");
+		real_args.push_back("true");
+	}
+	if(recreate_dataset_links_arg.getValue())
+	{
+		real_args.push_back("--recreate_missing_dataset_links");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())

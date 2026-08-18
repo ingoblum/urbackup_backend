@@ -10,6 +10,8 @@
 
 #include "reconcile_storage.h"
 #include "app.h"
+#include "../snapshot_helper.h"
+#include "../server.h"
 #include "../server_settings.h"
 #include "../../Interface/DatabaseCursor.h"
 #include "../../Interface/File.h"
@@ -38,7 +40,7 @@ struct SStats
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
-		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
+		dataset_links(0), dataset_links_created(0), paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
 	}
@@ -51,6 +53,8 @@ struct SStats
 	int64 file_rows_imported;
 	int64 file_rows_reused;
 	int64 file_rows_skipped_malformed;
+	int64 dataset_links;
+	int64 dataset_links_created;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
 	int64 missing_files;
@@ -94,6 +98,13 @@ struct SCursorProgress
 	size_t max_line_length;
 	bool drawn;
 };
+
+// The dataset-link reconciliation path reuses the interactive cursor progress helpers
+// below, so forward declarations keep the helper order stable and avoid reshuffling
+// already debugged output code.
+void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force);
+void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail);
+void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel);
 
 std::string strip_trailing_sep(std::string path)
 {
@@ -192,6 +203,230 @@ std::string row_result_value(const db_single_result& row, const std::string& key
 		return fallback;
 	}
 	return it->second;
+}
+
+// Reconcile-storage creates the same visible symlink objects as the normal server mode:
+// a temporary link is created first and then renamed atomically so readers never observe
+// a half-written final path. Existing filesystem objects are intentionally left untouched.
+bool create_dataset_link_at_path(const std::string& mountpoint, const std::string& link_path, bool apply)
+{
+	const std::string tmp_path = link_path + ".reconcile-storage-new";
+
+	if (os_get_file_type(os_file_prefix(link_path)) != 0)
+	{
+		return true;
+	}
+
+	if (apply)
+	{
+		Server->deleteFile(os_file_prefix(tmp_path));
+
+		const std::string parent_dir = ExtractFilePath(link_path);
+		if (!parent_dir.empty() && !os_directory_exists(os_file_prefix(parent_dir)))
+		{
+			if (!os_create_dir_recursive(os_file_prefix(parent_dir)))
+			{
+				Server->Log("Could not create parent directory \"" + parent_dir + "\" for dataset link. "
+					+ os_last_error_str(), LL_ERROR);
+				return false;
+			}
+		}
+
+		if (!os_link_symbolic(mountpoint, tmp_path))
+		{
+			Server->Log("Could not create temporary dataset link at \"" + tmp_path + "\" to \"" + mountpoint
+				+ "\". " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+
+		if (!os_rename_file(tmp_path, link_path))
+		{
+			Server->Log("Could not rename temporary dataset link from \"" + tmp_path + "\" to \"" + link_path
+				+ "\". " + os_last_error_str(), LL_ERROR);
+			Server->deleteFile(os_file_prefix(tmp_path));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool should_recreate_image_dataset_link(const db_single_result& row)
+{
+	const std::string image_path = row_result_value(row, "image_path");
+	if (image_path.empty())
+	{
+		return false;
+	}
+
+	// Only raw image backups are represented by a symlinked dataset directory in normal
+	// server mode. VHD/VHDZ/VHDX variants remain regular files and must not be recreated
+	// as directory links here.
+	return findextension(image_path) == "raw";
+}
+
+bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_filter,
+	const std::string& storage_prefix, bool apply, SStats& stats)
+{
+	const bool file_zfs_links = BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile;
+	const bool image_zfs_links = BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs;
+
+	if (!file_zfs_links && !image_zfs_links)
+	{
+		Server->Log("Skipping dataset link recreation because neither file nor image backups use dataset-backed links.", LL_INFO);
+		return true;
+	}
+
+	bool ok = true;
+
+	if (file_zfs_links)
+	{
+		std::string sql = "SELECT b.id AS backupid, b.path AS backup_path, c.name AS client_name "
+			"FROM backups b INNER JOIN clients c ON c.id=b.clientid";
+		if (!client_filter.empty())
+		{
+			sql += " WHERE c.name=" + sql_string(client_filter);
+		}
+		sql += " ORDER BY c.name ASC, b.path ASC";
+
+		IQuery* q = db->Prepare(sql, false);
+		IDatabaseCursor* cursor = q->Cursor();
+		db_single_result row;
+		int64 processed_rows = 0;
+		SCursorProgress progress("Recreating file dataset links", 0);
+
+		while (cursor->next(row))
+		{
+			++processed_rows;
+			const std::string clientname = row_result_value(row, "client_name");
+			const std::string backup_path = row_result_value(row, "backup_path");
+			draw_cursor_progress(progress, processed_rows, clientname + "/" + backup_path, false);
+
+			const std::string link_path = join_path(join_path(storage_prefix, clientname), backup_path);
+			if (os_get_file_type(os_file_prefix(link_path)) != 0)
+			{
+				continue;
+			}
+			if (!SnapshotHelper::isSubvolume(false, clientname, backup_path))
+			{
+				continue;
+			}
+
+			const std::string mountpoint = SnapshotHelper::getMountpoint(false, clientname, backup_path);
+			if (mountpoint.empty())
+			{
+				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for file backup id "
+					+ row_result_value(row, "backupid") + " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_WARNING);
+				ok = false;
+				continue;
+			}
+
+			++stats.dataset_links;
+			log_with_cursor_progress(progress, std::string(apply ? "Recreating" : "Would recreate")
+				+ " file dataset link for backup id " + row_result_value(row, "backupid")
+				+ " client \"" + clientname + "\" path \"" + backup_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
+
+			if (!create_dataset_link_at_path(mountpoint, link_path, apply))
+			{
+				ok = false;
+				continue;
+			}
+
+			if (apply)
+			{
+				++stats.dataset_links_created;
+			}
+		}
+
+		finish_cursor_progress(progress, processed_rows, "done");
+		const bool cursor_ok = !cursor->has_error();
+		cursor->shutdown();
+		db->destroyQuery(q);
+		ok = ok && cursor_ok;
+	}
+
+	if (image_zfs_links)
+	{
+		std::string sql = "SELECT i.id AS backupid, i.path AS image_path, c.name AS client_name "
+			"FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE i.complete=1";
+		if (!client_filter.empty())
+		{
+			sql += " AND c.name=" + sql_string(client_filter);
+		}
+		sql += " ORDER BY c.name ASC, i.path ASC";
+
+		IQuery* q = db->Prepare(sql, false);
+		IDatabaseCursor* cursor = q->Cursor();
+		db_single_result row;
+		int64 processed_rows = 0;
+		SCursorProgress progress("Recreating image dataset links", 0);
+
+		while (cursor->next(row))
+		{
+			++processed_rows;
+			const std::string clientname = row_result_value(row, "client_name");
+			const std::string image_path = row_result_value(row, "image_path");
+			draw_cursor_progress(progress, processed_rows, clientname + "/" + image_path, false);
+
+			if (!should_recreate_image_dataset_link(row))
+			{
+				continue;
+			}
+
+			const std::string image_folder = ExtractFilePath(image_path);
+			const std::string backup_path = ExtractFileName(image_folder);
+			if (image_folder.empty() || backup_path.empty())
+			{
+				continue;
+			}
+
+			// Image backup rows may still point at an old storage prefix after migration.
+			// Recreate the visible link below the current storage prefix so the server sees
+			// the same layout it would have created during the original backup run.
+			const std::string link_path = join_path(join_path(storage_prefix, clientname), backup_path);
+			if (os_get_file_type(os_file_prefix(link_path)) != 0)
+			{
+				continue;
+			}
+			if (!SnapshotHelper::isSubvolume(true, clientname, backup_path))
+			{
+				continue;
+			}
+
+			const std::string mountpoint = SnapshotHelper::getMountpoint(true, clientname, backup_path);
+			if (mountpoint.empty())
+			{
+				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for image backup id "
+					+ row_result_value(row, "backupid") + " client \"" + clientname + "\" path \"" + image_path + "\"", LL_WARNING);
+				ok = false;
+				continue;
+			}
+
+			++stats.dataset_links;
+			log_with_cursor_progress(progress, std::string(apply ? "Recreating" : "Would recreate")
+				+ " image dataset link for backup id " + row_result_value(row, "backupid")
+				+ " client \"" + clientname + "\" path \"" + link_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
+
+			if (!create_dataset_link_at_path(mountpoint, link_path, apply))
+			{
+				ok = false;
+				continue;
+			}
+
+			if (apply)
+			{
+				++stats.dataset_links_created;
+			}
+		}
+
+		finish_cursor_progress(progress, processed_rows, "done");
+		const bool cursor_ok = !cursor->has_error();
+		cursor->shutdown();
+		db->destroyQuery(q);
+		ok = ok && cursor_ok;
+	}
+
+	return ok;
 }
 
 bool get_file_size(const std::string& path, _i64& size)
@@ -1436,6 +1671,8 @@ void log_summary(const SStats& stats, bool apply)
 		Server->Log("  file rows reused: " + convert(stats.file_rows_reused), LL_INFO);
 	}
 	Server->Log("  malformed file rows skipped during import: " + convert(stats.file_rows_skipped_malformed), LL_INFO);
+	Server->Log(std::string("  dataset links ") + (apply ? "created: " : "would create: ")
+		+ convert(apply ? stats.dataset_links_created : stats.dataset_links), LL_INFO);
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
@@ -1461,6 +1698,7 @@ int reconcile_storage()
 	const bool migrate_existing_file_paths = Server->getServerParameter("migrate_existing_file_paths") == "true";
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
+	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 
 	if (skip_db_backup)
@@ -1555,6 +1793,15 @@ int reconcile_storage()
 	else
 	{
 		Server->Log("Skipping missing backup import because --import-db-dir was not specified.", LL_INFO);
+	}
+
+	if (recreate_missing_dataset_links_enabled)
+	{
+		ok = ok && recreate_missing_dataset_links(db, client_filter, new_storage_prefix, apply, stats);
+	}
+	else
+	{
+		Server->Log("Skipping dataset link recreation because --recreate-missing-dataset-links was not specified.", LL_INFO);
 	}
 
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
