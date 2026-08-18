@@ -184,6 +184,16 @@ bool path_exists(const std::string& path)
 	return FileExists(prefixed) || os_directory_exists(prefixed);
 }
 
+std::string row_result_value(const db_single_result& row, const std::string& key, const std::string& fallback = std::string())
+{
+	db_single_result::const_iterator it = row.find(key);
+	if (it == row.end())
+	{
+		return fallback;
+	}
+	return it->second;
+}
+
 bool get_file_size(const std::string& path, _i64& size)
 {
 	if (!FileExists(os_file_prefix(path)))
@@ -714,6 +724,11 @@ bool is_malformed_file_row(const db_single_result& row, std::string& reason)
 		reason = "backupid has type " + row.find("file_backupid_type")->second;
 		return true;
 	}
+	if (row.find("backup_exists") != row.end() && row.find("backup_exists")->second.empty())
+	{
+		reason = "referenced backup is missing";
+		return true;
+	}
 	if (row.find("file_fullpath_type") != row.end() && row.find("file_fullpath_type")->second != "text")
 	{
 		reason = "fullpath has type " + row.find("file_fullpath_type")->second;
@@ -749,6 +764,11 @@ bool is_malformed_file_row(const db_single_result& row, std::string& reason)
 	if (row.find("file_filesize") != row.end() && watoi64(row.find("file_filesize")->second) < 0)
 	{
 		reason = "filesize is negative";
+		return true;
+	}
+	if (row.find("file_created_type") != row.end() && row.find("file_created_type")->second != "integer")
+	{
+		reason = "created has type " + row.find("file_created_type")->second;
 		return true;
 	}
 	if (row.find("file_clientid_type") != row.end() && row.find("file_clientid_type")->second != "integer")
@@ -1134,16 +1154,19 @@ std::string file_validation_select_columns()
 {
 	return "f.id AS file_id, f.backupid AS file_backupid, f.fullpath AS file_fullpath, "
 		"f.hashpath AS file_hashpath, f.shahash AS file_shahash, f.filesize AS file_filesize, "
+		"f.created AS file_created, f.rsize AS file_rsize, "
 		"f.clientid AS file_clientid, f.incremental AS file_incremental, "
 		"typeof(f.backupid) AS file_backupid_type, typeof(f.fullpath) AS file_fullpath_type, "
 		"typeof(f.hashpath) AS file_hashpath_type, typeof(f.shahash) AS file_shahash_type, "
-		"typeof(f.filesize) AS file_filesize_type, typeof(f.clientid) AS file_clientid_type, "
+		"typeof(f.filesize) AS file_filesize_type, typeof(f.created) AS file_created_type, "
+		"typeof(f.rsize) AS file_rsize_type, typeof(f.clientid) AS file_clientid_type, "
 		"typeof(f.incremental) AS file_incremental_type, length(f.shahash) AS file_shahash_len, "
 		"quote(f.backupid) AS file_backupid_quoted, quote(f.fullpath) AS file_fullpath_quoted, "
 		"quote(f.hashpath) AS file_hashpath_quoted, quote(f.shahash) AS file_shahash_quoted, "
-		"quote(f.filesize) AS file_filesize_quoted, quote(f.clientid) AS file_clientid_quoted, "
+		"quote(f.filesize) AS file_filesize_quoted, quote(f.created) AS file_created_quoted, "
+		"quote(f.rsize) AS file_rsize_quoted, quote(f.clientid) AS file_clientid_quoted, "
 		"quote(f.incremental) AS file_incremental_quoted, "
-		"c.id AS backup_clientid, c.name AS client_name, b.path AS backup_path, "
+		"b.id AS backup_exists, c.id AS backup_clientid, c.name AS client_name, b.path AS backup_path, "
 		"EXISTS(SELECT 1 FROM curr_files.files_incoming_stat s WHERE s.id=f.id "
 		"AND f.backupid=s.filesize AND f.fullpath=CAST(s.clientid AS TEXT) "
 		"AND f.shahash=s.backupid AND f.filesize=s.existing_clients "
@@ -1154,19 +1177,22 @@ std::string file_validation_select_columns()
 std::string malformed_file_row_log_message(const db_single_result& row, const std::string& reason, bool apply)
 {
 	return std::string(apply ? "Removing" : "Would remove") + " malformed file row id "
-		+ row.find("file_id")->second + " reason \"" + reason + "\""
-		+ " backupid " + row.find("file_backupid_quoted")->second + " type " + row.find("file_backupid_type")->second
-		+ " client \"" + row.find("client_name")->second + "\""
-		+ " file clientid " + row.find("file_clientid_quoted")->second + " type " + row.find("file_clientid_type")->second
-		+ " backup clientid " + row.find("backup_clientid")->second
-		+ " backup path \"" + row.find("backup_path")->second + "\""
-		+ " incremental " + row.find("file_incremental_quoted")->second + " type " + row.find("file_incremental_type")->second
-		+ " filesize " + row.find("file_filesize_quoted")->second + " type " + row.find("file_filesize_type")->second
-		+ " fullpath " + row.find("file_fullpath_quoted")->second + " type " + row.find("file_fullpath_type")->second
-		+ " hashpath " + row.find("file_hashpath_quoted")->second + " type " + row.find("file_hashpath_type")->second
-		+ " shahash type " + row.find("file_shahash_type")->second
-		+ " len " + row.find("file_shahash_len")->second
-		+ " incoming_stat_match " + row.find("incoming_stat_match")->second;
+		+ row_result_value(row, "file_id") + " reason \"" + reason + "\""
+		+ " backupid " + row_result_value(row, "file_backupid_quoted") + " type " + row_result_value(row, "file_backupid_type")
+		+ " backup_exists " + row_result_value(row, "backup_exists", "<missing>")
+		+ " client \"" + row_result_value(row, "client_name", "<missing-client>") + "\""
+		+ " file clientid " + row_result_value(row, "file_clientid_quoted") + " type " + row_result_value(row, "file_clientid_type")
+		+ " backup clientid " + row_result_value(row, "backup_clientid", "<missing>")
+		+ " backup path \"" + row_result_value(row, "backup_path", "<missing-backup>") + "\""
+		+ " incremental " + row_result_value(row, "file_incremental_quoted") + " type " + row_result_value(row, "file_incremental_type")
+		+ " filesize " + row_result_value(row, "file_filesize_quoted") + " type " + row_result_value(row, "file_filesize_type")
+		+ " created " + row_result_value(row, "file_created_quoted") + " type " + row_result_value(row, "file_created_type")
+		+ " rsize " + row_result_value(row, "file_rsize_quoted") + " type " + row_result_value(row, "file_rsize_type")
+		+ " fullpath " + row_result_value(row, "file_fullpath_quoted") + " type " + row_result_value(row, "file_fullpath_type")
+		+ " hashpath " + row_result_value(row, "file_hashpath_quoted") + " type " + row_result_value(row, "file_hashpath_type")
+		+ " shahash type " + row_result_value(row, "file_shahash_type")
+		+ " len " + row_result_value(row, "file_shahash_len")
+		+ " incoming_stat_match " + row_result_value(row, "incoming_stat_match");
 }
 
 bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
@@ -1179,8 +1205,8 @@ bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter,
 
 	SCursorProgress progress("Checking malformed file rows", 0);
 	IDatabaseCursor* cursor = db->Prepare("SELECT " + file_validation_select_columns()
-		+ " FROM curr_files.files f INNER JOIN backups b ON b.id=f.backupid "
-		+ "INNER JOIN clients c ON c.id=b.clientid" + where)->Cursor();
+		+ " FROM curr_files.files f LEFT JOIN backups b ON b.id=f.backupid "
+		+ "LEFT JOIN clients c ON c.id=b.clientid" + where)->Cursor();
 
 	IQuery* q_delete = NULL;
 	if (apply)
@@ -1193,7 +1219,8 @@ bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter,
 	while (cursor->next(row))
 	{
 		++processed_rows;
-		draw_cursor_progress(progress, processed_rows, row["client_name"] + "/" + row["backup_path"], false);
+		draw_cursor_progress(progress, processed_rows,
+			row_result_value(row, "client_name", "<missing-client>") + "/" + row_result_value(row, "backup_path", "<missing-backup>"), false);
 
 		std::string reason;
 		if (is_malformed_file_row(row, reason))
