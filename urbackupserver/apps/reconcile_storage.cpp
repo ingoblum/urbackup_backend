@@ -47,7 +47,7 @@ struct SStats
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
 		dataset_links(0), dataset_links_created(0), dataset_backups_seen(0),
-		dataset_backups_importable(0), dataset_backups_imported(0), broken_storage_link_targets(0),
+		dataset_backups_importable(0), dataset_backups_imported(0), ignored_read_errors(0), broken_storage_link_targets(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
@@ -66,6 +66,7 @@ struct SStats
 	int64 dataset_backups_seen;
 	int64 dataset_backups_importable;
 	int64 dataset_backups_imported;
+	int64 ignored_read_errors;
 	int64 broken_storage_link_targets;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
@@ -132,7 +133,10 @@ struct SStorageBackupEntry
 {
 	bool image;
 	bool symlink;
+	bool standalone_image_file;
+	bool client_exists_in_db;
 	std::string root_path;
+	std::string payload_path;
 	std::string clientname;
 	std::string backup_path;
 };
@@ -638,6 +642,22 @@ bool is_image_backup_name(const std::string& backup_path)
 	return backup_path.find("_Image_") != std::string::npos;
 }
 
+bool is_supported_image_extension(const std::string& ext)
+{
+	return ext == "raw" || ext == "vhd" || ext == "vhdz" || ext == "vhdx" || ext == "vhdxz";
+}
+
+std::string strip_file_extension(const std::string& filename)
+{
+	const std::string ext = findextension(filename);
+	if (ext.empty() || filename.size() <= ext.size() + 1)
+	{
+		return filename;
+	}
+
+	return filename.substr(0, filename.size() - ext.size() - 1);
+}
+
 bool is_backup_timestamp_component(const std::string& backup_path)
 {
 	if (backup_path.size() < 11 || backup_path[6] != '-')
@@ -683,6 +703,55 @@ bool is_valid_visible_backup_name(const std::string& backup_path)
 		&& backup_path.substr(11, image_marker.size()) == image_marker;
 }
 
+std::string storage_entry_display_name(const SStorageBackupEntry& entry)
+{
+	if (entry.standalone_image_file)
+	{
+		return entry.backup_path + "." + findextension(entry.payload_path);
+	}
+
+	return entry.backup_path;
+}
+
+bool current_storage_image_backup_exists(IDatabase* db, const SStorageBackupEntry& entry)
+{
+	IQuery* q = NULL;
+	if (entry.standalone_image_file)
+	{
+		// Standalone image files are matched by their basename because they do not
+		// have the extra backup directory level that directory-backed image backups use.
+		q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+			"WHERE c.name=? AND i.path LIKE ?", false);
+		q->Bind(entry.clientname);
+		q->Bind("%/" + entry.clientname + "/" + ExtractFileName(entry.payload_path));
+	}
+	else
+	{
+		q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+			"WHERE c.name=? AND i.path LIKE ?", false);
+		q->Bind(entry.clientname);
+		q->Bind("%/" + entry.clientname + "/" + entry.backup_path + "/%");
+	}
+	db_results res = q->Read();
+	q->Reset();
+	db->destroyQuery(q);
+	return !res.empty();
+}
+
+std::string storage_import_action_label(const SStorageBackupEntry& entry)
+{
+	// Backups belonging to clients that already exist in the database are logged
+	// with the same wording remove-unknown implicitly compares against. Storage-only
+	// clients remain importable, but are called out separately so both dry-run sets
+	// can be compared without those additional reconstruction candidates.
+	if (entry.client_exists_in_db)
+	{
+		return "storage-backed";
+	}
+
+	return "storage-only-client";
+}
+
 bool should_skip_storage_visible_entry_name(const std::string& name)
 {
 	// Hidden bookkeeping directories below the storage root are not client backups.
@@ -704,7 +773,10 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 	std::sort(clients.begin(), clients.end());
 	for (size_t i = 0; i < clients.size(); ++i)
 	{
-		if ((!clients[i].isdir && !clients[i].issym) || clients[i].isspecialf)
+		// Linux marks symlinks from getFiles() as "special" as well. Visible storage
+		// backups are frequently represented exactly by those symlinks, so only truly
+		// unsupported special files are skipped here while symlink-based clients stay visible.
+		if ((!clients[i].isdir && !clients[i].issym) || (clients[i].isspecialf && !clients[i].issym))
 		{
 			continue;
 		}
@@ -728,7 +800,10 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 		std::sort(backups.begin(), backups.end());
 		for (size_t j = 0; j < backups.size(); ++j)
 		{
-			if ((!backups[j].isdir && !backups[j].issym) || backups[j].isspecialf)
+			// Backup links use the same Linux SFile flags as other symlinks. Skipping
+			// all isspecialf entries hid the majority of dataset-backed backups from
+			// import-storage, while remove-unknown still considered them present.
+			if (backups[j].isspecialf && !backups[j].issym)
 			{
 				continue;
 			}
@@ -736,21 +811,51 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 			{
 				continue;
 			}
-			if (!is_valid_visible_backup_name(backups[j].name))
-			{
-				continue;
-			}
-			if (should_skip_dataset_entry_name(backups[j].name))
-			{
-				continue;
-			}
-
 			SStorageBackupEntry entry;
-			entry.image = is_image_backup_name(backups[j].name);
+			entry.image = false;
 			entry.symlink = backups[j].issym;
+			entry.standalone_image_file = false;
+			entry.client_exists_in_db = false;
 			entry.root_path = join_path(client_root, backups[j].name);
+			entry.payload_path.clear();
 			entry.clientname = clients[i].name;
-			entry.backup_path = backups[j].name;
+
+			// Remove-unknown treats plain names without dots as file-backup candidates
+			// even when they are not directories. Import-storage mirrors that behavior
+			// so copied file backups and snapshot-link style entries are not skipped.
+			if (backups[j].isdir || backups[j].issym || backups[j].name.find(".") == std::string::npos)
+			{
+				if (!is_valid_visible_backup_name(backups[j].name)
+					|| should_skip_dataset_entry_name(backups[j].name))
+				{
+					continue;
+				}
+
+				entry.image = is_image_backup_name(backups[j].name);
+				entry.backup_path = backups[j].name;
+			}
+			else
+			{
+				const std::string ext = findextension(backups[j].name);
+				if (!is_supported_image_extension(ext))
+				{
+					continue;
+				}
+
+				const std::string backup_stem = strip_file_extension(backups[j].name);
+				if (!is_valid_visible_backup_name(backup_stem) || !is_image_backup_name(backup_stem)
+					|| should_skip_dataset_entry_name(backup_stem))
+				{
+					continue;
+				}
+
+				// Standalone image files live directly below the client directory. They
+				// are valid UrBackup objects and remove-unknown already considers them.
+				entry.image = true;
+				entry.standalone_image_file = true;
+				entry.backup_path = backup_stem;
+				entry.payload_path = entry.root_path;
+			}
 
 			// A visible backup symlink whose target is currently not reachable would be
 			// seen by later cleanup logic as a broken storage object. Reconcile-storage
@@ -850,13 +955,25 @@ bool should_skip_dataset_entry_name(const std::string& name)
 	return name == ".hashes" || name == ".directory_pool";
 }
 
-bool scan_dataset_file_tree_stats(const std::string& current_path, _i64& total_size, int64& file_count)
+bool scan_dataset_file_tree_stats(const std::string& current_path, const std::string& backup_label,
+	bool ignore_read_errors, bool is_root, _i64& total_size, int64& file_count,
+	int64& ignored_read_errors_for_backup, SStats& stats)
 {
 	bool has_error = false;
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
 	{
-		return false;
+		// With --ignore-read-errors only subtree access failures are tolerated. If the
+		// backup root itself cannot be listed there is no trustworthy subset to import.
+		if (!ignore_read_errors || is_root)
+		{
+			return false;
+		}
+
+		++ignored_read_errors_for_backup;
+		++stats.ignored_read_errors;
+		Server->Log("Ignoring unreadable storage subtree \"" + current_path + "\" while scanning backup \""
+			+ backup_label + "\" because --ignore-read-errors was specified.", LL_WARNING);
 	}
 
 	for (size_t i = 0; i < files.size(); ++i)
@@ -867,7 +984,8 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, _i64& total_s
 			{
 				continue;
 			}
-			if (!scan_dataset_file_tree_stats(join_path(current_path, files[i].name), total_size, file_count))
+			if (!scan_dataset_file_tree_stats(join_path(current_path, files[i].name), backup_label,
+				ignore_read_errors, false, total_size, file_count, ignored_read_errors_for_backup, stats))
 			{
 				return false;
 			}
@@ -920,13 +1038,25 @@ bool build_hash_for_file(const std::string& path, std::string& shahash)
 
 bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
 	const std::string& relative_path, const std::string& visible_root,
-	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, SStats& stats)
+	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors,
+	int64& ignored_read_errors_for_backup, SStats& stats)
 {
 	bool has_error = false;
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
 	{
-		return false;
+		// Partial imports are only allowed when explicitly requested. A failed root
+		// directory listing still aborts because there is otherwise no stable base.
+		if (!ignore_read_errors || relative_path.empty())
+		{
+			return false;
+		}
+
+		++ignored_read_errors_for_backup;
+		++stats.ignored_read_errors;
+		log_with_cursor_progress(progress, "Ignoring unreadable storage subtree \"" + current_path
+			+ "\" while importing backup \"" + imported.clientname + "/" + imported.backup_path
+			+ "\" because --ignore-read-errors was specified.", LL_WARNING);
 	}
 
 	std::sort(files.begin(), files.end());
@@ -944,7 +1074,7 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 				continue;
 			}
 			if (!import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
-				visible_root, imported, progress, apply, stats))
+				visible_root, imported, progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats))
 			{
 				return false;
 			}
@@ -959,7 +1089,19 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 		std::string shahash;
 		if (!build_hash_for_file(physical_path, shahash))
 		{
-			return false;
+			if (!ignore_read_errors)
+			{
+				return false;
+			}
+
+			// Read and hashing failures are skipped per file so the rest of the backup
+			// can still be reconstructed from the readable content.
+			++ignored_read_errors_for_backup;
+			++stats.ignored_read_errors;
+			log_with_cursor_progress(progress, "Ignoring unreadable file \"" + physical_path
+				+ "\" while importing backup \"" + imported.clientname + "/" + imported.backup_path
+				+ "\" because --ignore-read-errors was specified.", LL_WARNING);
+			continue;
 		}
 
 		const std::string fullpath = join_path(visible_root, child_relative);
@@ -994,7 +1136,7 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 }
 
 bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
-	const SStorageBackupEntry& entry, bool apply, SStats& stats)
+	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, SStats& stats)
 {
 	SImportedDatasetBackup imported;
 	imported.clientname = entry.clientname;
@@ -1020,20 +1162,33 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		imported.incremental = (!older.empty() && watoi64(older[0]["c"]) > 0) ? 1 : 0;
 	}
 
+	++stats.dataset_backups_importable;
+	SCursorProgress count_progress("Scanning storage file backup", 0);
+	int64 ignored_read_errors_for_backup = 0;
+	log_with_cursor_progress(count_progress, std::string(apply ? "Importing" : "Would import")
+		+ " " + storage_import_action_label(entry) + " file backup client \"" + entry.clientname
+		+ "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
+
+	// Dry-run is used primarily to compare the visible backup set with remove-unknown.
+	// Walking every file tree here would both slow the scan down significantly and
+	// suppress candidates behind restrictive permissions before they can be reported.
+	if (!apply)
+	{
+		return true;
+	}
+
 	// The storage scan computes the future backup size before the row exists so the
 	// main backup table gets a correct size_bytes value immediately instead of waiting
 	// for a later statistics refresh.
-	SCursorProgress count_progress("Scanning storage file backup", 0);
-	if (!scan_dataset_file_tree_stats(entry.root_path, imported.total_size, imported.file_rows))
+	if (!scan_dataset_file_tree_stats(entry.root_path, entry.clientname + "/" + entry.backup_path,
+		ignore_read_errors, true, imported.total_size, imported.file_rows, ignored_read_errors_for_backup, stats))
 	{
-		return false;
+		log_with_cursor_progress(count_progress, "Skipping storage file backup client \"" + entry.clientname
+			+ "\" path \"" + entry.backup_path
+			+ "\" because its contents could not be read completely. See previous log lines for the concrete filesystem error.", LL_WARNING);
+		return true;
 	}
 	finish_cursor_progress(count_progress, 0, "done");
-
-	++stats.dataset_backups_importable;
-	log_with_cursor_progress(count_progress, std::string(apply ? "Importing" : "Would import")
-		+ " storage-backed file backup client \"" + entry.clientname + "\" path \"" + entry.backup_path
-		+ "\" root \"" + entry.root_path + "\"", LL_INFO);
 
 	if (!insert_dataset_file_backup_row(db, backup_columns, imported, apply))
 	{
@@ -1053,16 +1208,36 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		}
 
 		SCursorProgress import_progress("Importing storage file rows", 0);
+		const int64 file_rows_imported_before = stats.file_rows_imported;
+		const int64 file_rows_importable_before = stats.file_rows_importable;
 		if (!import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
-			entry.root_path, imported, import_progress, apply, stats))
+			entry.root_path, imported, import_progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats))
 		{
 			finish_cursor_progress(import_progress, stats.file_rows_imported, "failed");
+
+			// File-tree imports may fail only after the backup row and some file rows
+			// already exist. Those partial rows are removed again so apply mode can
+			// continue with the next visible backup instead of aborting the whole run.
 			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
 			Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES)->Write("DELETE FROM files WHERE backupid=" + convert(imported.backupid));
-			return false;
+			stats.file_rows_imported = file_rows_imported_before;
+			stats.file_rows_importable = file_rows_importable_before;
+			log_with_cursor_progress(import_progress, "Skipping storage file backup client \"" + entry.clientname
+				+ "\" path \"" + entry.backup_path
+				+ "\" because importing its file rows failed. Partial database rows were removed again. See previous log lines for the concrete filesystem or hashing error.", LL_WARNING);
+			return true;
 		}
 		finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
 		FileIndex::flush();
+
+		// Per-backup reporting keeps ignored read errors attributable to the backup
+		// that triggered them, instead of only showing the final global aggregate.
+		if (ignored_read_errors_for_backup > 0)
+		{
+			Server->Log("Imported storage file backup client \"" + entry.clientname + "\" path \""
+				+ entry.backup_path + "\" with " + convert(ignored_read_errors_for_backup)
+				+ " ignored read error(s) because --ignore-read-errors was specified.", LL_WARNING);
+		}
 
 		if (!update_client_rollups(db, imported.clientid))
 		{
@@ -1095,7 +1270,7 @@ bool find_image_payload_in_backup_root(const std::string& backup_root, std::stri
 		}
 
 		const std::string ext = findextension(files[i].name);
-		if (ext == "raw" || ext == "vhd" || ext == "vhdz" || ext == "vhdx" || ext == "vhdxz")
+		if (is_supported_image_extension(ext))
 		{
 			image_name = files[i].name;
 			image_size = files[i].size;
@@ -1144,7 +1319,23 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 
 	std::string image_name;
 	_i64 image_size = 0;
-	if (!find_image_payload_in_backup_root(entry.root_path, image_name, image_size))
+	if (entry.standalone_image_file)
+	{
+		// Standalone image files already point at the payload, so import must not
+		// search for a nested image file that does not exist in that layout.
+		SFile file_meta = getFileMetadata(entry.payload_path);
+		if (file_meta.isdir || file_meta.isspecialf || file_meta.name.empty())
+		{
+			Server->Log("Could not import storage-backed image backup client \"" + entry.clientname
+				+ "\" path \"" + entry.backup_path + "\" because payload file \"" + entry.payload_path
+				+ "\" is not accessible as a regular file", LL_WARNING);
+			return true;
+		}
+
+		image_name = file_meta.name;
+		image_size = file_meta.size;
+	}
+	else if (!find_image_payload_in_backup_root(entry.root_path, image_name, image_size))
 	{
 		Server->Log("Could not find image payload in storage path \"" + entry.root_path + "\" for client \""
 			+ entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
@@ -1158,14 +1349,24 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 			+ " AND backuptime<" + sql_string(sqlite_time));
 		incremental = (!older.empty() && watoi64(older[0]["c"]) > 0) ? 1 : 0;
 	}
-	const std::string image_path = join_path(entry.root_path, image_name);
+	const std::string image_path = entry.standalone_image_file
+		? entry.payload_path
+		: join_path(entry.root_path, image_name);
 	const std::string image_letter = storage_image_letter(entry, image_name);
 
 	++stats.dataset_backups_importable;
 	SCursorProgress image_progress("Importing storage image backup", 0);
 	log_with_cursor_progress(image_progress,
-		std::string(apply ? "Importing" : "Would import") + " storage-backed image backup client \""
+		std::string(apply ? "Importing" : "Would import") + " " + storage_import_action_label(entry) + " image backup client \""
 		+ entry.clientname + "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
+
+	// Image dry-runs only need to surface the visible candidate itself. Payload
+	// validation remains part of apply mode so the listing stays aligned with
+	// remove-unknown even when image directories are currently unreadable.
+	if (!apply)
+	{
+		return true;
+	}
 
 	if (!insert_dataset_image_backup_row(db, image_columns, clientid, sqlite_time, image_path, image_letter, incremental, image_size, apply))
 	{
@@ -1185,7 +1386,7 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 }
 
 bool import_missing_dataset_backups(IDatabase* db, const std::string& client_filter,
-	const std::string& storage_prefix, bool apply, SStats& stats)
+	const std::string& storage_prefix, bool apply, bool ignore_read_errors, SStats& stats)
 {
 	std::vector<SStorageBackupEntry> entries;
 	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries, stats))
@@ -1225,10 +1426,10 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 	{
 		const SStorageBackupEntry& entry = entries[i];
 		++stats.dataset_backups_seen;
-		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + storage_entry_display_name(entry), false);
 
 		const bool exists = entry.image
-			? current_image_backup_exists(db, entry.clientname, entry.backup_path)
+			? current_storage_image_backup_exists(db, entry)
 			: current_backup_exists(db, entry.clientname, entry.backup_path);
 		if (exists)
 		{
@@ -1237,11 +1438,17 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 
 		if (entry.image)
 		{
-			ok = ok && import_storage_image_backup(db, image_columns, entry, apply, stats);
+			SStorageBackupEntry current_entry = entry;
+			int64 existing_clientid = 0;
+			current_entry.client_exists_in_db = current_client_id(db, entry.clientname, existing_clientid);
+			ok = ok && import_storage_image_backup(db, image_columns, current_entry, apply, stats);
 		}
 		else
 		{
-			ok = ok && import_storage_file_backup(db, backup_columns, entry, apply, stats);
+			SStorageBackupEntry current_entry = entry;
+			int64 existing_clientid = 0;
+			current_entry.client_exists_in_db = current_client_id(db, entry.clientname, existing_clientid);
+			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, stats);
 		}
 		if (!ok)
 		{
@@ -2682,6 +2889,7 @@ void log_summary(const SStats& stats, bool apply)
 	Server->Log("  visible storage backups importable: " + convert(stats.dataset_backups_importable), LL_INFO);
 	Server->Log(std::string("  visible storage backups ") + (apply ? "imported: " : "would import: ")
 		+ convert(apply ? stats.dataset_backups_imported : stats.dataset_backups_importable), LL_INFO);
+	Server->Log("  ignored read errors during storage import: " + convert(stats.ignored_read_errors), LL_INFO);
 	Server->Log("  visible storage links with unreachable targets: " + convert(stats.broken_storage_link_targets), LL_INFO);
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
@@ -2714,6 +2922,7 @@ int reconcile_storage()
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
 	bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_storage") == "true";
+	const bool ignore_read_errors = Server->getServerParameter("ignore_read_errors") == "true";
 	if (!import_missing_dataset_backups_enabled)
 	{
 		import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
@@ -2831,7 +3040,7 @@ int reconcile_storage()
 
 	if (import_missing_dataset_backups_enabled)
 	{
-		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, stats);
+		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, ignore_read_errors, stats);
 	}
 	else
 	{

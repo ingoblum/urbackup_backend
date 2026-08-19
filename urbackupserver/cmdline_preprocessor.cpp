@@ -1207,6 +1207,10 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Import missing visible backups from the current storage tree, including copied directories and recreated dataset links.",
 		cmd, false);
 
+	TCLAP::SwitchArg ignore_read_errors_arg("", "ignore-read-errors",
+		"While importing storage-backed file backups, skip unreadable files and subtrees instead of skipping the whole backup.",
+		cmd, false);
+
 	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
@@ -1308,6 +1312,13 @@ int action_reconcile_storage(std::vector<std::string> args)
 	if(import_dataset_backups_arg.getValue())
 	{
 		real_args.push_back("--import_storage");
+		real_args.push_back("true");
+	}
+	if(ignore_read_errors_arg.getValue())
+	{
+		// Partial storage imports are explicit because they can reconstruct backups
+		// with missing files when only parts of the source tree are readable.
+		real_args.push_back("--ignore_read_errors");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())
