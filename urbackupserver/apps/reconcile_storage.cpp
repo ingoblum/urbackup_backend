@@ -25,6 +25,9 @@
 #include <set>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -263,6 +266,59 @@ bool should_recreate_image_dataset_link(const db_single_result& row)
 	// server mode. VHD/VHDZ/VHDX variants remain regular files and must not be recreated
 	// as directory links here.
 	return findextension(image_path) == "raw";
+}
+
+std::string read_trimmed_file_if_exists(const std::string& path)
+{
+	if (!FileExists(os_file_prefix(path)))
+	{
+		return std::string();
+	}
+
+	return trim(getFile(path));
+}
+
+void warn_if_dataset_detection_failed()
+{
+	const std::string dataset_image = read_trimmed_file_if_exists("/etc/urbackup/dataset");
+	const std::string dataset_file = read_trimmed_file_if_exists("/etc/urbackup/dataset_file");
+	if (dataset_image.empty() && dataset_file.empty())
+	{
+		return;
+	}
+
+	if (BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile
+		|| BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs)
+	{
+		return;
+	}
+
+	std::string configured_roots;
+	if (!dataset_image.empty())
+	{
+		configured_roots = "dataset=\"" + dataset_image + "\"";
+	}
+	if (!dataset_file.empty())
+	{
+		if (!configured_roots.empty())
+		{
+			configured_roots += " ";
+		}
+		configured_roots += "dataset_file=\"" + dataset_file + "\"";
+	}
+
+	std::string msg = "Dataset link recreation is enabled and dataset roots are configured (" + configured_roots
+		+ "), but snapshot detection did not activate ZFS dataset-backed backups. Reconcile-storage therefore cannot determine dataset mountpoints or link targets.";
+#ifndef _WIN32
+	// The snapshot helper test is often privilege-sensitive on Linux/ZFS setups. A
+	// non-root reconcile run should call this out explicitly so operators can retry
+	// with the same privileges as the regular server process.
+	if (geteuid() != 0)
+	{
+		msg += " The current process is not running as root; if the snapshot helper requires root privileges for ZFS detection, rerun reconcile-storage with root privileges or the same user the working server uses.";
+	}
+#endif
+	Server->Log(msg, LL_WARNING);
 }
 
 bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_filter,
@@ -1730,6 +1786,11 @@ int reconcile_storage()
 		return 1;
 	}
 
+	// Dataset-link recreation relies on the same global snapshot method state as the
+	// normal backup paths. Reconcile-storage must initialize that state explicitly
+	// before deciding whether file/image backups use ZFS-backed datasets.
+	BackupServer::testSnapshotAvailability(db);
+
 	ServerSettings settings(db);
 	std::string new_storage_prefix = strip_trailing_sep(Server->getServerParameter("new_storage_prefix"));
 	if (new_storage_prefix.empty())
@@ -1797,6 +1858,7 @@ int reconcile_storage()
 
 	if (recreate_missing_dataset_links_enabled)
 	{
+		warn_if_dataset_detection_failed();
 		ok = ok && recreate_missing_dataset_links(db, client_filter, new_storage_prefix, apply, stats);
 	}
 	else
