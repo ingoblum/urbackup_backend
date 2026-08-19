@@ -1154,7 +1154,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 {
 	TCLAP::CmdLine cmd("Reconcile UrBackup database entries with migrated backup storage", ' ', cmdline_version);
 
-	TCLAP::ValueArg<std::string> import_db_dir_arg("", "import-db-dir",
+	TCLAP::ValueArg<std::string> import_db_dir_arg("", "import-db",
 		"Directory containing UrBackup database files to import missing backups from. If omitted, only the current database is reconciled.",
 		false, "", "path", cmd);
 
@@ -1203,7 +1203,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 	// Missing backup rows can be reconstructed from whatever is currently visible below
 	// the storage prefix. That includes real copied directories as well as dataset-backed
 	// backups whose links were recreated beforehand via --recreate-missing-dataset-links.
-	TCLAP::SwitchArg import_dataset_backups_arg("", "import-missing-dataset-backups",
+	TCLAP::SwitchArg import_dataset_backups_arg("", "import-storage",
 		"Import missing visible backups from the current storage tree, including copied directories and recreated dataset links.",
 		cmd, false);
 
@@ -1222,11 +1222,19 @@ int action_reconcile_storage(std::vector<std::string> args)
 	{
 		if(args[i]=="--old-db-dir")
 		{
-			args[i]="--import-db-dir";
+			args[i]="--import-db";
 		}
 		else if(args[i].find("--old-db-dir=")==0)
 		{
-			args[i]="--import-db-dir="+args[i].substr(std::string("--old-db-dir=").size());
+			args[i]="--import-db="+args[i].substr(std::string("--old-db-dir=").size());
+		}
+		else if(args[i]=="--import-db-dir")
+		{
+			args[i]="--import-db";
+		}
+		else if(args[i].find("--import-db-dir=")==0)
+		{
+			args[i]="--import-db="+args[i].substr(std::string("--import-db-dir=").size());
 		}
 	}
 
@@ -1244,7 +1252,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 	const std::string import_db_dir = import_db_dir_arg.getValue();
 	if(!import_db_dir.empty())
 	{
-		real_args.push_back("--import_db_dir");
+		real_args.push_back("--import_db");
 		real_args.push_back(import_db_dir);
 	}
 	if(!backup_database_arg.getValue().empty())
@@ -1299,7 +1307,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 	}
 	if(import_dataset_backups_arg.getValue())
 	{
-		real_args.push_back("--import_missing_dataset_backups");
+		real_args.push_back("--import_storage");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())

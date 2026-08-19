@@ -47,7 +47,7 @@ struct SStats
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
 		dataset_links(0), dataset_links_created(0), dataset_backups_seen(0),
-		dataset_backups_importable(0), dataset_backups_imported(0),
+		dataset_backups_importable(0), dataset_backups_imported(0), broken_storage_link_targets(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
@@ -66,6 +66,7 @@ struct SStats
 	int64 dataset_backups_seen;
 	int64 dataset_backups_importable;
 	int64 dataset_backups_imported;
+	int64 broken_storage_link_targets;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
 	int64 missing_files;
@@ -638,7 +639,7 @@ bool is_image_backup_name(const std::string& backup_path)
 }
 
 bool list_visible_storage_backup_entries(const std::string& storage_prefix, const std::string& client_filter,
-	std::vector<SStorageBackupEntry>& entries)
+	std::vector<SStorageBackupEntry>& entries, SStats& stats)
 {
 	bool has_error = false;
 	std::vector<SFile> clients = getFiles(storage_prefix, &has_error);
@@ -685,6 +686,18 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 			entry.root_path = join_path(client_root, backups[j].name);
 			entry.clientname = clients[i].name;
 			entry.backup_path = backups[j].name;
+
+			// A visible backup symlink whose target is currently not reachable would be
+			// seen by later cleanup logic as a broken storage object. Reconcile-storage
+			// warns immediately so operators do not run remove-unknown against an
+			// incomplete mount state and accidentally delete still-valid backup data.
+			if (entry.symlink && !os_directory_exists(os_file_prefix(entry.root_path)))
+			{
+				++stats.broken_storage_link_targets;
+				Server->Log("Visible backup link \"" + entry.root_path + "\" exists, but its target is currently not reachable. "
+					"Do not run remove-unknown before the underlying dataset or mount target is available.", LL_WARNING);
+			}
+
 			entries.push_back(entry);
 		}
 	}
@@ -1107,7 +1120,7 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 	const std::string& storage_prefix, bool apply, SStats& stats)
 {
 	std::vector<SStorageBackupEntry> entries;
-	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries))
+	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries, stats))
 	{
 		return false;
 	}
@@ -2601,6 +2614,7 @@ void log_summary(const SStats& stats, bool apply)
 	Server->Log("  visible storage backups importable: " + convert(stats.dataset_backups_importable), LL_INFO);
 	Server->Log(std::string("  visible storage backups ") + (apply ? "imported: " : "would import: ")
 		+ convert(apply ? stats.dataset_backups_imported : stats.dataset_backups_importable), LL_INFO);
+	Server->Log("  visible storage links with unreachable targets: " + convert(stats.broken_storage_link_targets), LL_INFO);
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
@@ -2614,7 +2628,11 @@ void log_summary(const SStats& stats, bool apply)
 
 int reconcile_storage()
 {
-	std::string import_db_dir = strip_trailing_sep(Server->getServerParameter("import_db_dir"));
+	std::string import_db_dir = strip_trailing_sep(Server->getServerParameter("import_db"));
+	if (import_db_dir.empty())
+	{
+		import_db_dir = strip_trailing_sep(Server->getServerParameter("import_db_dir"));
+	}
 	if (import_db_dir.empty())
 	{
 		import_db_dir = strip_trailing_sep(Server->getServerParameter("old_db_dir"));
@@ -2627,7 +2645,11 @@ int reconcile_storage()
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
-	const bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
+	bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_storage") == "true";
+	if (!import_missing_dataset_backups_enabled)
+	{
+		import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
+	}
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 
 	if (skip_db_backup)
@@ -2646,7 +2668,7 @@ int reconcile_storage()
 	}
 	if (import_db_dir.empty())
 	{
-		Server->Log("No --import-db-dir specified. Missing backup import is disabled; only current database actions will run.", LL_INFO);
+		Server->Log("No --import-db specified. Missing backup import is disabled; only current database actions will run.", LL_INFO);
 	}
 
 	open_server_database(true);
@@ -2726,7 +2748,7 @@ int reconcile_storage()
 	}
 	else
 	{
-		Server->Log("Skipping missing backup import because --import-db-dir was not specified.", LL_INFO);
+		Server->Log("Skipping missing backup import because --import-db was not specified.", LL_INFO);
 	}
 
 	if (recreate_missing_dataset_links_enabled)
@@ -2745,7 +2767,7 @@ int reconcile_storage()
 	}
 	else
 	{
-		Server->Log("Skipping visible storage backup import because --import-missing-dataset-backups was not specified.", LL_INFO);
+		Server->Log("Skipping visible storage backup import because --import-storage was not specified.", LL_INFO);
 	}
 
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
@@ -2791,6 +2813,14 @@ int reconcile_storage()
 	}
 
 	log_summary(stats, apply);
+	if (stats.broken_storage_link_targets > 0)
+	{
+		// Broken backup links usually indicate that dataset-backed storage is not
+		// mounted at the moment. Running remove-unknown in that state would interpret
+		// those backups as missing and can therefore delete references to valid data.
+		Server->Log("Detected " + convert(stats.broken_storage_link_targets)
+			+ " visible backup link(s) with unreachable targets. Do not run remove-unknown until the corresponding datasets or mount targets are available again, otherwise this can cause data loss.", LL_WARNING);
+	}
 
 	if (!apply)
 	{
