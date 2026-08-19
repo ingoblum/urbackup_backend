@@ -616,6 +616,9 @@ int action_remove_unknown(std::vector<std::string> args)
 	TCLAP::ValueArg<std::string> user_arg("u", "user",
 		"Change process to run as specific user",
 		false, "urbackup", "user", cmd);
+	TCLAP::SwitchArg dry_run_arg("", "dry-run",
+		"Scan backup storage and log remove-unknown actions without changing database, symlinks or backup storage",
+		cmd, false);
 
 	std::vector<std::string> real_args;
 	real_args.push_back(args[0]);
@@ -631,6 +634,13 @@ int action_remove_unknown(std::vector<std::string> args)
 	real_args.push_back("debug");
 	real_args.push_back("--app");
 	real_args.push_back("remove_unknown");
+	if(dry_run_arg.getValue())
+	{
+		// The preprocessor forwards dry-run explicitly so the backend can keep the
+		// same discovery path while suppressing every write side effect centrally.
+		real_args.push_back("--dry_run");
+		real_args.push_back("true");
+	}
 	real_args.push_back("--snapshot_helper");
 	real_args.push_back(BINDIR "/urbackup_snapshot_helper");
 

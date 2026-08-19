@@ -209,20 +209,66 @@ int defrag_database(void)
 
 int remove_unknown(void)
 {
-	Server->Log("Going to remove all unknown files and directories in the urbackup storage directory. Waiting 20 seconds...", LL_INFO);
+	const bool dry_run = Server->getServerParameter("dry_run") == "true";
 
-	Server->wait(20000);
-
-	Server->setServerParameter("cleanup_amount", "0%");
-	if(cleanup_cmd()!=0)
+	if(!dry_run)
 	{
-		Server->Log("Error cleaning up.", LL_ERROR);
-		return 1;
+		Server->Log("Going to remove all unknown files and directories in the urbackup storage directory. Waiting 20 seconds...", LL_INFO);
+
+		Server->wait(20000);
+
+		Server->setServerParameter("cleanup_amount", "0%");
+		if(cleanup_cmd()!=0)
+		{
+			Server->Log("Error cleaning up.", LL_ERROR);
+			return 1;
+		}
+	}
+	else
+	{
+		// Dry-run intentionally bypasses cleanup_cmd() because that helper also
+		// performs regular cleanup work unrelated to remove-unknown. This keeps the
+		// simulation limited to the unknown-object scan and avoids hidden writes.
+		Server->Log("Starting remove-unknown in dry-run mode.", LL_INFO);
+		// Apply mode currently runs the generic cleanup prelude first. The dry-run
+		// logs that difference explicitly so operators can account for cleanup-side
+		// effects that are not simulated here.
+		Server->Log("Dry-run note: apply mode would first execute the generic cleanup prelude from cleanup_cmd() with cleanup_amount=0%, including file index opening/creation, snapshot availability checks and the regular cleanup initialization path.", LL_WARNING);
+
+		Server->Log("Shutting down all database instances...", LL_INFO);
+		Server->destroyAllDatabases();
+
+		Server->Log("Opening urbackup server database...", LL_INFO);
+		open_server_database(true);
+		open_settings_database();
+
+		IDatabase *db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+		if(db==NULL)
+		{
+			Server->Log("Could not open database", LL_ERROR);
+			return 1;
+		}
+
+		IDatabase *db_files = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES);
+		if (db_files == NULL)
+		{
+			Server->Log("Could not open files database", LL_ERROR);
+			return 1;
+		}
+
+		start_wal_checkpoint_threads();
 	}
 
-	ServerCleanupThread::removeUnknown();
+	ServerCleanupThread::removeUnknown(dry_run);
 
-	Server->Log("Successfully removed all unknown files in backup directory.", LL_INFO);
+	if(dry_run)
+	{
+		Server->Log("Remove-unknown dry-run complete. No database or storage changes were applied.", LL_INFO);
+	}
+	else
+	{
+		Server->Log("Successfully removed all unknown files in backup directory.", LL_INFO);
+	}
 
 	return 0;
 }

@@ -61,6 +61,32 @@ void cleanupLastActs();
 
 const unsigned int min_cleanup_interval=12*60*60;
 
+namespace
+{
+	struct SRemoveUnknownStats
+	{
+		SRemoveUnknownStats()
+			: missing_file_backups(0), missing_image_backups(0), unknown_file_backups(0),
+			unknown_image_backups(0), symlink_repairs(0), dangling_file_rows(0)
+		{
+		}
+
+		size_t missing_file_backups;
+		size_t missing_image_backups;
+		size_t unknown_file_backups;
+		size_t unknown_image_backups;
+		size_t symlink_repairs;
+		size_t dangling_file_rows;
+	};
+
+	// Dry-run keeps detection and logging aligned with apply mode while routing
+	// every destructive branch through a single predicate.
+	std::string dry_run_prefix(bool dry_run)
+	{
+		return dry_run ? "Would " : std::string();
+	}
+}
+
 void ServerCleanupThread::initMutex(void)
 {
 	mutex=Server->createMutex();
@@ -96,7 +122,12 @@ void ServerCleanupThread::operator()(void)
 		cleanupdao.reset(new ServerCleanupDao(db));
 		backupdao.reset(new ServerBackupDao(db));
 		filesdao.reset(new ServerFilesDao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES)));
-		fileindex.reset(create_lmdb_files_index());
+		if (!(cleanup_action.action == ECleanupAction_RemoveUnknown && cleanup_action.dry_run))
+		{
+			// Remove-unknown dry-run never mutates file rows, so it can avoid opening
+			// or creating the LMDB file index and remain side-effect free.
+			fileindex.reset(create_lmdb_files_index());
+		}
 
 		switch(cleanup_action.action)
 		{
@@ -525,8 +556,16 @@ bool ServerCleanupThread::do_cleanup(int64 minspace, bool do_cleanup_other)
 void ServerCleanupThread::do_remove_unknown(void)
 {
 	ServerSettings settings(db);
+	const bool dry_run = cleanup_action.dry_run;
+	SRemoveUnknownStats stats;
 
-	replay_directory_link_journal();
+	if (dry_run)
+	{
+		// The journal can recreate symlinks and then clear bookkeeping rows. Dry-run
+		// still inspects those entries, but must not consume them before apply mode.
+		Server->Log("Scanning directory link journal in dry-run mode.", LL_INFO);
+	}
+	replay_directory_link_journal(dry_run);
 
 	ServerLinkDao link_dao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_LINKS));
 
@@ -549,9 +588,13 @@ void ServerCleanupThread::do_remove_unknown(void)
 			int backupid=res_file_backups[j].id;
 			if(!os_directory_exists(backup_path))
 			{
-				Server->Log("Path for file backup [id="+convert(res_file_backups[j].id)+" path="+res_file_backups[j].path+" clientname="+clientname+"] does not exist. Deleting it from the database.", LL_WARNING);
+				++stats.missing_file_backups;
+				Server->Log(dry_run_prefix(dry_run)+"remove file backup [id="+convert(res_file_backups[j].id)+" path="+res_file_backups[j].path+" clientname="+clientname+"] from the database because its path does not exist.", LL_WARNING);
 
-				removeFileBackupSql(backupid);
+				if(!dry_run)
+				{
+					removeFileBackupSql(backupid);
+				}
 
 			}
 		}
@@ -565,8 +608,12 @@ void ServerCleanupThread::do_remove_unknown(void)
 			IFile *tf=Server->openFile(os_file_prefix(backup_path), MODE_READ);
 			if(tf==NULL)
 			{
-				Server->Log("Image backup [id="+convert(res_image_backups[j].id)+" path="+res_image_backups[j].path+" clientname="+clientname+"] does not exist. Deleting it from the database.", LL_WARNING);
-				cleanupdao->removeImage(res_image_backups[j].id);
+				++stats.missing_image_backups;
+				Server->Log(dry_run_prefix(dry_run)+"remove image backup [id="+convert(res_image_backups[j].id)+" path="+res_image_backups[j].path+" clientname="+clientname+"] from the database because its path does not exist.", LL_WARNING);
+				if(!dry_run)
+				{
+					cleanupdao->removeImage(res_image_backups[j].id);
+				}
 			}
 			else
 			{
@@ -600,17 +647,25 @@ void ServerCleanupThread::do_remove_unknown(void)
 
 					if (!res_id.exists)
 					{
-						Server->Log("File backup \"" + cf.name + "\" of client \"" + clientname + "\" not found in database. Deleting it.", LL_WARNING);
+						++stats.unknown_file_backups;
+						Server->Log(dry_run_prefix(dry_run)+"delete file backup \"" + cf.name + "\" of client \"" + clientname + "\" because it is not present in the database.", LL_WARNING);
 						bool remove_folder = false;
 						if (!cf.isdir)
 						{
-							SnapshotHelper::removeFilesystem(false, clientname, cf.name);
-							Server->deleteFile(os_file_prefix(backupfolder
-								+ os_file_sep() + clientname + os_file_sep() + cf.name));
+							if(!dry_run)
+							{
+								SnapshotHelper::removeFilesystem(false, clientname, cf.name);
+								Server->deleteFile(os_file_prefix(backupfolder
+									+ os_file_sep() + clientname + os_file_sep() + cf.name));
+							}
 						}
 						else if (BackupServer::isFileSnapshotsEnabled())
 						{
-							if (!SnapshotHelper::removeFilesystem(false, clientname, cf.name))
+							if (dry_run)
+							{
+								remove_folder = !SnapshotHelper::isSubvolume(false, clientname, cf.name);
+							}
+							else if (!SnapshotHelper::removeFilesystem(false, clientname, cf.name))
 							{
 								remove_folder = true;
 							}
@@ -623,7 +678,11 @@ void ServerCleanupThread::do_remove_unknown(void)
 						if (remove_folder)
 						{
 							std::string rm_dir = backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name;
-							if (!remove_directory_link_dir(rm_dir, link_dao, clientid))
+							if (dry_run)
+							{
+								Server->Log("Would delete directory tree \"" + rm_dir + "\" including directory-link entries if present.", LL_WARNING);
+							}
+							else if (!remove_directory_link_dir(rm_dir, link_dao, clientid))
 							{
 								Server->Log("Could not delete directory \"" + rm_dir + "\"", LL_ERROR);
 							}
@@ -658,9 +717,14 @@ void ServerCleanupThread::do_remove_unknown(void)
 
 						if (!found)
 						{
-							Server->Log("Image backup \"" + cf.name + "\" of client \"" + clientname + "\" not found in database. Deleting it.", LL_WARNING);
+							++stats.unknown_image_backups;
+							Server->Log(dry_run_prefix(dry_run)+"delete image backup \"" + cf.name + "\" of client \"" + clientname + "\" because it is not present in the database.", LL_WARNING);
 							
-							if (extension == "raw")
+							if (dry_run)
+							{
+								continue;
+							}
+							else if (extension == "raw")
 							{
 								SnapshotHelper::removeFilesystem(true, clientname, cf.name);
 							}
@@ -675,17 +739,27 @@ void ServerCleanupThread::do_remove_unknown(void)
 					{
 						if (!cf.isdir)
 						{
-							SnapshotHelper::removeFilesystem(true, clientname, cf.name);
-							Server->deleteFile(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name));
+							++stats.unknown_image_backups;
+							Server->Log(dry_run_prefix(dry_run)+"delete standalone image entry \"" + cf.name + "\" of client \"" + clientname + "\" because it is not present in the database.", LL_WARNING);
+							if(!dry_run)
+							{
+								SnapshotHelper::removeFilesystem(true, clientname, cf.name);
+								Server->deleteFile(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name));
+							}
 						}
 						else
 						{
-							os_remove_nonempty_dir(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name));
-
-							if(os_directory_exists(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name))
-								&& BackupServer::isImageSnapshotsEnabled() )
+							++stats.unknown_image_backups;
+							Server->Log(dry_run_prefix(dry_run)+"delete image directory \"" + cf.name + "\" of client \"" + clientname + "\" because it does not contain a known image backup.", LL_WARNING);
+							if(!dry_run)
 							{
-								SnapshotHelper::removeFilesystem(true, clientname, cf.name);
+								os_remove_nonempty_dir(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name));
+
+								if(os_directory_exists(os_file_prefix(backupfolder + os_file_sep() + clientname + os_file_sep() + cf.name))
+									&& BackupServer::isImageSnapshotsEnabled() )
+								{
+									SnapshotHelper::removeFilesystem(true, clientname, cf.name);
+								}
 							}
 						}
 					}
@@ -712,27 +786,35 @@ void ServerCleanupThread::do_remove_unknown(void)
 
 				if(!found)
 				{
-					Server->Log("Image backup \""+cf.name+"\" of client \""+clientname+"\" not found in database. Deleting it.", LL_WARNING);
+					++stats.unknown_image_backups;
+					Server->Log(dry_run_prefix(dry_run)+"delete image backup \""+cf.name+"\" of client \""+clientname+"\" because it is not present in the database.", LL_WARNING);
 					std::string rm_file=backupfolder+os_file_sep()+clientname+os_file_sep()+cf.name;
-					if(!Server->deleteFile(rm_file))
+					if(dry_run)
 					{
-						Server->Log("Could not delete file \""+rm_file+"\"", LL_ERROR);
+						Server->Log("Would delete image sidecar files for \""+rm_file+"\" (.mbr, .hash, .bitmap, .cbitmap, .sync).", LL_WARNING);
 					}
-					if(!Server->deleteFile(rm_file+".mbr"))
+					else
 					{
-						Server->Log("Could not delete file \""+rm_file+".mbr\"", LL_ERROR);
+						if(!Server->deleteFile(rm_file))
+						{
+							Server->Log("Could not delete file \""+rm_file+"\"", LL_ERROR);
+						}
+						if(!Server->deleteFile(rm_file+".mbr"))
+						{
+							Server->Log("Could not delete file \""+rm_file+".mbr\"", LL_ERROR);
+						}
+						if(!Server->deleteFile(rm_file+".hash"))
+						{
+							Server->Log("Could not delete file \""+rm_file+".hash\"", LL_ERROR);
+						}
+						Server->deleteFile(rm_file+".bitmap");
+						Server->deleteFile(rm_file+".cbitmap");
+						Server->deleteFile(rm_file + ".sync");
 					}
-					if(!Server->deleteFile(rm_file+".hash"))
-					{
-						Server->Log("Could not delete file \""+rm_file+".hash\"", LL_ERROR);
-					}
-					Server->deleteFile(rm_file+".bitmap");
-					Server->deleteFile(rm_file+".cbitmap");
-					Server->deleteFile(rm_file + ".sync");
 				}
 			}
 		}
-		check_symlinks(res_clients[i], backupfolder, false);
+		check_symlinks(res_clients[i], backupfolder, false, dry_run);
 	}
 
 	Server->Log("Removing dangling file entries...", LL_INFO);
@@ -760,13 +842,38 @@ void ServerCleanupThread::do_remove_unknown(void)
 
 	if (ok)
 	{
-		filesdao->removeDanglingFiles();
-		Server->Log("Deleted " + convert(files_db->getLastChanges()) + " file entries", LL_INFO);
+		if (dry_run)
+		{
+			// The temporary table mirrors apply mode exactly, so the count below
+			// reflects the rows removeDanglingFiles() would delete without touching
+			// the files table during simulation.
+			db_results dangling_rows = files_db->Read("SELECT COUNT(*) AS c FROM files WHERE backupid NOT IN (SELECT id FROM backups)");
+			if (!dangling_rows.empty())
+			{
+				stats.dangling_file_rows = watoi64(dangling_rows[0]["c"]);
+			}
+			Server->Log("Would delete " + convert(stats.dangling_file_rows) + " dangling file entries", LL_INFO);
+		}
+		else
+		{
+			filesdao->removeDanglingFiles();
+			Server->Log("Deleted " + convert(files_db->getLastChanges()) + " file entries", LL_INFO);
+		}
 	}
 
 	files_db->Write("DROP TABLE backups");
 
-	FileIndex::flush();
+	if (!dry_run)
+	{
+		FileIndex::flush();
+	}
+
+	Server->Log(std::string("Remove-unknown summary: missing file backups=") + convert(stats.missing_file_backups)
+		+ " missing image backups=" + convert(stats.missing_image_backups)
+		+ " unknown file backups=" + convert(stats.unknown_file_backups)
+		+ " unknown image backups=" + convert(stats.unknown_image_backups)
+		+ " dangling file rows=" + convert(stats.dangling_file_rows)
+		+ (dry_run ? " mode=dry-run" : " mode=apply"), LL_INFO);
 }
 
 int ServerCleanupThread::hasEnoughFreeSpace(int64 minspace, ServerSettings *settings)
@@ -1994,9 +2101,9 @@ bool ServerCleanupThread::cleanupSpace(int64 minspace, bool do_cleanup_other)
 	return result;
 }
 
-void ServerCleanupThread::removeUnknown(void)
+void ServerCleanupThread::removeUnknown(bool dry_run)
 {
-	Server->getThreadPool()->executeWait(new ServerCleanupThread(CleanupAction(ECleanupAction_RemoveUnknown)),
+	Server->getThreadPool()->executeWait(new ServerCleanupThread(CleanupAction(ECleanupAction_RemoveUnknown, dry_run)),
 		"remove unknown");
 }
 
@@ -2204,7 +2311,7 @@ bool ServerCleanupThread::correct_poolname( const std::string& backupfolder, con
 }
 
 void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& client_info, const std::string& backupfolder,
-	bool deep_check)
+	bool deep_check, bool dry_run)
 {
 	const int clientid=client_info.id;
 	const std::string& clientname=client_info.name;
@@ -2257,7 +2364,11 @@ void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& c
 			{
 				if(symlink_pool_path!=pool_path)
 				{
-					Server->Log("Correcting target of symlink \""+new_target+"\" to \""+pool_path+"\"");
+					Server->Log(dry_run_prefix(dry_run)+"correct target of symlink \""+new_target+"\" to \""+pool_path+"\"");
+					if(dry_run)
+					{
+						continue;
+					}
 					if(os_remove_symlink_dir(os_file_prefix(new_target)))
 					{
 						if(!os_link_symbolic(pool_path, os_file_prefix(new_target)))
@@ -2285,18 +2396,36 @@ void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& c
 
 	for(size_t i=0;i<del_ids.size();++i)
 	{
-		link_dao.deleteLinkReferenceEntry(del_ids[i]);
+		if(dry_run)
+		{
+			Server->Log("Would delete pool reference entry id " + convert(del_ids[i]), LL_WARNING);
+		}
+		else
+		{
+			link_dao.deleteLinkReferenceEntry(del_ids[i]);
+		}
 	}
 
 	for(size_t i=0;i<target_adjustments.size();++i)
 	{
-		link_dao.updateLinkReferenceTarget(target_adjustments[i].second, target_adjustments[i].first);
+		if(dry_run)
+		{
+			Server->Log("Would adjust pool directory target of entry id " + convert(target_adjustments[i].first)
+				+ " to \"" + target_adjustments[i].second + "\"", LL_WARNING);
+		}
+		else
+		{
+			link_dao.updateLinkReferenceTarget(target_adjustments[i].second, target_adjustments[i].first);
+		}
 	}
 
-	for (size_t i = 0; i < deep_check_links.size(); ++i)
+	if (!dry_run)
 	{
-		reference_contained_directory_links(link_dao, clientid, deep_check_links[i].name,
-			std::string(), deep_check_links[i].target);
+		for (size_t i = 0; i < deep_check_links.size(); ++i)
+		{
+			reference_contained_directory_links(link_dao, clientid, deep_check_links[i].name,
+				std::string(), deep_check_links[i].target);
+		}
 	}
 
 	if(os_directory_exists(pool_root))
@@ -2314,7 +2443,14 @@ void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& c
 
 			if (pool_files.empty())
 			{
-				os_remove_dir(curr_path);
+				if(dry_run)
+				{
+					Server->Log("Would delete empty pool directory \"" + curr_path + "\"", LL_WARNING);
+				}
+				else
+				{
+					os_remove_dir(curr_path);
+				}
 				continue;
 			}
 			
@@ -2335,10 +2471,14 @@ void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& c
 					if (!deep_check)
 					{
 						Server->Log("Restarting symlink check. Starting deep directory link check...", LL_WARNING);
-						check_symlinks(client_info, backupfolder, true);
+						check_symlinks(client_info, backupfolder, true, dry_run);
 						return;
 					}
-					if(!remove_directory_link_dir(pool_path, link_dao, clientid))
+					if(dry_run)
+					{
+						Server->Log("Would remove unreferenced pool folder \"" + pool_path + "\"", LL_WARNING);
+					}
+					else if(!remove_directory_link_dir(pool_path, link_dao, clientid))
 					{
 						Server->Log("Could not remove pool folder \""+pool_path+"\"", LL_ERROR);
 					}
@@ -2351,7 +2491,14 @@ void ServerCleanupThread::check_symlinks( const ServerCleanupDao::SClientInfo& c
 
 			if (!has_dir)
 			{
-				os_remove_dir(curr_path);
+				if(dry_run)
+				{
+					Server->Log("Would delete empty pool root directory \"" + curr_path + "\"", LL_WARNING);
+				}
+				else
+				{
+					os_remove_dir(curr_path);
+				}
 			}
 		}
 	}	

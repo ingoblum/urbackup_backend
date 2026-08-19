@@ -28,14 +28,15 @@ struct CleanupAction
 {
 	//None
 	CleanupAction(void)
-		: action(ECleanupAction_None)
+		: action(ECleanupAction_None), clientid(0), backupid(0), force_remove(false),
+		cleanup_other(false), dry_run(false), minspace(0), result(NULL)
 	{
 	}
 
 	//Delete file backup
 	CleanupAction(std::string backupfolder, int clientid, int backupid, bool force_remove, bool *result)
 		: action(ECleanupAction_DeleteFilebackup), backupfolder(backupfolder), clientid(clientid), backupid(backupid),
-		  force_remove(force_remove), result(result)
+		  force_remove(force_remove), cleanup_other(false), dry_run(false), minspace(0), result(result)
 	{
 
 	}
@@ -43,20 +44,22 @@ struct CleanupAction
 	//Delete image backup
 	CleanupAction(int backupid, bool force_remove, bool *result)
 		: action(ECleanupAction_DeleteImagebackup), clientid(0), backupid(backupid),
-		force_remove(force_remove), result(result)
+		force_remove(force_remove), cleanup_other(false), dry_run(false), minspace(0), result(result)
 	{
 
 	}
 
 	//Free minspace
 	CleanupAction(int64 minspace, bool *result, bool cleanup_other)
-		: action(ECleanupAction_FreeMinspace), minspace(minspace), result(result), cleanup_other(cleanup_other)
+		: action(ECleanupAction_FreeMinspace), clientid(0), backupid(0), force_remove(false),
+		cleanup_other(cleanup_other), dry_run(false), minspace(minspace), result(result)
 	{
 	}
 
 	//Remove unknown data
-	CleanupAction(ECleanupAction action)
-		: action(action)
+	CleanupAction(ECleanupAction action, bool dry_run)
+		: action(action), clientid(0), backupid(0), force_remove(false),
+		cleanup_other(false), dry_run(dry_run), minspace(0), result(NULL)
 	{
 	}
 
@@ -67,6 +70,7 @@ struct CleanupAction
 	int backupid;
 	bool force_remove;
 	bool cleanup_other;
+	bool dry_run;
 
 	int64 minspace;
 	bool *result;
@@ -83,7 +87,7 @@ public:
 
 	static bool cleanupSpace(int64 minspace, bool do_cleanup_other=false);
 
-	static void removeUnknown(void);
+	static void removeUnknown(bool dry_run=false);
 
 	static void updateStats(bool interruptible);
 
@@ -126,7 +130,7 @@ private:
 
 	bool correct_poolname(const std::string& backupfolder, const std::string& clientname, const std::string& pool_name, std::string& pool_path);
 
-	void check_symlinks(const ServerCleanupDao::SClientInfo& client_info, const std::string& backupfolder, bool deep_check);
+	void check_symlinks(const ServerCleanupDao::SClientInfo& client_info, const std::string& backupfolder, bool deep_check, bool dry_run);
 
 	int max_removable_incr_images(ServerSettings& settings, int backupid, int del_in_stack);
 

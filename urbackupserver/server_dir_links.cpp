@@ -321,7 +321,7 @@ bool link_directory_pool( int clientid, const std::string& target_dir, const std
 	return true;
 }
 
-bool replay_directory_link_journal( )
+bool replay_directory_link_journal(bool dry_run)
 {
 	IScopedLock lock(dir_link_mutex);
 
@@ -342,6 +342,14 @@ bool replay_directory_link_journal( )
 		{
 			if(os_directory_exists(je.linktarget))
 			{
+				if(dry_run)
+				{
+					// Dry-run reports the exact journal repair that apply mode would
+					// replay, but leaves both the symlink and the journal entry intact.
+					Server->Log("Would replay symlink journal entry by linking \""+je.linkname+"\" to \""+je.linktarget+"\"", LL_WARNING);
+					continue;
+				}
+
 				os_remove_symlink_dir(os_file_prefix(je.linkname));
 				if(!os_link_symbolic(os_file_prefix(je.linktarget), os_file_prefix(je.linkname)))
 				{
@@ -352,7 +360,10 @@ bool replay_directory_link_journal( )
 		}
 	}
 
-	link_journal_dao.removeDirectoryLinkJournalEntries();
+	if(!dry_run)
+	{
+		link_journal_dao.removeDirectoryLinkJournalEntries();
+	}
 
 	return has_error;
 }

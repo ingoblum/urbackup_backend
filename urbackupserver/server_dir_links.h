@@ -17,7 +17,7 @@ void dir_link_lock_client_mutex(int clientid, IScopedLock& lock);
 bool link_directory_pool(int clientid, const std::string& target_dir, const std::string& src_dir, const std::string& pooldir, bool with_transaction,
 	ServerLinkDao*& link_dao, ServerLinkJournalDao*& link_journal_dao, int depth);
 
-bool replay_directory_link_journal();
+bool replay_directory_link_journal(bool dry_run=false);
 
 bool remove_directory_link(const std::string &path, ServerLinkDao& link_dao, int clientid,
 	std::auto_ptr<DBScopedSynchronous>& synchronous_link_dao, bool with_transaction=true);
