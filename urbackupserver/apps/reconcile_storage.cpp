@@ -638,6 +638,59 @@ bool is_image_backup_name(const std::string& backup_path)
 	return backup_path.find("_Image_") != std::string::npos;
 }
 
+bool is_backup_timestamp_component(const std::string& backup_path)
+{
+	if (backup_path.size() < 11 || backup_path[6] != '-')
+	{
+		return false;
+	}
+
+	// Visible storage imports must only consider objects that match the regular
+	// UrBackup naming scheme. This filters out administrative directories and
+	// copied helper content before any client/backup reconstruction logic starts.
+	for (size_t i = 0; i < 6; ++i)
+	{
+		if (backup_path[i] < '0' || backup_path[i] > '9')
+		{
+			return false;
+		}
+	}
+	for (size_t i = 7; i < 11; ++i)
+	{
+		if (backup_path[i] < '0' || backup_path[i] > '9')
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool is_valid_visible_backup_name(const std::string& backup_path)
+{
+	if (!is_backup_timestamp_component(backup_path))
+	{
+		return false;
+	}
+
+	if (backup_path.size() == 11)
+	{
+		return true;
+	}
+
+	const std::string image_marker = "_Image_";
+	return backup_path.size() > 11 + image_marker.size()
+		&& backup_path.substr(11, image_marker.size()) == image_marker;
+}
+
+bool should_skip_storage_visible_entry_name(const std::string& name)
+{
+	// Hidden bookkeeping directories below the storage root are not client backups.
+	// Importing them would create bogus client/backup rows such as ".migration-state"
+	// and can then trip later assumptions in the reconstruction path.
+	return !name.empty() && name[0] == '.';
+}
+
 bool list_visible_storage_backup_entries(const std::string& storage_prefix, const std::string& client_filter,
 	std::vector<SStorageBackupEntry>& entries, SStats& stats)
 {
@@ -652,6 +705,10 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 	for (size_t i = 0; i < clients.size(); ++i)
 	{
 		if ((!clients[i].isdir && !clients[i].issym) || clients[i].isspecialf)
+		{
+			continue;
+		}
+		if (should_skip_storage_visible_entry_name(clients[i].name))
 		{
 			continue;
 		}
@@ -672,6 +729,14 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 		for (size_t j = 0; j < backups.size(); ++j)
 		{
 			if ((!backups[j].isdir && !backups[j].issym) || backups[j].isspecialf)
+			{
+				continue;
+			}
+			if (should_skip_storage_visible_entry_name(backups[j].name))
+			{
+				continue;
+			}
+			if (!is_valid_visible_backup_name(backups[j].name))
 			{
 				continue;
 			}
@@ -978,28 +1043,31 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 	if (apply)
 	{
 		imported.backupid = db->getLastInsertID();
-	}
-
-	ServerFilesDao filesdao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES));
-	std::auto_ptr<FileIndex> fileindex(create_lmdb_files_index());
-	SCursorProgress import_progress("Importing storage file rows", 0);
-	if (!import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
-		entry.root_path, imported, import_progress, apply, stats))
-	{
-		finish_cursor_progress(import_progress, stats.file_rows_imported, "failed");
-		if (apply)
+		ServerFilesDao filesdao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES));
+		std::auto_ptr<FileIndex> fileindex(create_lmdb_files_index());
+		if (fileindex.get() == NULL)
 		{
+			Server->Log("Could not open file index for storage-backed file backup import. The file index is missing.", LL_ERROR);
+			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
+			return false;
+		}
+
+		SCursorProgress import_progress("Importing storage file rows", 0);
+		if (!import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
+			entry.root_path, imported, import_progress, apply, stats))
+		{
+			finish_cursor_progress(import_progress, stats.file_rows_imported, "failed");
 			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
 			Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES)->Write("DELETE FROM files WHERE backupid=" + convert(imported.backupid));
+			return false;
 		}
-		return false;
-	}
-	finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
-	FileIndex::flush();
+		finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
+		FileIndex::flush();
 
-	if (apply && !update_client_rollups(db, imported.clientid))
-	{
-		return false;
+		if (!update_client_rollups(db, imported.clientid))
+		{
+			return false;
+		}
 	}
 
 	if (apply)
