@@ -1200,6 +1200,13 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Recreate missing visible backup-directory links from configured dataset and dataset_file parents.",
 		cmd, false);
 
+	// Missing backup rows can be reconstructed from whatever is currently visible below
+	// the storage prefix. That includes real copied directories as well as dataset-backed
+	// backups whose links were recreated beforehand via --recreate-missing-dataset-links.
+	TCLAP::SwitchArg import_dataset_backups_arg("", "import-missing-dataset-backups",
+		"Import missing visible backups from the current storage tree, including copied directories and recreated dataset links.",
+		cmd, false);
+
 	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
@@ -1288,6 +1295,11 @@ int action_reconcile_storage(std::vector<std::string> args)
 	if(recreate_dataset_links_arg.getValue())
 	{
 		real_args.push_back("--recreate_missing_dataset_links");
+		real_args.push_back("true");
+	}
+	if(import_dataset_backups_arg.getValue())
+	{
+		real_args.push_back("--import_missing_dataset_backups");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())

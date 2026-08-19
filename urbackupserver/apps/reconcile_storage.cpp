@@ -12,10 +12,13 @@
 #include "app.h"
 #include "../snapshot_helper.h"
 #include "../server.h"
+#include "../server_hash.h"
 #include "../server_settings.h"
+#include "../create_files_index.h"
 #include "../../Interface/DatabaseCursor.h"
 #include "../../Interface/File.h"
 #include "../../urbackupcommon/os_functions.h"
+#include "../../urbackupcommon/TreeHash.h"
 #include "../../stringtools.h"
 
 #include <algorithm>
@@ -43,7 +46,9 @@ struct SStats
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
-		dataset_links(0), dataset_links_created(0), paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
+		dataset_links(0), dataset_links_created(0), dataset_backups_seen(0),
+		dataset_backups_importable(0), dataset_backups_imported(0),
+		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
 	}
@@ -58,6 +63,9 @@ struct SStats
 	int64 file_rows_skipped_malformed;
 	int64 dataset_links;
 	int64 dataset_links_created;
+	int64 dataset_backups_seen;
+	int64 dataset_backups_importable;
+	int64 dataset_backups_imported;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
 	int64 missing_files;
@@ -102,12 +110,61 @@ struct SCursorProgress
 	bool drawn;
 };
 
+struct STableColumnInfo
+{
+	std::string name;
+	std::string type;
+	std::string default_value;
+	bool notnull;
+};
+
+struct SDatasetEntry
+{
+	bool image;
+	std::string dataset_name;
+	std::string mountpoint;
+	std::string clientname;
+	std::string backup_path;
+};
+
+struct SStorageBackupEntry
+{
+	bool image;
+	bool symlink;
+	std::string root_path;
+	std::string clientname;
+	std::string backup_path;
+};
+
+struct SImportedDatasetBackup
+{
+	SImportedDatasetBackup()
+		: clientid(0), backupid(0), incremental(0), total_size(0), file_rows(0)
+	{
+	}
+
+	int64 clientid;
+	int64 backupid;
+	int incremental;
+	std::string clientname;
+	std::string backup_path;
+	std::string sqlite_time;
+	_i64 total_size;
+	int64 file_rows;
+};
+
 // The dataset-link reconciliation path reuses the interactive cursor progress helpers
 // below, so forward declarations keep the helper order stable and avoid reshuffling
 // already debugged output code.
 void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force);
 void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail);
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel);
+bool current_client_id(IDatabase* db, const std::string& clientname, int64& clientid);
+bool current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path);
+std::vector<STableColumnInfo> table_column_info(IDatabase* db, const std::string& dbname, const std::string& table);
+std::string column_list(const std::vector<SColumn>& columns, const std::string& prefix);
+std::string bind_list(size_t n);
+bool should_skip_dataset_entry_name(const std::string& name);
 
 std::string strip_trailing_sep(std::string path)
 {
@@ -152,6 +209,24 @@ std::string sql_ident(const std::string& value)
 		}
 	}
 	ret += "\"";
+	return ret;
+}
+
+std::string shell_single_quote(const std::string& value)
+{
+	std::string ret = "'";
+	for (size_t i = 0; i < value.size(); ++i)
+	{
+		if (value[i] == '\'')
+		{
+			ret += "'\\''";
+		}
+		else
+		{
+			ret += value[i];
+		}
+	}
+	ret += "'";
 	return ret;
 }
 
@@ -319,6 +394,782 @@ void warn_if_dataset_detection_failed()
 	}
 #endif
 	Server->Log(msg, LL_WARNING);
+}
+
+#ifndef _WIN32
+std::string find_zfs_cmd()
+{
+	const char* const locations[] = { "zfs", "/sbin/zfs", "/bin/zfs", "/usr/sbin/zfs", "/usr/bin/zfs" };
+	for (size_t i = 0; i < sizeof(locations) / sizeof(locations[0]); ++i)
+	{
+		if (system((std::string(locations[i]) + " list >/dev/null 2>&1").c_str()) == 0)
+		{
+			return locations[i];
+		}
+	}
+	return "zfs";
+}
+#endif
+
+bool list_zfs_dataset_entries(const std::string& dataset_root, bool image, std::vector<SDatasetEntry>& entries)
+{
+#ifdef _WIN32
+	(void)dataset_root;
+	(void)image;
+	(void)entries;
+	return false;
+#else
+	if (dataset_root.empty())
+	{
+		return true;
+	}
+
+	std::string output;
+	const std::string zfs_cmd = find_zfs_cmd();
+	const int rc = os_popen(zfs_cmd + " list -H -o name,mountpoint -r " + shell_single_quote(dataset_root), output);
+	if (rc != 0)
+	{
+		Server->Log("Could not enumerate ZFS datasets below \"" + dataset_root + "\" using \"" + zfs_cmd + "\"", LL_ERROR);
+		return false;
+	}
+
+	std::vector<std::string> lines;
+	Tokenize(output, lines, "\n");
+	for (size_t i = 0; i < lines.size(); ++i)
+	{
+		std::vector<std::string> cols;
+		Tokenize(lines[i], cols, "\t");
+		if (cols.size() < 2)
+		{
+			continue;
+		}
+
+		const std::string dataset_name = trim(cols[0]);
+		const std::string mountpoint = trim(cols[1]);
+		if (dataset_name == dataset_root)
+		{
+			continue;
+		}
+		if (!starts_with(dataset_name, dataset_root + "/"))
+		{
+			continue;
+		}
+		if (mountpoint.empty() || mountpoint == "-")
+		{
+			continue;
+		}
+
+		const std::string relative = dataset_name.substr(dataset_root.size() + 1);
+		std::vector<std::string> parts;
+		Tokenize(relative, parts, "/");
+		if (parts.size() < 2)
+		{
+			continue;
+		}
+
+		SDatasetEntry entry;
+		entry.image = image;
+		entry.dataset_name = dataset_name;
+		entry.mountpoint = mountpoint;
+		entry.clientname = parts[0];
+		entry.backup_path = parts[1];
+		for (size_t j = 2; j < parts.size(); ++j)
+		{
+			entry.backup_path += "/" + parts[j];
+		}
+		entries.push_back(entry);
+	}
+
+	return true;
+#endif
+}
+
+bool list_all_dataset_entries(std::vector<SDatasetEntry>& entries)
+{
+	const std::string dataset_image = read_trimmed_file_if_exists("/etc/urbackup/dataset");
+	const std::string dataset_file = read_trimmed_file_if_exists("/etc/urbackup/dataset_file");
+	return list_zfs_dataset_entries(dataset_file, false, entries)
+		&& list_zfs_dataset_entries(dataset_image, true, entries);
+}
+
+bool parse_backup_time_from_path(const std::string& backup_path, std::string& sqlite_time)
+{
+	if (backup_path.size() < 11)
+	{
+		return false;
+	}
+
+	const std::string stamp = backup_path.substr(0, 11);
+	if (stamp[6] != '-')
+	{
+		return false;
+	}
+
+	tm t;
+	memset(&t, 0, sizeof(t));
+	t.tm_year = 100 + watoi(stamp.substr(0, 2));
+	t.tm_mon = watoi(stamp.substr(2, 2)) - 1;
+	t.tm_mday = watoi(stamp.substr(4, 2));
+	t.tm_hour = watoi(stamp.substr(7, 2));
+	t.tm_min = watoi(stamp.substr(9, 2));
+	t.tm_sec = 0;
+
+	char buf[32];
+	if (strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t) == 0)
+	{
+		return false;
+	}
+	sqlite_time = buf;
+	return true;
+}
+
+bool current_image_backup_exists(IDatabase* db, const std::string& clientname, const std::string& backup_path)
+{
+	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE c.name=? AND i.path LIKE ?", false);
+	q->Bind(clientname);
+	q->Bind("%/" + clientname + "/" + backup_path + "/%");
+	db_results res = q->Read();
+	q->Reset();
+	db->destroyQuery(q);
+	return !res.empty();
+}
+
+int64 ensure_client(IDatabase* db, const std::string& clientname, bool apply)
+{
+	int64 clientid = 0;
+	if (current_client_id(db, clientname, clientid))
+	{
+		return clientid;
+	}
+
+	if (!apply)
+	{
+		return -1;
+	}
+
+	// Missing clients are reconstructed minimally so later backup/file imports can
+	// attach to a consistent client id. Remaining statistics are rebuilt from the
+	// imported backup rows and files rows below.
+	IQuery* q = db->Prepare("INSERT INTO clients(name) VALUES(?)", false);
+	q->Bind(clientname);
+	if (!q->Write())
+	{
+		q->Reset();
+		db->destroyQuery(q);
+		return 0;
+	}
+	q->Reset();
+	db->destroyQuery(q);
+	return db->getLastInsertID();
+}
+
+std::vector<STableColumnInfo> subset_column_info(const std::vector<STableColumnInfo>& cols, const std::set<std::string>& selected)
+{
+	std::vector<STableColumnInfo> ret;
+	for (size_t i = 0; i < cols.size(); ++i)
+	{
+		if (selected.find(cols[i].name) != selected.end())
+		{
+			ret.push_back(cols[i]);
+		}
+	}
+	return ret;
+}
+
+bool insert_named_row(IDatabase* db, const std::string& table, const std::vector<STableColumnInfo>& columns,
+	const std::map<std::string, std::string>& values)
+{
+	std::vector<SColumn> query_columns;
+	for (size_t i = 0; i < columns.size(); ++i)
+	{
+		if (values.find(columns[i].name) != values.end())
+		{
+			SColumn col;
+			col.name = columns[i].name;
+			col.type = columns[i].type;
+			query_columns.push_back(col);
+		}
+	}
+	if (query_columns.empty())
+	{
+		Server->Log("No column values prepared for insert into table \"" + table + "\"", LL_ERROR);
+		return false;
+	}
+
+	IQuery* q = db->Prepare("INSERT INTO " + table + " (" + column_list(query_columns, "")
+		+ ") VALUES (" + bind_list(query_columns.size()) + ")", false);
+	for (size_t i = 0; i < query_columns.size(); ++i)
+	{
+		std::map<std::string, std::string>::const_iterator it = values.find(query_columns[i].name);
+		if (query_columns[i].name == "shahash")
+		{
+			q->Bind(it->second.c_str(), static_cast<_u32>(it->second.size()));
+		}
+		else
+		{
+			q->Bind(it->second);
+		}
+	}
+	const bool ok = q->Write();
+	q->Reset();
+	db->destroyQuery(q);
+	return ok;
+}
+
+bool update_client_rollups(IDatabase* db, int64 clientid)
+{
+	std::string clientid_str = convert(clientid);
+	return db->Write("UPDATE clients SET "
+		"bytes_used_files=COALESCE((SELECT SUM(rsize) FROM curr_files.files WHERE clientid=" + clientid_str + "),0), "
+		"bytes_used_images=COALESCE((SELECT SUM(size_bytes) FROM backup_images WHERE clientid=" + clientid_str + "),0), "
+		"lastbackup=(SELECT MAX(backuptime) FROM backups WHERE clientid=" + clientid_str + "), "
+		"lastbackup_image=(SELECT MAX(backuptime) FROM backup_images WHERE clientid=" + clientid_str + ") "
+		"WHERE id=" + clientid_str);
+}
+
+std::string dataset_link_path(const std::string& storage_prefix, const SDatasetEntry& entry)
+{
+	return join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+}
+
+bool is_image_backup_name(const std::string& backup_path)
+{
+	return backup_path.find("_Image_") != std::string::npos;
+}
+
+bool list_visible_storage_backup_entries(const std::string& storage_prefix, const std::string& client_filter,
+	std::vector<SStorageBackupEntry>& entries)
+{
+	bool has_error = false;
+	std::vector<SFile> clients = getFiles(storage_prefix, &has_error);
+	if (has_error)
+	{
+		return false;
+	}
+
+	std::sort(clients.begin(), clients.end());
+	for (size_t i = 0; i < clients.size(); ++i)
+	{
+		if ((!clients[i].isdir && !clients[i].issym) || clients[i].isspecialf)
+		{
+			continue;
+		}
+		if (!client_filter.empty() && clients[i].name != client_filter)
+		{
+			continue;
+		}
+
+		const std::string client_root = join_path(storage_prefix, clients[i].name);
+		bool backup_error = false;
+		std::vector<SFile> backups = getFiles(client_root, &backup_error);
+		if (backup_error)
+		{
+			return false;
+		}
+
+		std::sort(backups.begin(), backups.end());
+		for (size_t j = 0; j < backups.size(); ++j)
+		{
+			if ((!backups[j].isdir && !backups[j].issym) || backups[j].isspecialf)
+			{
+				continue;
+			}
+			if (should_skip_dataset_entry_name(backups[j].name))
+			{
+				continue;
+			}
+
+			SStorageBackupEntry entry;
+			entry.image = is_image_backup_name(backups[j].name);
+			entry.symlink = backups[j].issym;
+			entry.root_path = join_path(client_root, backups[j].name);
+			entry.clientname = clients[i].name;
+			entry.backup_path = backups[j].name;
+			entries.push_back(entry);
+		}
+	}
+
+	return true;
+}
+
+bool insert_dataset_file_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
+	const SImportedDatasetBackup& imported, bool apply)
+{
+	if (!apply)
+	{
+		return true;
+	}
+
+	// Reconstructed backup rows are filled with the same semantically relevant fields
+	// the server uses during normal operation. Optional later-added columns are only
+	// populated when their names are known here so schema extensions keep their defaults.
+	std::map<std::string, std::string> values;
+	values["clientid"] = convert(imported.clientid);
+	values["backuptime"] = imported.sqlite_time;
+	values["incremental"] = convert(imported.incremental);
+	values["path"] = imported.backup_path;
+	values["complete"] = "1";
+	values["running"] = "1970-01-01 00:00:00";
+	values["size_bytes"] = convert(imported.total_size);
+	values["done"] = "1";
+
+	if (!insert_named_row(db, "backups", backup_columns, values))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool insert_dataset_image_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& image_columns,
+	int64 clientid, const std::string& sqlite_time, const std::string& image_path,
+	const std::string& image_letter, int incremental, _i64 size_bytes, bool apply)
+{
+	if (!apply)
+	{
+		return true;
+	}
+
+	// Image-backup reconstruction keeps all currently relevant state explicit so the
+	// imported row behaves like a completed backup and does not get mistaken for a
+	// half-finished or archived job on next startup.
+	std::map<std::string, std::string> values;
+	values["clientid"] = convert(clientid);
+	values["backuptime"] = sqlite_time;
+	values["incremental"] = convert(incremental);
+	values["incremental_ref"] = "0";
+	values["path"] = image_path;
+	values["complete"] = "1";
+	values["running"] = "1970-01-01 00:00:00";
+	values["size_bytes"] = convert(size_bytes);
+	values["done"] = "1";
+	values["version"] = "0";
+	values["letter"] = image_letter;
+	values["archived"] = "0";
+	values["archive_timeout"] = "0";
+	values["mounttime"] = "0";
+	values["delete_pending"] = "0";
+
+	return insert_named_row(db, "backup_images", image_columns, values);
+}
+
+bool update_imported_file_created(ServerFilesDao& filesdao, int64 fileid, int64 created)
+{
+	// addFileSQL reconstructs the linkage fields consistently, but its insert path uses
+	// the files.created default. Reconcile-storage overwrites that afterwards so rebuilt
+	// rows keep a stable filesystem-derived timestamp instead of the import time.
+	IQuery* q = filesdao.getDatabase()->Prepare("UPDATE files SET created=? WHERE id=?", false);
+	q->Bind(created);
+	q->Bind(fileid);
+	const bool ok = q->Write();
+	q->Reset();
+	filesdao.getDatabase()->destroyQuery(q);
+	return ok;
+}
+
+bool should_skip_dataset_entry_name(const std::string& name)
+{
+	return name == ".hashes" || name == ".directory_pool";
+}
+
+bool scan_dataset_file_tree_stats(const std::string& current_path, _i64& total_size, int64& file_count)
+{
+	bool has_error = false;
+	std::vector<SFile> files = getFiles(current_path, &has_error);
+	if (has_error)
+	{
+		return false;
+	}
+
+	for (size_t i = 0; i < files.size(); ++i)
+	{
+		if (files[i].isdir)
+		{
+			if (should_skip_dataset_entry_name(files[i].name))
+			{
+				continue;
+			}
+			if (!scan_dataset_file_tree_stats(join_path(current_path, files[i].name), total_size, file_count))
+			{
+				return false;
+			}
+			continue;
+		}
+
+		if (files[i].issym || files[i].isspecialf)
+		{
+			continue;
+		}
+
+		total_size += files[i].size;
+		++file_count;
+	}
+
+	return true;
+}
+
+bool build_hash_for_file(const std::string& path, std::string& shahash)
+{
+	std::auto_ptr<IFsFile> f(Server->openFile(os_file_prefix(path), MODE_READ));
+	if (f.get() == NULL)
+	{
+		Server->Log("Could not open dataset file \"" + path + "\" for hashing. " + os_last_error_str(), LL_ERROR);
+		return false;
+	}
+
+	FsExtentIterator extent_iterator(f.get(), 512 * 1024);
+	if (BackupServer::useTreeHashing())
+	{
+		TreeHash treehash(NULL);
+		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, treehash))
+		{
+			return false;
+		}
+		shahash = treehash.finalize();
+	}
+	else
+	{
+		HashSha512 hashsha;
+		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, hashsha))
+		{
+			return false;
+		}
+		shahash = hashsha.finalize();
+	}
+
+	return true;
+}
+
+bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
+	const std::string& relative_path, const std::string& visible_root,
+	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, SStats& stats)
+{
+	bool has_error = false;
+	std::vector<SFile> files = getFiles(current_path, &has_error);
+	if (has_error)
+	{
+		return false;
+	}
+
+	std::sort(files.begin(), files.end());
+	for (size_t i = 0; i < files.size(); ++i)
+	{
+		const std::string child_relative = relative_path.empty() ? files[i].name : relative_path + os_file_sep() + files[i].name;
+		const std::string physical_path = join_path(current_path, files[i].name);
+		draw_cursor_progress(progress, stats.file_rows_importable + stats.file_rows_imported + 1,
+			imported.clientname + "/" + imported.backup_path + " " + child_relative, false);
+
+		if (files[i].isdir)
+		{
+			if (should_skip_dataset_entry_name(files[i].name))
+			{
+				continue;
+			}
+			if (!import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
+				visible_root, imported, progress, apply, stats))
+			{
+				return false;
+			}
+			continue;
+		}
+
+		if (files[i].issym || files[i].isspecialf)
+		{
+			continue;
+		}
+
+		std::string shahash;
+		if (!build_hash_for_file(physical_path, shahash))
+		{
+			return false;
+		}
+
+		const std::string fullpath = join_path(visible_root, child_relative);
+		std::string hashpath = join_path(join_path(visible_root, ".hashes"), child_relative);
+		if (!FileExists(os_file_prefix(hashpath)))
+		{
+			hashpath.clear();
+		}
+
+		++stats.file_rows_importable;
+		++imported.file_rows;
+		if (!apply)
+		{
+			continue;
+		}
+
+		BackupServerHash::addFileSQL(filesdao, fileindex, static_cast<int>(imported.backupid),
+			static_cast<int>(imported.clientid), imported.incremental, fullpath, hashpath, shahash,
+			files[i].size, files[i].size, 0, 0, 0, true);
+
+		const int64 fileid = filesdao.getLastId();
+		const int64 created = files[i].created != 0 ? files[i].created : files[i].last_modified;
+		if (created != 0 && !update_imported_file_created(filesdao, fileid, created))
+		{
+			return false;
+		}
+
+		++stats.file_rows_imported;
+	}
+
+	return true;
+}
+
+bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
+	const SStorageBackupEntry& entry, bool apply, SStats& stats)
+{
+	SImportedDatasetBackup imported;
+	imported.clientname = entry.clientname;
+	imported.backup_path = entry.backup_path;
+
+	if (!parse_backup_time_from_path(entry.backup_path, imported.sqlite_time))
+	{
+		Server->Log("Cannot reconstruct file backup row for storage path \"" + entry.root_path
+			+ "\" because the backup timestamp could not be parsed from path \"" + entry.backup_path + "\"", LL_WARNING);
+		return true;
+	}
+
+	imported.clientid = ensure_client(db, entry.clientname, apply);
+	if (imported.clientid == 0)
+	{
+		Server->Log("Could not ensure client row for storage-backed file backup client \"" + entry.clientname + "\"", LL_ERROR);
+		return false;
+	}
+	if (imported.clientid > 0)
+	{
+		db_results older = db->Read("SELECT COUNT(*) AS c FROM backups WHERE clientid=" + convert(imported.clientid)
+			+ " AND backuptime<" + sql_string(imported.sqlite_time));
+		imported.incremental = (!older.empty() && watoi64(older[0]["c"]) > 0) ? 1 : 0;
+	}
+
+	// The storage scan computes the future backup size before the row exists so the
+	// main backup table gets a correct size_bytes value immediately instead of waiting
+	// for a later statistics refresh.
+	SCursorProgress count_progress("Scanning storage file backup", 0);
+	if (!scan_dataset_file_tree_stats(entry.root_path, imported.total_size, imported.file_rows))
+	{
+		return false;
+	}
+	finish_cursor_progress(count_progress, 0, "done");
+
+	++stats.dataset_backups_importable;
+	log_with_cursor_progress(count_progress, std::string(apply ? "Importing" : "Would import")
+		+ " storage-backed file backup client \"" + entry.clientname + "\" path \"" + entry.backup_path
+		+ "\" root \"" + entry.root_path + "\"", LL_INFO);
+
+	if (!insert_dataset_file_backup_row(db, backup_columns, imported, apply))
+	{
+		return false;
+	}
+
+	if (apply)
+	{
+		imported.backupid = db->getLastInsertID();
+	}
+
+	ServerFilesDao filesdao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES));
+	std::auto_ptr<FileIndex> fileindex(create_lmdb_files_index());
+	SCursorProgress import_progress("Importing storage file rows", 0);
+	if (!import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
+		entry.root_path, imported, import_progress, apply, stats))
+	{
+		finish_cursor_progress(import_progress, stats.file_rows_imported, "failed");
+		if (apply)
+		{
+			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
+			Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES)->Write("DELETE FROM files WHERE backupid=" + convert(imported.backupid));
+		}
+		return false;
+	}
+	finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
+	FileIndex::flush();
+
+	if (apply && !update_client_rollups(db, imported.clientid))
+	{
+		return false;
+	}
+
+	if (apply)
+	{
+		++stats.dataset_backups_imported;
+	}
+
+	return true;
+}
+
+bool find_image_payload_in_backup_root(const std::string& backup_root, std::string& image_name, _i64& image_size)
+{
+	bool has_error = false;
+	std::vector<SFile> files = getFiles(backup_root, &has_error);
+	if (has_error)
+	{
+		return false;
+	}
+
+	for (size_t i = 0; i < files.size(); ++i)
+	{
+		if (files[i].isdir || files[i].issym || files[i].isspecialf)
+		{
+			continue;
+		}
+
+		const std::string ext = findextension(files[i].name);
+		if (ext == "raw" || ext == "vhd" || ext == "vhdz" || ext == "vhdx" || ext == "vhdxz")
+		{
+			image_name = files[i].name;
+			image_size = files[i].size;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+std::string storage_image_letter(const SStorageBackupEntry& entry, const std::string& image_name)
+{
+	const std::string marker = "_Image_";
+	size_t pos = entry.backup_path.find(marker);
+	if (pos != std::string::npos && pos + marker.size() < entry.backup_path.size())
+	{
+		return entry.backup_path.substr(pos + marker.size(), 1);
+	}
+
+	pos = image_name.find("Image_");
+	if (pos != std::string::npos && pos + 6 < image_name.size())
+	{
+		return image_name.substr(pos + 6, 1);
+	}
+
+	return std::string();
+}
+
+bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnInfo>& image_columns,
+	const SStorageBackupEntry& entry, bool apply, SStats& stats)
+{
+	std::string sqlite_time;
+	if (!parse_backup_time_from_path(entry.backup_path, sqlite_time))
+	{
+		Server->Log("Cannot reconstruct image backup row for storage path \"" + entry.root_path
+			+ "\" because the backup timestamp could not be parsed from path \"" + entry.backup_path + "\"", LL_WARNING);
+		return true;
+	}
+
+	int64 clientid = ensure_client(db, entry.clientname, apply);
+	if (clientid == 0)
+	{
+		Server->Log("Could not ensure client row for storage-backed image backup client \"" + entry.clientname + "\"", LL_ERROR);
+		return false;
+	}
+
+	std::string image_name;
+	_i64 image_size = 0;
+	if (!find_image_payload_in_backup_root(entry.root_path, image_name, image_size))
+	{
+		Server->Log("Could not find image payload in storage path \"" + entry.root_path + "\" for client \""
+			+ entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
+		return true;
+	}
+
+	int incremental = 0;
+	if (clientid > 0)
+	{
+		db_results older = db->Read("SELECT COUNT(*) AS c FROM backup_images WHERE clientid=" + convert(clientid)
+			+ " AND backuptime<" + sql_string(sqlite_time));
+		incremental = (!older.empty() && watoi64(older[0]["c"]) > 0) ? 1 : 0;
+	}
+	const std::string image_path = join_path(entry.root_path, image_name);
+	const std::string image_letter = storage_image_letter(entry, image_name);
+
+	++stats.dataset_backups_importable;
+	SCursorProgress image_progress("Importing storage image backup", 0);
+	log_with_cursor_progress(image_progress,
+		std::string(apply ? "Importing" : "Would import") + " storage-backed image backup client \""
+		+ entry.clientname + "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
+
+	if (!insert_dataset_image_backup_row(db, image_columns, clientid, sqlite_time, image_path, image_letter, incremental, image_size, apply))
+	{
+		return false;
+	}
+	if (apply)
+	{
+		++stats.dataset_backups_imported;
+	}
+
+	if (apply && !update_client_rollups(db, clientid))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool import_missing_dataset_backups(IDatabase* db, const std::string& client_filter,
+	const std::string& storage_prefix, bool apply, SStats& stats)
+{
+	std::vector<SStorageBackupEntry> entries;
+	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries))
+	{
+		return false;
+	}
+
+	if (entries.empty())
+	{
+		Server->Log("No visible storage backups found for import.", LL_INFO);
+		return true;
+	}
+
+	const std::vector<STableColumnInfo> backup_columns = subset_column_info(table_column_info(db, "main", "backups"),
+		std::set<std::string>({"clientid", "backuptime", "incremental", "path", "complete", "running", "size_bytes", "done"}));
+	const std::vector<STableColumnInfo> image_columns = subset_column_info(table_column_info(db, "main", "backup_images"),
+		std::set<std::string>({"clientid", "backuptime", "incremental", "incremental_ref", "path",
+			"complete", "running", "size_bytes", "done", "version", "letter", "archived",
+			"archive_timeout", "mounttime", "delete_pending"}));
+
+	std::sort(entries.begin(), entries.end(), [](const SStorageBackupEntry& a, const SStorageBackupEntry& b)
+	{
+		if (a.clientname != b.clientname)
+		{
+			return a.clientname < b.clientname;
+		}
+		if (a.backup_path != b.backup_path)
+		{
+			return a.backup_path < b.backup_path;
+		}
+		return a.image < b.image;
+	});
+
+	bool ok = true;
+	SCursorProgress progress("Scanning visible storage backups", static_cast<_i64>(entries.size()));
+	for (size_t i = 0; i < entries.size(); ++i)
+	{
+		const SStorageBackupEntry& entry = entries[i];
+		++stats.dataset_backups_seen;
+		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+
+		const bool exists = entry.image
+			? current_image_backup_exists(db, entry.clientname, entry.backup_path)
+			: current_backup_exists(db, entry.clientname, entry.backup_path);
+		if (exists)
+		{
+			continue;
+		}
+
+		if (entry.image)
+		{
+			ok = ok && import_storage_image_backup(db, image_columns, entry, apply, stats);
+		}
+		else
+		{
+			ok = ok && import_storage_file_backup(db, backup_columns, entry, apply, stats);
+		}
+		if (!ok)
+		{
+			break;
+		}
+	}
+
+	finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
+	return ok;
 }
 
 bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_filter,
@@ -707,6 +1558,23 @@ std::vector<SColumn> table_columns(IDatabase* db, const std::string& dbname, con
 		col.name = res[i]["name"];
 		col.type = res[i]["type"];
 		strupper(&col.type);
+		ret.push_back(col);
+	}
+	return ret;
+}
+
+std::vector<STableColumnInfo> table_column_info(IDatabase* db, const std::string& dbname, const std::string& table)
+{
+	std::vector<STableColumnInfo> ret;
+	db_results res = db->Read("PRAGMA " + dbname + ".table_info(" + sql_ident(table) + ")");
+	for (size_t i = 0; i < res.size(); ++i)
+	{
+		STableColumnInfo col;
+		col.name = res[i]["name"];
+		col.type = res[i]["type"];
+		strupper(&col.type);
+		col.default_value = res[i]["dflt_value"];
+		col.notnull = watoi(res[i]["notnull"]) != 0;
 		ret.push_back(col);
 	}
 	return ret;
@@ -1729,6 +2597,10 @@ void log_summary(const SStats& stats, bool apply)
 	Server->Log("  malformed file rows skipped during import: " + convert(stats.file_rows_skipped_malformed), LL_INFO);
 	Server->Log(std::string("  dataset links ") + (apply ? "created: " : "would create: ")
 		+ convert(apply ? stats.dataset_links_created : stats.dataset_links), LL_INFO);
+	Server->Log("  visible storage backups seen: " + convert(stats.dataset_backups_seen), LL_INFO);
+	Server->Log("  visible storage backups importable: " + convert(stats.dataset_backups_importable), LL_INFO);
+	Server->Log(std::string("  visible storage backups ") + (apply ? "imported: " : "would import: ")
+		+ convert(apply ? stats.dataset_backups_imported : stats.dataset_backups_importable), LL_INFO);
 	Server->Log(std::string("  file paths ") + (apply ? "migrated: " : "would migrate: ")
 		+ convert(apply ? stats.paths_migrated : stats.paths_to_migrate), LL_INFO);
 	Server->Log(std::string("  missing file rows ") + (apply ? "removed: " : "would remove: ")
@@ -1755,6 +2627,7 @@ int reconcile_storage()
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
+	const bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 
 	if (skip_db_backup)
@@ -1864,6 +2737,15 @@ int reconcile_storage()
 	else
 	{
 		Server->Log("Skipping dataset link recreation because --recreate-missing-dataset-links was not specified.", LL_INFO);
+	}
+
+	if (import_missing_dataset_backups_enabled)
+	{
+		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, stats);
+	}
+	else
+	{
+		Server->Log("Skipping visible storage backup import because --import-missing-dataset-backups was not specified.", LL_INFO);
 	}
 
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
