@@ -1211,6 +1211,10 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"While importing storage-backed file backups, skip unreadable files and subtrees instead of skipping the whole backup.",
 		cmd, false);
 
+	TCLAP::SwitchArg regenerate_index_arg("", "regenerate-index",
+		"After a successful apply run that invalidates the file index, rebuild it immediately instead of leaving it for the next startup/check.",
+		cmd, false);
+
 	TCLAP::SwitchArg drop_empty_backups_arg("", "drop-empty-backups",
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
@@ -1330,6 +1334,13 @@ int action_reconcile_storage(std::vector<std::string> args)
 		// Partial storage imports are explicit because they can reconstruct backups
 		// with missing files when only parts of the source tree are readable.
 		real_args.push_back("--ignore_read_errors");
+		real_args.push_back("true");
+	}
+	if(regenerate_index_arg.getValue())
+	{
+		// Immediate regeneration is opt-in because rebuilding the LMDB index can take
+		// a long time on large installations even though it avoids a later startup rebuild.
+		real_args.push_back("--regenerate_index");
 		real_args.push_back("true");
 	}
 	if(drop_empty_backups_arg.getValue())

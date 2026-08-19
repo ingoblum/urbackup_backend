@@ -15,6 +15,7 @@
 #include "../server_hash.h"
 #include "../server_settings.h"
 #include "../create_files_index.h"
+#include "../serverinterface/helper.h"
 #include "../../Interface/DatabaseCursor.h"
 #include "../../Interface/File.h"
 #include "../../urbackupcommon/os_functions.h"
@@ -323,6 +324,35 @@ bool path_exists(const std::string& path)
 	}
 	const std::string prefixed = os_file_prefix(path);
 	return FileExists(prefixed) || os_directory_exists(prefixed);
+}
+
+bool file_index_exists()
+{
+	return FileExists("urbackup/fileindex/backup_server_files_index.lmdb");
+}
+
+bool ensure_file_index_available_for_reconcile(bool force_rebuild)
+{
+	// Reconcile-storage can run without the file index for many read-only or
+	// metadata-only actions. Storage-backed file imports, however, call into the
+	// normal hash/link pipeline and therefore need a current LMDB file index.
+	if (!force_rebuild && file_index_exists())
+	{
+		return true;
+	}
+
+	if (force_rebuild)
+	{
+		Server->Log("Rebuilding file index for reconcile-storage...", LL_INFO);
+		delete_file_index();
+	}
+	else
+	{
+		Server->Log("File index is missing. Creating it before reconcile-storage continues...", LL_WARNING);
+	}
+
+	SStartupStatus startup_status;
+	return create_files_index(startup_status);
 }
 
 std::string row_result_value(const db_single_result& row, const std::string& key, const std::string& fallback = std::string())
@@ -2978,6 +3008,7 @@ int reconcile_storage()
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
 	bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_storage") == "true";
 	const bool ignore_read_errors = Server->getServerParameter("ignore_read_errors") == "true";
+	const bool regenerate_index = Server->getServerParameter("regenerate_index") == "true";
 	if (!import_missing_dataset_backups_enabled)
 	{
 		import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
@@ -3037,6 +3068,15 @@ int reconcile_storage()
 		return 1;
 	}
 	const bool have_import_db = !import_db_dir.empty();
+	const bool storage_import_needs_file_index = apply && import_missing_dataset_backups_enabled;
+	const bool current_files_rows_will_change = apply
+		&& (remove_malformed_file_rows_enabled || remove_missing_files || have_import_db || import_missing_dataset_backups_enabled);
+
+	if (storage_import_needs_file_index && !ensure_file_index_available_for_reconcile(false))
+	{
+		Server->Log("Could not create or open the file index required for storage-backed file imports.", LL_ERROR);
+		return 1;
+	}
 	if (have_import_db && !attach_import_databases(db, import_db_dir))
 	{
 		return 1;
@@ -3160,8 +3200,29 @@ int reconcile_storage()
 	}
 	else if (ok)
 	{
-		delete_file_index();
-		Server->Log("Apply complete. File index was removed and will be rebuilt on next startup/check.", LL_INFO);
+		// Only operations that insert or delete rows in curr_files.files invalidate the
+		// LMDB index. Path-only updates and backup-table-only changes leave it valid.
+		if (current_files_rows_will_change)
+		{
+			delete_file_index();
+			if (regenerate_index)
+			{
+				if (!ensure_file_index_available_for_reconcile(true))
+				{
+					Server->Log("Apply completed, but regenerating the file index failed.", LL_ERROR);
+					return 1;
+				}
+				Server->Log("Apply complete. File index was regenerated as requested.", LL_INFO);
+			}
+			else
+			{
+				Server->Log("Apply complete. File index was removed and will be rebuilt on next startup/check.", LL_INFO);
+			}
+		}
+		else
+		{
+			Server->Log("Apply complete. File index remained unchanged because no indexed file rows were modified.", LL_INFO);
+		}
 	}
 
 	return ok ? 0 : 1;
