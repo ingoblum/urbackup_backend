@@ -1166,9 +1166,9 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"New backup storage prefix. Defaults to the configured backupfolder setting.",
 		false, "", "path", cmd);
 
-	TCLAP::ValueArg<std::string> client_arg("", "client",
-		"Only reconcile one client. Defaults to all clients.",
-		false, "", "client name", cmd);
+	TCLAP::MultiArg<std::string> client_arg("", "client",
+		"Only reconcile the specified client(s). Repeat --client for multiple exact client names. Defaults to all clients.",
+		false, "client name", cmd);
 
 	TCLAP::SwitchArg apply_arg("", "apply",
 		"Apply database changes. Without this option the command only performs a dry-run.",
@@ -1271,8 +1271,19 @@ int action_reconcile_storage(std::vector<std::string> args)
 	}
 	if(!client_arg.getValue().empty())
 	{
+		// The backend reads one server parameter value, so repeated CLI client filters
+		// are forwarded as a single comma-separated exact-match set.
+		std::string client_filter;
+		for(size_t i=0;i<client_arg.getValue().size();++i)
+		{
+			if(i>0)
+			{
+				client_filter += ",";
+			}
+			client_filter += client_arg.getValue()[i];
+		}
 		real_args.push_back("--client");
-		real_args.push_back(client_arg.getValue());
+		real_args.push_back(client_filter);
 	}
 	if(apply_arg.getValue())
 	{

@@ -235,6 +235,53 @@ std::string shell_single_quote(const std::string& value)
 	return ret;
 }
 
+std::set<std::string> parse_client_filter_set(const std::string& client_filter)
+{
+	std::set<std::string> ret;
+	std::vector<std::string> toks;
+	Tokenize(client_filter, toks, ",");
+	for (size_t i = 0; i < toks.size(); ++i)
+	{
+		const std::string clientname = trim(toks[i]);
+		if (!clientname.empty())
+		{
+			ret.insert(clientname);
+		}
+	}
+	return ret;
+}
+
+bool matches_client_filter(const std::set<std::string>& client_filters, const std::string& clientname)
+{
+	return client_filters.empty() || client_filters.find(clientname) != client_filters.end();
+}
+
+std::string client_filter_sql_expr(const std::string& client_filter, const std::string& qualified_column)
+{
+	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
+	if (client_filters.empty())
+	{
+		return std::string();
+	}
+
+	if (client_filters.size() == 1)
+	{
+		return qualified_column + "=" + sql_string(*client_filters.begin());
+	}
+
+	std::string ret = qualified_column + " IN (";
+	for (std::set<std::string>::const_iterator it = client_filters.begin(); it != client_filters.end(); ++it)
+	{
+		if (it != client_filters.begin())
+		{
+			ret += ", ";
+		}
+		ret += sql_string(*it);
+	}
+	ret += ")";
+	return ret;
+}
+
 bool starts_with(const std::string& value, const std::string& prefix)
 {
 	return value.size() >= prefix.size()
@@ -763,6 +810,7 @@ bool should_skip_storage_visible_entry_name(const std::string& name)
 bool list_visible_storage_backup_entries(const std::string& storage_prefix, const std::string& client_filter,
 	std::vector<SStorageBackupEntry>& entries, SStats& stats)
 {
+	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
 	bool has_error = false;
 	std::vector<SFile> clients = getFiles(storage_prefix, &has_error);
 	if (has_error)
@@ -784,7 +832,7 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 		{
 			continue;
 		}
-		if (!client_filter.empty() && clients[i].name != client_filter)
+		if (!matches_client_filter(client_filters, clients[i].name))
 		{
 			continue;
 		}
@@ -1478,9 +1526,10 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 	{
 		std::string sql = "SELECT b.id AS backupid, b.path AS backup_path, c.name AS client_name "
 			"FROM backups b INNER JOIN clients c ON c.id=b.clientid";
-		if (!client_filter.empty())
+		const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+		if (!client_filter_expr.empty())
 		{
-			sql += " WHERE c.name=" + sql_string(client_filter);
+			sql += " WHERE " + client_filter_expr;
 		}
 		sql += " ORDER BY c.name ASC, b.path ASC";
 
@@ -1544,9 +1593,10 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 	{
 		std::string sql = "SELECT i.id AS backupid, i.path AS image_path, c.name AS client_name "
 			"FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE i.complete=1";
-		if (!client_filter.empty())
+		const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+		if (!client_filter_expr.empty())
 		{
-			sql += " AND c.name=" + sql_string(client_filter);
+			sql += " AND " + client_filter_expr;
 		}
 		sql += " ORDER BY c.name ASC, i.path ASC";
 
@@ -2411,9 +2461,10 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 	}
 
 	std::string where;
-	if (!client_filter.empty())
+	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	if (!client_filter_expr.empty())
 	{
-		where = " WHERE c.name=" + sql_string(client_filter);
+		where = " WHERE " + client_filter_expr;
 	}
 
 	db_results count_res = db->Read("SELECT COUNT(*) AS c FROM old_main.backups b "
@@ -2517,9 +2568,10 @@ bool migrate_current_file_paths(IDatabase* db, const std::string& client_filter,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	std::string where;
-	if (!client_filter.empty())
+	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	if (!client_filter_expr.empty())
 	{
-		where = " WHERE c.name=" + sql_string(client_filter);
+		where = " WHERE " + client_filter_expr;
 	}
 
 	SCursorProgress progress("Checking current file paths", 0);
@@ -2645,9 +2697,10 @@ std::string malformed_file_row_log_message(const db_single_result& row, const st
 bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
 {
 	std::string where;
-	if (!client_filter.empty())
+	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	if (!client_filter_expr.empty())
 	{
-		where = " WHERE c.name=" + sql_string(client_filter);
+		where = " WHERE " + client_filter_expr;
 	}
 
 	SCursorProgress progress("Checking malformed file rows", 0);
@@ -2707,9 +2760,10 @@ bool remove_missing_file_rows(IDatabase* db, const std::string& client_filter,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	std::string where;
-	if (!client_filter.empty())
+	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	if (!client_filter_expr.empty())
 	{
-		where = " WHERE c.name=" + sql_string(client_filter);
+		where = " WHERE " + client_filter_expr;
 	}
 
 	SCursorProgress progress("Checking missing file rows", 0);
@@ -2814,9 +2868,10 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 {
 	std::string where = " WHERE NOT EXISTS (SELECT 1 FROM curr_files.files f WHERE f.backupid=b.id AND "
 		+ valid_file_row_sql_predicate() + ")";
-	if (!client_filter.empty())
+	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	if (!client_filter_expr.empty())
 	{
-		where += " AND c.name=" + sql_string(client_filter);
+		where += " AND " + client_filter_expr;
 	}
 
 	db_results count_res = db->Read("SELECT COUNT(*) AS c "
@@ -2941,7 +2996,7 @@ int reconcile_storage()
 	Server->Log(std::string("Starting reconcile-storage in ") + (apply ? "apply" : "dry-run") + " mode", LL_INFO);
 	if (!client_filter.empty())
 	{
-		Server->Log("Restricting reconciliation to client \"" + client_filter + "\"", LL_INFO);
+		Server->Log("Restricting reconciliation to client set \"" + client_filter + "\"", LL_INFO);
 	}
 	if (import_db_dir.empty())
 	{
