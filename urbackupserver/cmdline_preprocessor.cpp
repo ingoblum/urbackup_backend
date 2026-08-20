@@ -1215,6 +1215,10 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"While importing storage-backed file backups, skip unreadable files and subtrees instead of skipping the whole backup.",
 		cmd, false);
 
+	TCLAP::SwitchArg ignore_errors_arg("", "ignore-errors",
+		"Alias for --ignore-read-errors.",
+		cmd, false);
+
 	// Storage imports prefer the authoritative per-file metadata sidecars because
 	// re-reading the payload of every historical backup can take days on large
 	// migrated stores. This switch keeps the old behaviour available for audits.
@@ -1345,7 +1349,8 @@ int action_reconcile_storage(std::vector<std::string> args)
 		real_args.push_back("--import_storage");
 		real_args.push_back("true");
 	}
-	if(ignore_read_errors_arg.getValue())
+	if(ignore_read_errors_arg.getValue()
+		|| ignore_errors_arg.getValue())
 	{
 		// Partial storage imports are explicit because they can reconstruct backups
 		// with missing files when only parts of the source tree are readable.

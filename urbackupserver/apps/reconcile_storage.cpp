@@ -1177,9 +1177,12 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
 	{
-		// With --ignore-read-errors only subtree access failures are tolerated. If the
-		// backup root itself cannot be listed there is no trustworthy subset to import.
-		if (!ignore_read_errors || is_root)
+		// Some repaired storages expose CRC/read failures on individual directory
+		// entries while still returning the remaining entries of the same directory.
+		// When --ignore-read-errors is active, treat such partial root listings like
+		// subtree errors as long as getFiles() returned a non-empty subset that can be
+		// imported consistently. A completely unreadable root still aborts.
+		if (!ignore_read_errors || (is_root && files.empty()))
 		{
 			return false;
 		}
@@ -1666,9 +1669,11 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
 	{
-		// Partial imports are only allowed when explicitly requested. A failed root
-		// directory listing still aborts because there is otherwise no stable base.
-		if (!ignore_read_errors || relative_path.empty())
+		// The import walk mirrors the pre-scan behaviour above: CRC/read failures on
+		// individual root directory entries are tolerated with --ignore-read-errors if
+		// getFiles() still returned a usable subset. A completely unreadable root is
+		// still fatal because then no deterministic subset exists to import.
+		if (!ignore_read_errors || (relative_path.empty() && files.empty()))
 		{
 			return ETreeImportResult_Error;
 		}
