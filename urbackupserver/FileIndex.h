@@ -11,6 +11,8 @@
 
 const size_t bytes_in_index = 16;
 
+typedef void (*FileIndexRuntimeStatusCallback)(const std::string& msg);
+
 class FileIndex : public IThread
 {
 public:
@@ -146,6 +148,13 @@ public:
 
 	static void end_immediate_updates(bool commit);
 
+	// Long-running reconcile-storage imports can route noisy fileindex runtime
+	// events into their single-line interactive status display instead of emitting
+	// a separate log line for every internal LMDB state change.
+	static void set_runtime_status_callback(FileIndexRuntimeStatusCallback callback);
+
+	static bool emit_runtime_status(const std::string& msg);
+
 private:
 
 	bool get_from_cache( const FileIndex::SIndexKey &key, const std::map<SIndexKey, int64>& cache, int64& res );
@@ -173,4 +182,5 @@ private:
 	static bool do_accept;
 	static FileIndex* immediate_fileindex;
 	static bool immediate_transaction_open;
+	static FileIndexRuntimeStatusCallback runtime_status_callback;
 };

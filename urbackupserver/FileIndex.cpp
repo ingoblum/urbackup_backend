@@ -42,6 +42,7 @@ bool FileIndex::do_flush=false;
 bool FileIndex::do_accept = true;
 FileIndex* FileIndex::immediate_fileindex = NULL;
 bool FileIndex::immediate_transaction_open = false;
+FileIndexRuntimeStatusCallback FileIndex::runtime_status_callback = NULL;
 
 
 void FileIndex::operator()(void)
@@ -200,6 +201,22 @@ void FileIndex::end_immediate_updates(bool commit)
 	immediate_fileindex=NULL;
 	immediate_transaction_open=false;
 	clear_cache_state_locked();
+}
+
+void FileIndex::set_runtime_status_callback(FileIndexRuntimeStatusCallback callback)
+{
+	runtime_status_callback = callback;
+}
+
+bool FileIndex::emit_runtime_status(const std::string& msg)
+{
+	if(runtime_status_callback!=NULL)
+	{
+		runtime_status_callback(msg);
+		return true;
+	}
+
+	return false;
 }
 
 void FileIndex::put_delayed(const SIndexKey& key, int64 value)

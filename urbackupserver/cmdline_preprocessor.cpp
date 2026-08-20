@@ -1211,6 +1211,13 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"While importing storage-backed file backups, skip unreadable files and subtrees instead of skipping the whole backup.",
 		cmd, false);
 
+	// Storage imports prefer the authoritative per-file metadata sidecars because
+	// re-reading the payload of every historical backup can take days on large
+	// migrated stores. This switch keeps the old behaviour available for audits.
+	TCLAP::SwitchArg rehash_files_arg("", "rehash-files",
+		"Recompute every imported file hash from payload data instead of preferring the existing .hashes metadata.",
+		cmd, false);
+
 	TCLAP::SwitchArg regenerate_index_arg("", "regenerate-index",
 		"After a successful apply run that invalidates the file index, rebuild it immediately instead of leaving it for the next startup/check.",
 		cmd, false);
@@ -1334,6 +1341,11 @@ int action_reconcile_storage(std::vector<std::string> args)
 		// Partial storage imports are explicit because they can reconstruct backups
 		// with missing files when only parts of the source tree are readable.
 		real_args.push_back("--ignore_read_errors");
+		real_args.push_back("true");
+	}
+	if(rehash_files_arg.getValue())
+	{
+		real_args.push_back("--rehash_files");
 		real_args.push_back("true");
 	}
 	if(regenerate_index_arg.getValue())

@@ -361,7 +361,12 @@ void LMDBFileIndex::put_internal(const SIndexKey& key, int64 value, int flags, b
 
 			map_size*=2;
 
-			Server->Log("Increased LMDB database size to "+PrettyPrintBytes(map_size)+" (on put)", LL_DEBUG);
+			const std::string resize_msg = "Increased LMDB database size to "
+				+ PrettyPrintBytes(map_size) + " (on put)";
+			if(!FileIndex::emit_runtime_status(resize_msg))
+			{
+				Server->Log(resize_msg, LL_DEBUG);
+			}
 
 			if(!create_env())
 			{
@@ -447,7 +452,12 @@ void LMDBFileIndex::del_internal(const SIndexKey& key, bool log, bool handle_eno
 
 			map_size*=2;
 
-			Server->Log("Increased LMDB database size to "+PrettyPrintBytes(map_size)+" (on delete)", LL_DEBUG);
+			const std::string resize_msg = "Increased LMDB database size to "
+				+ PrettyPrintBytes(map_size) + " (on delete)";
+			if(!FileIndex::emit_runtime_status(resize_msg))
+			{
+				Server->Log(resize_msg, LL_DEBUG);
+			}
 
 			if(!create_env())
 			{
@@ -527,7 +537,12 @@ void LMDBFileIndex::commit_transaction_internal(bool handle_enosp)
 
 			map_size*=2;
 
-			Server->Log("Increased LMDB database size to "+PrettyPrintBytes(map_size)+" (on commit)", LL_DEBUG);
+			const std::string resize_msg = "Increased LMDB database size to "
+				+ PrettyPrintBytes(map_size) + " (on commit)";
+			if(!FileIndex::emit_runtime_status(resize_msg))
+			{
+				Server->Log(resize_msg, LL_DEBUG);
+			}
 
 			if(!create_env())
 			{

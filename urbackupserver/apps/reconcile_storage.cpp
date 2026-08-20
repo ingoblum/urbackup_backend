@@ -18,6 +18,8 @@
 #include "../serverinterface/helper.h"
 #include "../../Interface/DatabaseCursor.h"
 #include "../../Interface/File.h"
+#include "../../urbackupcommon/chunk_hasher.h"
+#include "../../urbackupcommon/file_metadata.h"
 #include "../../urbackupcommon/os_functions.h"
 #include "../../urbackupcommon/TreeHash.h"
 #include "../../stringtools.h"
@@ -222,12 +224,14 @@ public:
 	{
 		fileindex_status_progress = progress;
 		set_fileindex_status_message_callback(progress != NULL ? reconcile_fileindex_status_message : NULL);
+		FileIndex::set_runtime_status_callback(progress != NULL ? reconcile_fileindex_status_message : NULL);
 	}
 
 	~ScopedFileIndexStatusProgress()
 	{
 		fileindex_status_progress = previous_progress;
 		set_fileindex_status_message_callback(previous_progress != NULL ? reconcile_fileindex_status_message : NULL);
+		FileIndex::set_runtime_status_callback(previous_progress != NULL ? reconcile_fileindex_status_message : NULL);
 	}
 
 private:
@@ -274,6 +278,7 @@ std::vector<STableColumnInfo> table_column_info(IDatabase* db, const std::string
 std::string column_list(const std::vector<SColumn>& columns, const std::string& prefix);
 std::string bind_list(size_t n);
 bool should_skip_dataset_entry_name(const std::string& name);
+std::string metadata_path_from_relative(const std::string& metadata_root, const std::string& relative_path);
 
 std::string strip_trailing_sep(std::string path)
 {
@@ -417,6 +422,29 @@ std::string join_path(const std::string& a, const std::string& b)
 		return a + b;
 	}
 	return a + os_file_sep() + b;
+}
+
+// Storage imports need to address the on-disk .hashes tree exactly like the normal
+// backup code does. Escaping every path component here keeps reconcile-storage
+// compatible with metadata files whose names would otherwise collide with special
+// markers such as ".dir_metadata".
+std::string metadata_path_from_relative(const std::string& metadata_root, const std::string& relative_path)
+{
+	if (relative_path.empty())
+	{
+		return metadata_root;
+	}
+
+	std::vector<std::string> parts;
+	Tokenize(relative_path, parts, os_file_sep());
+
+	std::string ret = metadata_root;
+	for (size_t i = 0; i < parts.size(); ++i)
+	{
+		ret = join_path(ret, escape_metadata_fn(parts[i]));
+	}
+
+	return ret;
 }
 
 bool path_exists(const std::string& path)
@@ -1224,6 +1252,18 @@ private:
 	bool cancelled;
 };
 
+class ReconcileHashFileWriterNoSpaceCallback : public INotEnoughSpaceCallback
+{
+public:
+	// Reconcile-storage does not attempt emergency cleanup while rebuilding
+	// metadata files. A plain "false" here turns ENOSPC into a normal write
+	// failure so the operator sees the real cause in the surrounding log message.
+	virtual bool handle_not_enough_space(const std::string&)
+	{
+		return false;
+	}
+};
+
 bool build_hash_for_file(const std::string& path, std::string& shahash, bool& cancelled)
 {
 	cancelled = false;
@@ -1259,6 +1299,160 @@ bool build_hash_for_file(const std::string& path, std::string& shahash, bool& ca
 	}
 
 	return true;
+}
+
+bool read_hash_metadata_shahash(const std::string& hashpath, int64 expected_filesize, std::string& shahash, std::string& reason)
+{
+	reason.clear();
+	shahash.clear();
+
+	std::auto_ptr<IFile> hashfile(Server->openFile(os_file_prefix(hashpath), MODE_READ));
+	if (hashfile.get() == NULL)
+	{
+		reason = "metadata file cannot be opened";
+		return false;
+	}
+
+	const int64 hashfilesize = read_hashdata_size(hashfile.get());
+	if (hashfilesize != expected_filesize)
+	{
+		reason = hashfilesize == -1
+			? "metadata file does not contain hashdata for a regular file"
+			: "metadata file size header " + convert(hashfilesize) + " does not match file size " + convert(expected_filesize);
+		return false;
+	}
+
+	FileMetadata metadata;
+	if (!read_metadata(hashfile.get(), metadata))
+	{
+		reason = "metadata payload could not be read";
+		return false;
+	}
+
+	if (metadata.shahash.size() < 16)
+	{
+		reason = "metadata shahash is missing or shorter than the fileindex key";
+		return false;
+	}
+
+	shahash = metadata.shahash;
+	return true;
+}
+
+bool write_hash_metadata_for_file(const std::string& physical_path, const std::string& hashpath, std::string& shahash, bool& cancelled)
+{
+	cancelled = false;
+
+	std::auto_ptr<IFsFile> data_file(Server->openFile(os_file_prefix(physical_path), MODE_READ));
+	if (data_file.get() == NULL)
+	{
+		Server->Log("Could not open dataset file \"" + physical_path + "\" for rebuilding metadata. " + os_last_error_str(), LL_ERROR);
+		return false;
+	}
+
+	const std::string parent_dir = ExtractFilePath(hashpath, os_file_sep());
+	if (!parent_dir.empty() && !os_directory_exists(os_file_prefix(parent_dir)))
+	{
+		if (!os_create_dir_recursive(os_file_prefix(parent_dir)))
+		{
+			Server->Log("Could not create metadata directory \"" + parent_dir + "\" while rebuilding \"" + hashpath
+				+ "\". " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+	}
+
+	if (FileExists(os_file_prefix(hashpath)))
+	{
+		Server->deleteFile(os_file_prefix(hashpath));
+	}
+
+	std::auto_ptr<IFile> hashoutput(Server->openFile(os_file_prefix(hashpath), MODE_RW_CREATE));
+	if (hashoutput.get() == NULL)
+	{
+		Server->Log("Could not create metadata file \"" + hashpath + "\" while rebuilding it. " + os_last_error_str(), LL_ERROR);
+		return false;
+	}
+
+	FsExtentIterator extent_iterator(data_file.get(), 512 * 1024);
+	ReconcileHashProgressCallback progress_callback;
+	ReconcileHashFileWriterNoSpaceCallback no_space_callback;
+	bool ok = false;
+	if (BackupServer::useTreeHashing())
+	{
+		TreeHash treehash(NULL);
+		ok = build_chunk_hashs(data_file.get(), hashoutput.get(), &no_space_callback, NULL, false, NULL, NULL, false, &treehash, &extent_iterator);
+		if (ok)
+		{
+			shahash = treehash.finalize();
+		}
+	}
+	else
+	{
+		HashSha512 hashsha;
+		ok = build_chunk_hashs(data_file.get(), hashoutput.get(), &no_space_callback, NULL, false, NULL, NULL, false, &hashsha, &extent_iterator);
+		if (ok)
+		{
+			shahash = hashsha.finalize();
+		}
+	}
+
+	cancelled = progress_callback.was_cancelled();
+	if (!ok || shahash.empty())
+	{
+		Server->Log("Could not rebuild metadata file \"" + hashpath + "\" from \"" + physical_path + "\".", LL_ERROR);
+		Server->deleteFile(os_file_prefix(hashpath));
+		return false;
+	}
+
+	FileMetadata metadata;
+	metadata.set_shahash(shahash);
+	int64 truncate_to_bytes = -1;
+	if (!write_file_metadata(hashoutput.get(), &no_space_callback, metadata, false, truncate_to_bytes))
+	{
+		Server->Log("Could not append metadata payload to rebuilt hash file \"" + hashpath + "\".", LL_ERROR);
+		hashoutput.reset();
+		Server->deleteFile(os_file_prefix(hashpath));
+		return false;
+	}
+	if (truncate_to_bytes > 0 && !os_file_truncate(os_file_prefix(hashpath), truncate_to_bytes))
+	{
+		Server->Log("Could not truncate rebuilt hash file \"" + hashpath + "\" to its final size. " + os_last_error_str(), LL_ERROR);
+		hashoutput.reset();
+		Server->deleteFile(os_file_prefix(hashpath));
+		return false;
+	}
+
+	return true;
+}
+
+bool resolve_import_file_hash(const std::string& physical_path, const std::string& hashpath, int64 expected_filesize,
+	bool rehash_files, SCursorProgress& progress, std::string& shahash, bool& cancelled)
+{
+	cancelled = false;
+	shahash.clear();
+
+	if (!rehash_files)
+	{
+		std::string invalid_reason;
+		if (read_hash_metadata_shahash(hashpath, expected_filesize, shahash, invalid_reason))
+		{
+			return true;
+		}
+
+		log_with_cursor_progress(progress, "Rebuilding metadata file \"" + hashpath + "\" for \"" + physical_path
+			+ "\" because the existing .hashes entry is missing or invalid (" + invalid_reason + ").", LL_WARNING);
+		if (write_hash_metadata_for_file(physical_path, hashpath, shahash, cancelled))
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	// --rehash-files preserves the previous import behaviour. The fallback after a
+	// failed metadata validation uses the same payload hashing path as the previous
+	// implementation and intentionally does not touch the sidecar on disk.
+	return build_hash_for_file(physical_path, shahash, cancelled);
 }
 
 bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
@@ -1319,7 +1513,7 @@ bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
 
 ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
 	const std::string& relative_path, const std::string& visible_root,
-	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors,
+	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors, bool rehash_files,
 	int64& ignored_read_errors_for_backup, SStats& stats)
 {
 	if (is_reconcile_stop_requested())
@@ -1356,11 +1550,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 		const std::string child_relative = relative_path.empty() ? files[i].name : relative_path + os_file_sep() + files[i].name;
 		const std::string physical_path = join_path(current_path, files[i].name);
 		const std::string fullpath = join_path(visible_root, child_relative);
-		std::string hashpath = join_path(join_path(visible_root, ".hashes"), child_relative);
-		if (!FileExists(os_file_prefix(hashpath)))
-		{
-			hashpath.clear();
-		}
+		const std::string hashpath = metadata_path_from_relative(join_path(visible_root, ".hashes"), child_relative);
 		draw_cursor_progress(progress, stats.file_rows_importable + stats.file_rows_imported + 1,
 			imported.clientname + "/" + imported.backup_path + " " + child_relative, false);
 
@@ -1371,7 +1561,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 				continue;
 			}
 			const ETreeImportResult child_result = import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
-				visible_root, imported, progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats);
+				visible_root, imported, progress, apply, ignore_read_errors, rehash_files, ignored_read_errors_for_backup, stats);
 			if (child_result != ETreeImportResult_Ok)
 			{
 				return child_result;
@@ -1399,7 +1589,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 
 		std::string shahash;
 		bool hash_cancelled = false;
-		if (!build_hash_for_file(physical_path, shahash, hash_cancelled))
+		if (!resolve_import_file_hash(physical_path, hashpath, files[i].size, rehash_files, progress, shahash, hash_cancelled))
 		{
 			if (hash_cancelled)
 			{
@@ -1524,7 +1714,7 @@ SExistingFileBackupState current_file_backup_state(IDatabase* db, const std::str
 }
 
 bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
-	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, std::set<int64>& changed_clientids, SStats& stats)
+	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, bool rehash_files, std::set<int64>& changed_clientids, SStats& stats)
 {
 	SImportedDatasetBackup imported;
 	imported.clientname = entry.clientname;
@@ -1566,19 +1756,26 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 	}
 
 	++stats.dataset_backups_importable;
-	SCursorProgress count_progress("Scanning storage file backup", 0);
 	int64 ignored_read_errors_for_backup = 0;
-	log_with_cursor_progress(count_progress, std::string(apply ? "Importing" : "Would import")
-		+ " " + storage_import_action_label(entry) + " file backup client \"" + entry.clientname
-		+ "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
 
 	// Dry-run is used primarily to compare the visible backup set with remove-unknown.
 	// Walking every file tree here would both slow the scan down significantly and
 	// suppress candidates behind restrictive permissions before they can be reported.
+	// Dry-run candidates are emitted as regular log lines instead of transient cursor
+	// status updates so non-interactive logs and copied terminal output still show
+	// exactly which backups would be imported.
 	if (!apply)
 	{
+		Server->Log(std::string("Would import") + " " + storage_import_action_label(entry)
+			+ " file backup client \"" + entry.clientname + "\" path \"" + entry.backup_path
+			+ "\" root \"" + entry.root_path + "\"", LL_INFO);
 		return true;
 	}
+
+	SCursorProgress count_progress("Scanning storage file backup", 0);
+	log_with_cursor_progress(count_progress, "Importing " + storage_import_action_label(entry)
+		+ " file backup client \"" + entry.clientname
+		+ "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
 
 	// The storage scan computes the future backup size before the row exists so the
 	// main backup table gets a correct size_bytes value immediately instead of waiting
@@ -1656,7 +1853,7 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		// sync for this backup import without depending on the global thread pool.
 		FileIndex::begin_immediate_updates(*fileindex);
 		const ETreeImportResult import_result = import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
-			entry.root_path, imported, import_progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats);
+			entry.root_path, imported, import_progress, apply, ignore_read_errors, rehash_files, ignored_read_errors_for_backup, stats);
 		if (have_resume_lookup)
 		{
 			filesdao.dropTemporaryPathLookupIndex();
@@ -1697,6 +1894,14 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		{
 			return false;
 		}
+
+		// A single completion log per successfully imported backup keeps the
+		// interactive output compact while still recording which backup finished and
+		// how much content was reconstructed into the current database.
+		Server->Log("Imported storage file backup client \"" + entry.clientname + "\" path \""
+			+ entry.backup_path + "\" backupid " + convert(imported.backupid)
+			+ " file rows " + convert(imported.file_rows)
+			+ " size " + PrettyPrintBytes(imported.total_size), LL_INFO);
 
 		// Per-backup reporting keeps ignored read errors attributable to the backup
 		// that triggered them, instead of only showing the final global aggregate.
@@ -1825,18 +2030,24 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 	const std::string image_letter = storage_image_letter(entry, image_name);
 
 	++stats.dataset_backups_importable;
-	SCursorProgress image_progress("Importing storage image backup", 0);
-	log_with_cursor_progress(image_progress,
-		std::string(apply ? "Importing" : "Would import") + " " + storage_import_action_label(entry) + " image backup client \""
-		+ entry.clientname + "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
 
 	// Image dry-runs only need to surface the visible candidate itself. Payload
 	// validation remains part of apply mode so the listing stays aligned with
-	// remove-unknown even when image directories are currently unreadable.
+	// remove-unknown even when image directories are currently unreadable. As with
+	// file backups, dry-run candidates are logged explicitly so they are preserved
+	// in normal log files and shell transcripts.
 	if (!apply)
 	{
+		Server->Log(std::string("Would import") + " " + storage_import_action_label(entry)
+			+ " image backup client \"" + entry.clientname + "\" path \"" + entry.backup_path
+			+ "\" root \"" + entry.root_path + "\"", LL_INFO);
 		return true;
 	}
+
+	SCursorProgress image_progress("Importing storage image backup", 0);
+	log_with_cursor_progress(image_progress,
+		"Importing " + storage_import_action_label(entry) + " image backup client \""
+		+ entry.clientname + "\" path \"" + entry.backup_path + "\" root \"" + entry.root_path + "\"", LL_INFO);
 
 	if (!insert_dataset_image_backup_row(db, image_columns, clientid, sqlite_time, image_path, image_letter, incremental, image_size, apply))
 	{
@@ -1844,6 +2055,13 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 	}
 	if (apply)
 	{
+		// Image imports now emit one compact completion line, matching the file
+		// import behaviour and making it easier to correlate the summary with the
+		// concrete storage-backed backup that just finished.
+		Server->Log("Imported storage image backup client \"" + entry.clientname + "\" path \""
+			+ entry.backup_path + "\" image \"" + image_name + "\" size "
+			+ PrettyPrintBytes(image_size), LL_INFO);
+
 		// Image imports participate in the same deferred rollup update as file
 		// imports so one reconcile-storage run only recomputes client aggregates
 		// once per touched client instead of once per imported backup.
@@ -1855,7 +2073,7 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 }
 
 bool import_missing_dataset_backups(IDatabase* db, const std::string& client_filter,
-	const std::string& storage_prefix, bool apply, bool ignore_read_errors, SStats& stats)
+	const std::string& storage_prefix, bool apply, bool ignore_read_errors, bool rehash_files, SStats& stats)
 {
 	std::vector<SStorageBackupEntry> entries;
 	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries, stats))
@@ -1950,7 +2168,7 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 				break;
 			}
 			current_entry.client_exists_in_db = client_lookup_status == ELookupStatus_Found;
-			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, changed_clientids, stats);
+			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, rehash_files, changed_clientids, stats);
 		}
 		if (!ok)
 		{
@@ -2277,7 +2495,7 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 			segments = draw_segments;
 		}
 
-		line = "\r[";
+		line = "[";
 		for (size_t i = 0; i < draw_segments; ++i)
 		{
 			if (i < segments)
@@ -2306,7 +2524,7 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 	}
 	else
 	{
-		line = "\r" + progress.label + " " + convert(current)
+		line = progress.label + " " + convert(current)
 			+ " rows, " + convert(progress.rows_per_second) + " rows/s";
 	}
 
@@ -3528,6 +3746,7 @@ int reconcile_storage()
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
 	bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_storage") == "true";
 	const bool ignore_read_errors = Server->getServerParameter("ignore_read_errors") == "true";
+	const bool rehash_files = Server->getServerParameter("rehash_files") == "true";
 	const bool regenerate_index = Server->getServerParameter("regenerate_index") == "true";
 	if (!import_missing_dataset_backups_enabled)
 	{
@@ -3681,7 +3900,7 @@ int reconcile_storage()
 
 	if (import_missing_dataset_backups_enabled)
 	{
-		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, ignore_read_errors, stats);
+		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, ignore_read_errors, rehash_files, stats);
 	}
 	else
 	{
