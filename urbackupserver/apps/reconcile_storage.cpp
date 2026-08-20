@@ -1145,20 +1145,6 @@ bool insert_dataset_image_backup_row(IDatabase* db, const std::vector<STableColu
 	return insert_named_row(db, "backup_images", image_columns, values);
 }
 
-bool update_imported_file_created(ServerFilesDao& filesdao, int64 fileid, int64 created)
-{
-	// addFileSQL reconstructs the linkage fields consistently, but its insert path uses
-	// the files.created default. Reconcile-storage overwrites that afterwards so rebuilt
-	// rows keep a stable filesystem-derived timestamp instead of the import time.
-	IQuery* q = filesdao.getDatabase()->Prepare("UPDATE files SET created=? WHERE id=?", false);
-	q->Bind(created);
-	q->Bind(fileid);
-	const bool ok = q->Write();
-	q->Reset();
-	filesdao.getDatabase()->destroyQuery(q);
-	return ok;
-}
-
 bool should_skip_dataset_entry_name(const std::string& name)
 {
 	return name == ".hashes" || name == ".directory_pool";
@@ -1168,6 +1154,9 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 	bool ignore_read_errors, bool is_root, _i64& total_size, int64& file_count,
 	int64& ignored_read_errors_for_backup, SStats& stats, SCursorProgress* progress)
 {
+	// TODO: Make this pre-scan optional for operators who accept unknown initial
+	// size_bytes/file counts. Import-storage currently walks every tree once here
+	// and once while inserting rows, so skipping it can reduce metadata I/O.
 	if (is_reconcile_stop_requested())
 	{
 		return false;
@@ -1655,10 +1644,77 @@ bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex, 
 	return true;
 }
 
+const size_t c_storage_import_write_batch_size = 1000;
+
+struct SStorageImportWriteBatch
+{
+	SStorageImportWriteBatch()
+		: open(false), entries(0)
+	{
+	}
+
+	bool open;
+	size_t entries;
+};
+
+bool begin_storage_import_write_batch(ServerFilesDao& filesdao, FileIndex& fileindex, FileIndex* lookup_fileindex,
+	SStorageImportWriteBatch& batch)
+{
+	if (batch.open)
+	{
+		return true;
+	}
+
+	// One SQLite transaction and one LMDB write transaction cover a bounded set
+	// of rows. This changes the import from per-file fsync-like work to batched
+	// writes while retaining a well-defined, resumable checkpoint after each batch.
+	if (!filesdao.getDatabase()->BeginWriteTransaction())
+	{
+		return false;
+	}
+	FileIndex::begin_immediate_updates(fileindex, lookup_fileindex);
+	batch.open = true;
+	batch.entries = 0;
+	return true;
+}
+
+bool finish_storage_import_write_batch(ServerFilesDao& filesdao, SStorageImportWriteBatch& batch, bool commit)
+{
+	if (!batch.open)
+	{
+		return true;
+	}
+
+	bool ok = true;
+	if (commit)
+	{
+		// Commit SQLite first: if termination follows this point, resume can repair
+		// a missing LMDB key from its durable files row, whereas an index-only row
+		// would point to data that has not reached the files database yet.
+		ok = filesdao.getDatabase()->EndTransaction();
+		FileIndex::end_immediate_updates(ok);
+	}
+	else
+	{
+		filesdao.getDatabase()->RollbackTransaction();
+		FileIndex::end_immediate_updates(false);
+	}
+
+	batch.open = false;
+	batch.entries = 0;
+	return ok;
+}
+
+bool advance_storage_import_write_batch(ServerFilesDao& filesdao, SStorageImportWriteBatch& batch)
+{
+	++batch.entries;
+	return batch.entries < c_storage_import_write_batch_size || finish_storage_import_write_batch(filesdao, batch, true);
+}
+
 ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, FileIndex* lookup_fileindex, const std::string& current_path,
 	const std::string& relative_path, const std::string& visible_root,
 	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors, bool rehash_files, bool verbose,
-	int64& ignored_read_errors_for_backup, SStats& stats)
+	int64& ignored_read_errors_for_backup, SStats& stats, SStorageImportWriteBatch& write_batch)
 {
 	if (is_reconcile_stop_requested())
 	{
@@ -1719,7 +1775,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 				continue;
 			}
 			const ETreeImportResult child_result = import_dataset_file_tree_recursive(filesdao, fileindex, lookup_fileindex, physical_path, child_relative,
-				visible_root, imported, progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats);
+				visible_root, imported, progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats, write_batch);
 			if (child_result != ETreeImportResult_Ok)
 			{
 				return child_result;
@@ -1729,6 +1785,10 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 
 		if (imported.resume_existing_backup)
 		{
+			if (apply && !begin_storage_import_write_batch(filesdao, fileindex, lookup_fileindex, write_batch))
+			{
+				return ETreeImportResult_Error;
+			}
 			bool reused_entry = false;
 			if (!resume_imported_file_entry(filesdao, fileindex, lookup_fileindex, imported, fullpath, hashpath, files[i], stats, progress, reused_entry))
 			{
@@ -1736,6 +1796,10 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 			}
 			if (reused_entry)
 			{
+				if (apply && !advance_storage_import_write_batch(filesdao, write_batch))
+				{
+					return ETreeImportResult_Error;
+				}
 				continue;
 			}
 		}
@@ -1778,23 +1842,26 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 		{
 			continue;
 		}
+		if (!begin_storage_import_write_batch(filesdao, fileindex, lookup_fileindex, write_batch))
+		{
+			return ETreeImportResult_Error;
+		}
 
+		const int64 created = files[i].created != 0 ? files[i].created : files[i].last_modified;
 		BackupServerHash::addFileSQL(filesdao, fileindex, static_cast<int>(imported.backupid),
 			static_cast<int>(imported.clientid), imported.incremental, fullpath, hashpath, shahash,
-			files[i].size, files[i].size, 0, 0, 0, true);
+			files[i].size, files[i].size, 0, 0, 0, true, created);
 
-		const int64 fileid = filesdao.getLastId();
-		const int64 created = files[i].created != 0 ? files[i].created : files[i].last_modified;
-		if (created != 0 && !update_imported_file_created(filesdao, fileid, created))
+		if (!advance_storage_import_write_batch(filesdao, write_batch))
 		{
 			return ETreeImportResult_Error;
 		}
 
 		++stats.file_rows_imported;
 
-		// Ctrl-C is honored only after the current file row and matching fileindex
-		// update are durable. That keeps the resume state per file consistent and
-		// allows the next run to skip exactly the files that were already imported.
+		// Ctrl-C is observed after a file was added to its active batch. The caller
+		// commits the batch before recording the resumable incomplete state; a crash
+		// between SQLite and LMDB commit is repaired by the existing resume lookup.
 		if (is_reconcile_stop_requested())
 		{
 			return ETreeImportResult_Stopped;
@@ -2023,20 +2090,26 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		// updates into the active progress line keeps interactive imports readable
 		// while preserving the same information in continuously refreshed form.
 		ScopedFileIndexStatusProgress scoped_fileindex_status(&import_progress);
-		// reconcile-storage may run without an available asynchronous fileindex
-		// writer thread. Immediate mode keeps LMDB and the in-memory lookup cache in
-		// sync for this backup import without depending on the global thread pool.
-		FileIndex::begin_immediate_updates(*fileindex, resume_lookup_fileindex.get());
+		// The write batch opens its SQLite and LMDB transactions lazily at the first
+		// file. This also leaves a pre-interrupted import without an empty transaction.
+		SStorageImportWriteBatch write_batch;
 		const ETreeImportResult import_result = import_dataset_file_tree_recursive(filesdao, *fileindex, resume_lookup_fileindex.get(), entry.root_path, std::string(),
-			entry.root_path, imported, import_progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats);
-		if (have_resume_lookup)
-		{
-			filesdao.dropTemporaryPathLookupIndex();
-			filesdao.dropTemporaryPathLookupTable();
-		}
+			entry.root_path, imported, import_progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats, write_batch);
 		if (import_result != ETreeImportResult_Ok)
 		{
-			FileIndex::end_immediate_updates(false);
+			// Operator interruption commits the last complete batch for resume; actual
+			// import errors discard only the still-open batch before existing cleanup
+			// removes all rows for a newly failed backup.
+			if (!finish_storage_import_write_batch(filesdao, write_batch, import_result == ETreeImportResult_Stopped))
+			{
+				Server->Log("Could not finish storage file import write batch for backup id " + convert(imported.backupid), LL_ERROR);
+				return false;
+			}
+			if (have_resume_lookup)
+			{
+				filesdao.dropTemporaryPathLookupIndex();
+				filesdao.dropTemporaryPathLookupTable();
+			}
 			finish_cursor_progress(import_progress, stats.file_rows_imported, import_result == ETreeImportResult_Stopped ? "stopped" : "failed");
 
 			if (import_result == ETreeImportResult_Stopped)
@@ -2063,7 +2136,18 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 				+ "\" because importing its file rows failed. Partial database rows were removed again. See previous log lines for the concrete filesystem or hashing error.", LL_WARNING);
 			return true;
 		}
-		FileIndex::end_immediate_updates(true);
+		if (!finish_storage_import_write_batch(filesdao, write_batch, true))
+		{
+			Server->Log("Could not commit final storage file import write batch for backup id " + convert(imported.backupid), LL_ERROR);
+			return false;
+		}
+		if (have_resume_lookup)
+		{
+			// Temporary resume lookups must be dropped after the final batch commit;
+			// otherwise their DDL becomes part of an unfinished data transaction.
+			filesdao.dropTemporaryPathLookupIndex();
+			filesdao.dropTemporaryPathLookupTable();
+		}
 		if (imported.file_rows == 0)
 		{
 			dismiss_cursor_progress(import_progress);

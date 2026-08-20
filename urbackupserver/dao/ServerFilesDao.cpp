@@ -276,6 +276,43 @@ void ServerFilesDao::addFileEntry(int backupid, const std::string& fullpath, con
 	q_addFileEntry->Reset();
 }
 
+int64 ServerFilesDao::addFileEntryExternalWithCreated(int backupid, const std::string& fullpath, const std::string& hashpath, const std::string& shahash, int64 filesize, int64 created, int64 rsize, int clientid, int incremental, int64 next_entry, int64 prev_entry, int pointed_to)
+{
+	// Storage reconciliation already has the filesystem creation time while the
+	// row is inserted. Keeping it in this statement avoids a second SQLite write
+	// per imported file and preserves the original timestamp without a transient
+	// import-time value in the database.
+	if(q_addFileEntryWithCreated==NULL)
+	{
+		q_addFileEntryWithCreated=db->Prepare("INSERT INTO files (backupid, fullpath, hashpath, shahash, filesize, created, rsize, clientid, incremental, next_entry, prev_entry, pointed_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", false);
+	}
+	q_addFileEntryWithCreated->Bind(backupid);
+	q_addFileEntryWithCreated->Bind(fullpath);
+	q_addFileEntryWithCreated->Bind(hashpath);
+	q_addFileEntryWithCreated->Bind(shahash.c_str(), (_u32)shahash.size());
+	q_addFileEntryWithCreated->Bind(filesize);
+	q_addFileEntryWithCreated->Bind(created);
+	q_addFileEntryWithCreated->Bind(rsize);
+	q_addFileEntryWithCreated->Bind(clientid);
+	q_addFileEntryWithCreated->Bind(incremental);
+	q_addFileEntryWithCreated->Bind(next_entry);
+	q_addFileEntryWithCreated->Bind(prev_entry);
+	q_addFileEntryWithCreated->Bind(pointed_to);
+	q_addFileEntryWithCreated->Write();
+	q_addFileEntryWithCreated->Reset();
+
+	int64 id = db->getLastInsertID();
+	if (prev_entry != 0)
+	{
+		setNextEntry(id, prev_entry);
+	}
+	if (next_entry != 0)
+	{
+		setPrevEntry(id, next_entry);
+	}
+	return id;
+}
+
 /**
 * @-SQLGenAccessNoCheck
 * @func bool ServerFilesDao::createTemporaryPathLookupTable
@@ -687,6 +724,7 @@ void ServerFilesDao::prepareQueries()
 	q_getFileEntry=NULL;
 	q_getStatFileEntry=NULL;
 	q_addFileEntry=NULL;
+	q_addFileEntryWithCreated=NULL;
 	q_createTemporaryPathLookupTable=NULL;
 	q_dropTemporaryPathLookupTable=NULL;
 	q_dropTemporaryPathLookupIndex=NULL;
@@ -720,6 +758,7 @@ void ServerFilesDao::destroyQueries()
 	db->destroyQuery(q_getFileEntry);
 	db->destroyQuery(q_getStatFileEntry);
 	db->destroyQuery(q_addFileEntry);
+	db->destroyQuery(q_addFileEntryWithCreated);
 	db->destroyQuery(q_createTemporaryPathLookupTable);
 	db->destroyQuery(q_dropTemporaryPathLookupTable);
 	db->destroyQuery(q_dropTemporaryPathLookupIndex);

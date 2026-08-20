@@ -81,7 +81,7 @@ public:
 
 	static void addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex, int backupid, int clientid, int incremental, const std::string &fp,
 		const std::string &hash_path, const std::string &shahash, _i64 filesize, _i64 rsize, int64 prev_entry, int64 prev_entry_clientid,
-		int64 next_entry, bool update_fileindex);
+		int64 next_entry, bool update_fileindex, int64 created=0);
 		
 		
 	static void deleteFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex, int64 id);

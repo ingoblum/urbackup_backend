@@ -319,7 +319,7 @@ void BackupServerHash::addFileSQL(int backupid, int clientid, int incremental, c
 }
 
 void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex, int backupid, const int clientid, int incremental, const std::string &fp,
-	const std::string &hash_path, const std::string &shahash, _i64 filesize, _i64 rsize, int64 prev_entry, int64 prev_entry_clientid, int64 next_entry, bool update_fileindex)
+	const std::string &hash_path, const std::string &shahash, _i64 filesize, _i64 rsize, int64 prev_entry, int64 prev_entry_clientid, int64 next_entry, bool update_fileindex, int64 created)
 {
 	if (filesize < link_file_min_size)
 	{
@@ -327,7 +327,14 @@ void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex
 		assert(prev_entry == 0);
 		assert(next_entry == 0);
 		filesdao.addIncomingFile(filesize, clientid, backupid, std::string(), ServerFilesDao::c_direction_incoming, incremental);
-		filesdao.addFileEntryExternal(backupid, fp, hash_path, shahash, filesize, rsize, clientid, incremental, next_entry, prev_entry, 0);
+		if(created != 0)
+		{
+			filesdao.addFileEntryExternalWithCreated(backupid, fp, hash_path, shahash, filesize, created, rsize, clientid, incremental, next_entry, prev_entry, 0);
+		}
+		else
+		{
+			filesdao.addFileEntryExternal(backupid, fp, hash_path, shahash, filesize, rsize, clientid, incremental, next_entry, prev_entry, 0);
+		}
 		return;
 	}
 
@@ -415,7 +422,11 @@ void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex
 		}
 	}
 
-	int64 entryid = filesdao.addFileEntryExternal(backupid, fp, hash_path, shahash, filesize, rsize, clientid, incremental, next_entry, prev_entry, (new_for_client || update_fileindex)?1:0);
+	// Normal backups retain the database default; reconciliation supplies the
+	// filesystem timestamp and therefore avoids a separate post-insert update.
+	int64 entryid = created != 0
+		? filesdao.addFileEntryExternalWithCreated(backupid, fp, hash_path, shahash, filesize, created, rsize, clientid, incremental, next_entry, prev_entry, (new_for_client || update_fileindex)?1:0)
+		: filesdao.addFileEntryExternal(backupid, fp, hash_path, shahash, filesize, rsize, clientid, incremental, next_entry, prev_entry, (new_for_client || update_fileindex)?1:0);
 
 	if(new_for_client || update_fileindex)
 	{

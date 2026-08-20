@@ -109,6 +109,7 @@ public:
 	//@-SQLGenFunctionsEnd
 
 	int64 addFileEntryExternal(int backupid, const std::string& fullpath, const std::string& hashpath, const std::string& shahash, int64 filesize, int64 rsize, int clientid, int incremental, int64 next_entry, int64 prev_entry, int pointed_to);
+	int64 addFileEntryExternalWithCreated(int backupid, const std::string& fullpath, const std::string& hashpath, const std::string& shahash, int64 filesize, int64 created, int64 rsize, int clientid, int incremental, int64 next_entry, int64 prev_entry, int pointed_to);
 
 private:
 	ServerFilesDao(ServerFilesDao& other) {}
@@ -126,6 +127,7 @@ private:
 	IQuery* q_getFileEntry;
 	IQuery* q_getStatFileEntry;
 	IQuery* q_addFileEntry;
+	IQuery* q_addFileEntryWithCreated;
 	IQuery* q_createTemporaryPathLookupTable;
 	IQuery* q_dropTemporaryPathLookupTable;
 	IQuery* q_dropTemporaryPathLookupIndex;
