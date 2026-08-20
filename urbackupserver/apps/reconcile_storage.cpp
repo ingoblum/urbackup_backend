@@ -846,8 +846,13 @@ bool insert_named_row(IDatabase* db, const std::string& table, const std::vector
 bool update_client_rollups(IDatabase* db, int64 clientid)
 {
 	std::string clientid_str = convert(clientid);
+	// Storage imports already know the owning backup rows. Summing via backups.id ->
+	// files.backupid lets SQLite use the files_backupid index, whereas filtering
+	// directly on files.clientid caused large full scans over backup_server_files.db
+	// and made the post-import rollup phase appear to hang on big installations.
 	return db->Write("UPDATE clients SET "
-		"bytes_used_files=COALESCE((SELECT SUM(rsize) FROM curr_files.files WHERE clientid=" + clientid_str + "),0), "
+		"bytes_used_files=COALESCE((SELECT SUM(f.rsize) FROM curr_files.files f "
+			"INNER JOIN backups b ON b.id=f.backupid WHERE b.clientid=" + clientid_str + "),0), "
 		"bytes_used_images=COALESCE((SELECT SUM(size_bytes) FROM backup_images WHERE clientid=" + clientid_str + "),0), "
 		"lastbackup=(SELECT MAX(backuptime) FROM backups WHERE clientid=" + clientid_str + "), "
 		"lastbackup_image=(SELECT MAX(backuptime) FROM backup_images WHERE clientid=" + clientid_str + ") "
