@@ -45,6 +45,39 @@ const size_t BUFFER_SIZE=64*1024; //64KB
 IMutex * delete_mutex=NULL;
 FileIndexStatusMessageCallback fileindex_status_message_callback = NULL;
 
+namespace
+{
+	std::string shorten_fileindex_runtime_path(const std::string& fp, const std::string& hash_path)
+	{
+		const std::string marker = os_file_sep() + ".hashes" + os_file_sep();
+		size_t marker_pos = hash_path.find(marker);
+		if (marker_pos == std::string::npos)
+		{
+			return fp;
+		}
+
+		const std::string backup_root = hash_path.substr(0, marker_pos);
+		const std::string rel_path = hash_path.substr(marker_pos + marker.size());
+		const std::string backup_path = ExtractFilePath(backup_root, os_file_sep());
+		const std::string backup_name = ExtractFileName(backup_root, os_file_sep());
+		const std::string client_name = ExtractFileName(backup_path, os_file_sep());
+		if (client_name.empty() || backup_name.empty())
+		{
+			return fp;
+		}
+
+		// Runtime fileindex status lines are shown in a narrow interactive progress
+		// area. Displaying only client/backup/relative-path keeps the changing part
+		// visible and avoids wasting the line width on the static storage prefix.
+		std::string short_path = client_name + os_file_sep() + backup_name;
+		if (!rel_path.empty())
+		{
+			short_path += os_file_sep() + rel_path;
+		}
+		return short_path;
+	}
+}
+
 void set_fileindex_status_message_callback(FileIndexStatusMessageCallback callback)
 {
 	fileindex_status_message_callback = callback;
@@ -386,7 +419,7 @@ void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex
 
 	if(new_for_client || update_fileindex)
 	{
-		const std::string new_entry_msg = "New fileindex entry for \"" + fp + "\""
+		const std::string new_entry_msg = "New fileindex entry for \"" + shorten_fileindex_runtime_path(fp, hash_path) + "\""
 			" id=" + convert(entryid)
 			+ " hash=" + base64_encode(reinterpret_cast<const unsigned char*>(shahash.c_str()), bytes_in_index);
 
