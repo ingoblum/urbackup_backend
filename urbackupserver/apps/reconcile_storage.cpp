@@ -270,6 +270,7 @@ private:
 // already debugged output code.
 void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force);
 void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail);
+void dismiss_cursor_progress(SCursorProgress& progress);
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel);
 int current_client_id(IDatabase* db, const std::string& clientname, int64& clientid);
 int current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path);
@@ -1795,7 +1796,7 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 			+ "\" because its contents could not be read completely. See previous log lines for the concrete filesystem error.", LL_WARNING);
 		return true;
 	}
-	finish_cursor_progress(count_progress, 0, "done");
+	dismiss_cursor_progress(count_progress);
 
 	if (apply && imported.resume_existing_backup)
 	{
@@ -1889,7 +1890,14 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 			return true;
 		}
 		FileIndex::end_immediate_updates(true);
-		finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
+		if (imported.file_rows == 0)
+		{
+			dismiss_cursor_progress(import_progress);
+		}
+		else
+		{
+			finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
+		}
 		if (!update_imported_file_backup_state(db, imported.backupid, true, "1970-01-01 00:00:00", imported.total_size))
 		{
 			return false;
@@ -2055,6 +2063,8 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 	}
 	if (apply)
 	{
+		dismiss_cursor_progress(image_progress);
+
 		// Image imports now emit one compact completion line, matching the file
 		// import behaviour and making it easier to correlate the summary with the
 		// concrete storage-backed backup that just finished.
@@ -2179,6 +2189,9 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 	finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
 	if (ok && apply)
 	{
+		Server->Log("Updating client statistics for " + convert(changed_clientids.size())
+			+ " client(s) touched by storage import. This can take a while on large databases.", LL_INFO);
+
 		for (std::set<int64>::const_iterator it = changed_clientids.begin(); it != changed_clientids.end(); ++it)
 		{
 			// The deferred rollup pass preserves the same final client metadata as
@@ -2562,6 +2575,17 @@ void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::
 			active_cursor_progress = NULL;
 		}
 	}
+}
+
+void dismiss_cursor_progress(SCursorProgress& progress)
+{
+	// Some reconcile phases use a live status line only as transient context for the
+	// next regular log line. Clearing that status without emitting an extra newline
+	// avoids the visually empty separator lines that would otherwise appear for
+	// zero-row imports or other metadata-only operations.
+	pause_cursor_progress(progress);
+	progress.status_message.clear();
+	progress.detail.clear();
 }
 
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel)
@@ -3636,6 +3660,11 @@ bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bo
 	{
 		where += " AND " + client_filter_expr;
 	}
+
+	// The COUNT/NOT EXISTS pre-scan can run for a noticeable amount of time on large
+	// installations before the first cursor row is available. Logging this upfront
+	// makes the otherwise quiet phase explicit to the operator.
+	Server->Log("Checking for empty file backups. Counting candidates first; this can take a while on large databases.", LL_INFO);
 
 	db_results count_res = db->Read("SELECT COUNT(*) AS c "
 		"FROM backups b INNER JOIN clients c ON c.id=b.clientid" + where);
