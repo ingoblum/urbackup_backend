@@ -151,7 +151,7 @@ struct SImportedDatasetBackup
 {
 	SImportedDatasetBackup()
 		: clientid(0), backupid(0), incremental(0), total_size(0), file_rows(0),
-		resume_existing_backup(false)
+		resume_existing_backup(false), hash_metadata_changed(false)
 	{
 	}
 
@@ -164,6 +164,7 @@ struct SImportedDatasetBackup
 	_i64 total_size;
 	int64 file_rows;
 	bool resume_existing_backup;
+	bool hash_metadata_changed;
 };
 
 enum ELookupStatus
@@ -1506,10 +1507,15 @@ void update_hash_metadata_rebuild_status(SCursorProgress& progress, const SStats
 }
 
 bool resolve_import_file_hash(const std::string& physical_path, const std::string& hashpath, int64 expected_filesize,
-	bool rehash_files, bool verbose, SCursorProgress& progress, std::string& shahash, bool& cancelled, SStats& stats)
+	bool rehash_files, bool verbose, SCursorProgress& progress, std::string& shahash, bool& cancelled,
+	bool* metadata_changed, SStats& stats)
 {
 	cancelled = false;
 	shahash.clear();
+	if (metadata_changed != NULL)
+	{
+		*metadata_changed = false;
+	}
 
 	if (!rehash_files)
 	{
@@ -1528,6 +1534,10 @@ bool resolve_import_file_hash(const std::string& physical_path, const std::strin
 		if (write_hash_metadata_for_file(physical_path, hashpath, shahash, cancelled, &rebuild_failure_reason, !verbose))
 		{
 			++stats.hash_metadata_rebuilt;
+			if (metadata_changed != NULL)
+			{
+				*metadata_changed = true;
+			}
 			update_hash_metadata_rebuild_status(progress, stats);
 			return true;
 		}
@@ -1699,7 +1709,8 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 
 		std::string shahash;
 		bool hash_cancelled = false;
-		if (!resolve_import_file_hash(physical_path, hashpath, files[i].size, rehash_files, verbose, progress, shahash, hash_cancelled, stats))
+		bool metadata_changed = false;
+		if (!resolve_import_file_hash(physical_path, hashpath, files[i].size, rehash_files, verbose, progress, shahash, hash_cancelled, &metadata_changed, stats))
 		{
 			if (hash_cancelled)
 			{
@@ -1719,6 +1730,13 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 				+ "\" while importing backup \"" + imported.clientname + "/" + imported.backup_path
 				+ "\" because --ignore-read-errors was specified.", LL_WARNING);
 			continue;
+		}
+		if (metadata_changed)
+		{
+			// Any rebuilt .hashes entry changes the dataset contents after the original
+			// backup finished. Remember that at backup scope so the ZFS @ro snapshot can
+			// be refreshed exactly once after the import completed successfully.
+			imported.hash_metadata_changed = true;
 		}
 
 		++stats.file_rows_importable;
@@ -2006,6 +2024,25 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		else
 		{
 			finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
+		}
+		if (imported.hash_metadata_changed
+			&& BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile
+			&& SnapshotHelper::isSubvolume(false, entry.clientname, entry.backup_path))
+		{
+			std::string refresh_errmsg;
+			// Reconcile-storage only refreshes @ro when it actually modified .hashes.
+			// That keeps unchanged datasets untouched, while repaired ZFS backups get a
+			// new readonly clone origin whose contents match the updated dataset. A
+			// failed refresh leaves the backup incomplete so the next run can retry the
+			// snapshot repair against the already imported file rows.
+			if (!SnapshotHelper::refreshReadonly(false, entry.clientname, entry.backup_path, refresh_errmsg))
+			{
+				update_imported_file_backup_state(db, imported.backupid, false, "1970-01-01 00:00:00", imported.total_size);
+				Server->Log("Could not refresh readonly snapshot for imported storage file backup client \""
+					+ entry.clientname + "\" path \"" + entry.backup_path + "\" after rebuilding .hashes entries."
+					+ (refresh_errmsg.empty() ? std::string() : " " + trim(refresh_errmsg)), LL_ERROR);
+				return false;
+			}
 		}
 		if (!update_imported_file_backup_state(db, imported.backupid, true, "1970-01-01 00:00:00", imported.total_size))
 		{

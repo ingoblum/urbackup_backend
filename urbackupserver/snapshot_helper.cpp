@@ -113,6 +113,23 @@ bool SnapshotHelper::makeReadonly(bool image, std::string clientname, std::strin
 #endif
 }
 
+bool SnapshotHelper::refreshReadonly(bool image, std::string clientname, std::string name, std::string& errmsg)
+{
+#ifdef _WIN32
+	errmsg.clear();
+	return true;
+#else
+	// Storage reconciliation can repair or create .hashes entries inside an existing
+	// backup dataset. Replacing the readonly origin snapshot afterwards keeps later
+	// clones consistent with the now-corrected dataset contents. The helper performs
+	// the same dependency promotion sequence used during normal dataset removal when
+	// the old @ro snapshot still has clone children.
+	int rc = os_popen((helper_name + " " + convert(BackupServer::getSnapshotMethod(image))
+		+ " refreshreadonly \"" + clientname + "\" \"" + name + "\" 2>&1").c_str(), errmsg);
+	return rc == 0;
+#endif
+}
+
 std::string SnapshotHelper::getMountpoint(bool image, std::string clientname, std::string name)
 {
 	std::string ret;

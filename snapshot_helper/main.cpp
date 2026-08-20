@@ -566,6 +566,81 @@ bool make_readonly(int mode, std::string subvolume_folder)
 #endif
 }
 
+bool refresh_readonly(int mode, std::string subvolume_folder)
+{
+#ifdef _WIN32
+	return false;
+#else
+	if(mode==mode_btrfs)
+	{
+		// Btrfs does not keep a separate @ro clone-origin snapshot in the same way as
+		// ZFS. Reconcile-storage only needs this refresh step for ZFS datasets whose
+		// sidecar metadata changed after import, so the btrfs path is intentionally a
+		// no-op success.
+		return true;
+	}
+	else if(mode==mode_zfs)
+	{
+		zfs_elevate();
+
+		const std::string ro_snapshot = subvolume_folder+"@ro";
+		const std::string refresh_name = ExtractFileName(subvolume_folder)+"-refresh";
+		const std::string renamed_snapshot = subvolume_folder+"@"+refresh_name;
+
+		// Replacing @ro after reconcile-storage changed .hashes keeps future clones
+		// aligned with the repaired dataset state. If later backups already depend on
+		// the old @ro, refresh follows the same rename/promote/destroy sequence used
+		// during dataset removal before taking the new readonly snapshot.
+		if(is_subvolume(mode, ro_snapshot))
+		{
+			std::string clone_data;
+			int rc=exec_wait(find_zfs_cmd(), clone_data, "get", "-H", "-o", "value", "clones", ro_snapshot.c_str(), NULL);
+			if(rc!=0)
+			{
+				return false;
+			}
+
+			std::vector<std::string> clones;
+			Tokenize(clone_data, clones, "\n");
+			clones.erase(std::remove_if(clones.begin(), clones.end(),
+				[](const std::string& v) { return trim(v).empty() || trim(v)=="-"; }), clones.end());
+
+			if (!clones.empty())
+			{
+				if (exec_wait(find_zfs_cmd(), true, "rename", ro_snapshot.c_str(), renamed_snapshot.c_str(), NULL)!=0
+					&& is_subvolume(mode, ro_snapshot))
+				{
+					return false;
+				}
+
+				for(size_t i=0;i<clones.size();++i)
+				{
+					if(exec_wait(find_zfs_cmd(), true, "promote", clones[i].c_str(), NULL)!=0)
+					{
+						return false;
+					}
+				}
+
+				for(size_t i=0;i<clones.size();++i)
+				{
+					if(exec_wait(find_zfs_cmd(), true, "destroy", (clones[i]+"@"+refresh_name).c_str(), NULL)!=0)
+					{
+						return false;
+					}
+				}
+			}
+			else if(exec_wait(find_zfs_cmd(), true, "destroy", ro_snapshot.c_str(), NULL)!=0)
+			{
+				return false;
+			}
+		}
+
+		return make_readonly(mode, subvolume_folder);
+	}
+	return false;
+#endif
+}
+
 int zfs_test()
 {
 	std::cout << "Testing for zfs..." << std::endl;
@@ -840,10 +915,24 @@ int main(int argc, char *argv[])
 		
 		return make_readonly(mode, subvolume_folder)?0:1;
 	}
+	else if(cmd=="refreshreadonly")
+	{
+		if(argc<5)
+		{
+			std::cout << "Not enough parameters for refreshreadonly" << std::endl;
+			return 1;
+		}
+
+		std::string clientname=handleFilename(argv[3]);
+		std::string name=handleFilename(argv[4]);
+
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
+
+		return refresh_readonly(mode, subvolume_folder)?0:1;
+	}
 	else
 	{
 		std::cout << "Command not found" << std::endl;
 		return 1;
 	}
 }
-
