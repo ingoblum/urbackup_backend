@@ -2124,7 +2124,6 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 
 	bool ok = true;
 	std::set<int64> changed_clientids;
-	SCursorProgress progress("Scanning visible storage backups", static_cast<_i64>(entries.size()));
 	for (size_t i = 0; i < entries.size(); ++i)
 	{
 		if (is_reconcile_stop_requested())
@@ -2135,7 +2134,6 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 
 		const SStorageBackupEntry& entry = entries[i];
 		++stats.dataset_backups_seen;
-		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + storage_entry_display_name(entry), false);
 
 		if (entry.image)
 		{
@@ -2191,7 +2189,6 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 		}
 	}
 
-	finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
 	if (ok && apply)
 	{
 		Server->Log("Updating client statistics for " + convert(changed_clientids.size())
