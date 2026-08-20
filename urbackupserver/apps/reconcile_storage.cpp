@@ -165,12 +165,19 @@ struct SImportedDatasetBackup
 void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force);
 void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail);
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel);
-bool current_client_id(IDatabase* db, const std::string& clientname, int64& clientid);
-bool current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path);
+int current_client_id(IDatabase* db, const std::string& clientname, int64& clientid);
+int current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path);
 std::vector<STableColumnInfo> table_column_info(IDatabase* db, const std::string& dbname, const std::string& table);
 std::string column_list(const std::vector<SColumn>& columns, const std::string& prefix);
 std::string bind_list(size_t n);
 bool should_skip_dataset_entry_name(const std::string& name);
+
+enum ELookupStatus
+{
+	ELookupStatus_Error = -1,
+	ELookupStatus_NotFound = 0,
+	ELookupStatus_Found = 1
+};
 
 std::string strip_trailing_sep(std::string path)
 {
@@ -605,23 +612,36 @@ bool parse_backup_time_from_path(const std::string& backup_path, std::string& sq
 	return true;
 }
 
-bool current_image_backup_exists(IDatabase* db, const std::string& clientname, const std::string& backup_path)
+int current_image_backup_exists(IDatabase* db, const std::string& clientname, const std::string& backup_path)
 {
 	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE c.name=? AND i.path LIKE ?", false);
+	if (q == NULL)
+	{
+		// Storage reconciliation must not continue with a failed lookup query. If
+		// Prepare() already reported a schema/connection error, treating that as
+		// "backup not found" would import duplicates, while dereferencing NULL
+		// would crash immediately.
+		return ELookupStatus_Error;
+	}
 	q->Bind(clientname);
 	q->Bind("%/" + clientname + "/" + backup_path + "/%");
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
-	return !res.empty();
+	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
 }
 
 int64 ensure_client(IDatabase* db, const std::string& clientname, bool apply)
 {
 	int64 clientid = 0;
-	if (current_client_id(db, clientname, clientid))
+	const int lookup_status = current_client_id(db, clientname, clientid);
+	if (lookup_status == ELookupStatus_Found)
 	{
 		return clientid;
+	}
+	if (lookup_status == ELookupStatus_Error)
+	{
+		return 0;
 	}
 
 	if (!apply)
@@ -790,29 +810,34 @@ std::string storage_entry_display_name(const SStorageBackupEntry& entry)
 	return entry.backup_path;
 }
 
-bool current_storage_image_backup_exists(IDatabase* db, const SStorageBackupEntry& entry)
+int current_storage_image_backup_exists(IDatabase* db, const SStorageBackupEntry& entry)
 {
-	IQuery* q = NULL;
+	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+		"WHERE c.name=? AND i.path LIKE ?", false);
+	if (q == NULL)
+	{
+		// Storage-image imports use the same existence probe as file imports. A
+		// failed Prepare() must stop the caller instead of turning into a NULL
+		// dereference or a false "missing backup" result.
+		return ELookupStatus_Error;
+	}
+
 	if (entry.standalone_image_file)
 	{
 		// Standalone image files are matched by their basename because they do not
 		// have the extra backup directory level that directory-backed image backups use.
-		q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
-			"WHERE c.name=? AND i.path LIKE ?", false);
 		q->Bind(entry.clientname);
 		q->Bind("%/" + entry.clientname + "/" + ExtractFileName(entry.payload_path));
 	}
 	else
 	{
-		q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
-			"WHERE c.name=? AND i.path LIKE ?", false);
 		q->Bind(entry.clientname);
 		q->Bind("%/" + entry.clientname + "/" + entry.backup_path + "/%");
 	}
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
-	return !res.empty();
+	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
 }
 
 std::string storage_import_action_label(const SStorageBackupEntry& entry)
@@ -1506,10 +1531,15 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 		++stats.dataset_backups_seen;
 		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + storage_entry_display_name(entry), false);
 
-		const bool exists = entry.image
+		const int exists_status = entry.image
 			? current_storage_image_backup_exists(db, entry)
 			: current_backup_exists(db, entry.clientname, entry.backup_path);
-		if (exists)
+		if (exists_status == ELookupStatus_Error)
+		{
+			ok = false;
+			break;
+		}
+		if (exists_status == ELookupStatus_Found)
 		{
 			continue;
 		}
@@ -1518,14 +1548,26 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 		{
 			SStorageBackupEntry current_entry = entry;
 			int64 existing_clientid = 0;
-			current_entry.client_exists_in_db = current_client_id(db, entry.clientname, existing_clientid);
+			const int client_lookup_status = current_client_id(db, entry.clientname, existing_clientid);
+			if (client_lookup_status == ELookupStatus_Error)
+			{
+				ok = false;
+				break;
+			}
+			current_entry.client_exists_in_db = client_lookup_status == ELookupStatus_Found;
 			ok = ok && import_storage_image_backup(db, image_columns, current_entry, apply, stats);
 		}
 		else
 		{
 			SStorageBackupEntry current_entry = entry;
 			int64 existing_clientid = 0;
-			current_entry.client_exists_in_db = current_client_id(db, entry.clientname, existing_clientid);
+			const int client_lookup_status = current_client_id(db, entry.clientname, existing_clientid);
+			if (client_lookup_status == ELookupStatus_Error)
+			{
+				ok = false;
+				break;
+			}
+			current_entry.client_exists_in_db = client_lookup_status == ELookupStatus_Found;
 			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, stats);
 		}
 		if (!ok)
@@ -2182,24 +2224,35 @@ bool attach_current_files(IDatabase* db)
 	return db->Write("ATTACH DATABASE 'urbackup/backup_server_files.db' AS curr_files");
 }
 
-bool current_client_id(IDatabase* db, const std::string& clientname, int64& clientid)
+int current_client_id(IDatabase* db, const std::string& clientname, int64& clientid)
 {
 	IQuery* q = db->Prepare("SELECT id FROM clients WHERE name=?", false);
+	if (q == NULL)
+	{
+		// A failed Prepare() means the current database handle is unusable for this
+		// lookup right now. Returning a dedicated error status avoids both bogus
+		// "client missing" reconstruction and NULL dereferences in the caller.
+		return ELookupStatus_Error;
+	}
 	q->Bind(clientname);
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
 	if (res.empty())
 	{
-		return false;
+		return ELookupStatus_NotFound;
 	}
 	clientid = watoi64(res[0]["id"]);
-	return true;
+	return ELookupStatus_Found;
 }
 
 bool row_exists_id(IDatabase* db, const std::string& table, int64 id)
 {
 	IQuery* q = db->Prepare("SELECT id FROM " + table + " WHERE id=?", false);
+	if (q == NULL)
+	{
+		return false;
+	}
 	q->Bind(id);
 	db_results res = q->Read();
 	q->Reset();
@@ -2207,15 +2260,24 @@ bool row_exists_id(IDatabase* db, const std::string& table, int64 id)
 	return !res.empty();
 }
 
-bool current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path)
+int current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path)
 {
 	IQuery* q = db->Prepare("SELECT b.id FROM backups b INNER JOIN clients c ON c.id=b.clientid WHERE c.name=? AND b.path=?", false);
+	if (q == NULL)
+	{
+		// The observed crash path was: file-index setup invalidated the old DB
+		// handle, the next lookup Prepare() failed with "no such table", and the
+		// caller dereferenced the NULL IQuery pointer. Returning an explicit error
+		// status keeps the import path from crashing and from misclassifying the
+		// lookup as "backup missing".
+		return ELookupStatus_Error;
+	}
 	q->Bind(clientname);
 	q->Bind(path);
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
-	return !res.empty();
+	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
 }
 
 bool is_malformed_file_row(const db_single_result& row, std::string& reason)
@@ -2517,7 +2579,13 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 		const std::string clientname = row["clientname"];
 		const std::string backup_path = row["path"];
 
-		if (current_backup_exists(db, clientname, backup_path))
+		const int backup_exists_status = current_backup_exists(db, clientname, backup_path);
+		if (backup_exists_status == ELookupStatus_Error)
+		{
+			cursor->shutdown();
+			return false;
+		}
+		if (backup_exists_status == ELookupStatus_Found)
 		{
 			continue;
 		}
@@ -2538,7 +2606,13 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 		}
 
 		int64 mapped_clientid = 0;
-		if (!current_client_id(db, clientname, mapped_clientid))
+		const int client_lookup_status = current_client_id(db, clientname, mapped_clientid);
+		if (client_lookup_status == ELookupStatus_Error)
+		{
+			cursor->shutdown();
+			return false;
+		}
+		if (client_lookup_status != ELookupStatus_Found)
 		{
 			if (row_exists_id(db, "clients", old_clientid))
 			{
@@ -3062,19 +3136,31 @@ int reconcile_storage()
 	}
 	Server->Log("Using new storage prefix \"" + new_storage_prefix + "\"", LL_INFO);
 
-	if (!attach_current_files(db))
-	{
-		Server->Log("Could not attach current files database.", LL_ERROR);
-		return 1;
-	}
 	const bool have_import_db = !import_db_dir.empty();
 	const bool storage_import_needs_file_index = apply && import_missing_dataset_backups_enabled;
 	const bool current_files_rows_will_change = apply
 		&& (remove_malformed_file_rows_enabled || remove_missing_files || have_import_db || import_missing_dataset_backups_enabled);
 
+	// Creating the file index can rebuild backup_server_files.db and internally
+	// destroys all open SQLite handles. Reconcile-storage therefore has to do this
+	// before attaching curr_files or old_* databases and must reacquire the main
+	// server handle afterwards, otherwise later lookups can hit stale connections.
 	if (storage_import_needs_file_index && !ensure_file_index_available_for_reconcile(false))
 	{
 		Server->Log("Could not create or open the file index required for storage-backed file imports.", LL_ERROR);
+		return 1;
+	}
+
+	db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+	if (db == NULL)
+	{
+		Server->Log("Could not reopen current UrBackup database after preparing the file index", LL_ERROR);
+		return 1;
+	}
+
+	if (!attach_current_files(db))
+	{
+		Server->Log("Could not attach current files database.", LL_ERROR);
 		return 1;
 	}
 	if (have_import_db && !attach_import_databases(db, import_db_dir))
