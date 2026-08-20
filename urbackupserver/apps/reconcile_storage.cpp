@@ -1197,6 +1197,16 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 			return false;
 		}
 
+		// The pre-scan must reject the same Windows compatibility links as the real
+		// import walk. Otherwise the progress-only enumeration follows junction-like
+		// symlinks such as "Dokumente und Einstellungen/...\Anwendungsdaten" into a
+		// filesystem loop before file-row import even starts, which makes --apply
+		// skip otherwise readable backups for a purely traversal-related reason.
+		if (files[i].issym || files[i].isspecialf)
+		{
+			continue;
+		}
+
 		if (files[i].isdir)
 		{
 			if (should_skip_dataset_entry_name(files[i].name))
@@ -1208,11 +1218,6 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 			{
 				return false;
 			}
-			continue;
-		}
-
-		if (files[i].issym || files[i].isspecialf)
-		{
 			continue;
 		}
 
