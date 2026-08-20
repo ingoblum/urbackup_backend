@@ -50,7 +50,19 @@ public:
 	class IHashProgressCallback
 	{
 	public:
+		// Long-running hash users can poll external stop conditions here. The hash
+		// loop checks this between chunk reads so callers can stop cleanly without
+		// forcing an asynchronous termination in the middle of file processing.
+		virtual bool should_cancel()
+		{
+			return false;
+		}
+
 		virtual void hash_progress(int64 curr) = 0;
+
+		virtual ~IHashProgressCallback()
+		{
+		}
 	};
 
 

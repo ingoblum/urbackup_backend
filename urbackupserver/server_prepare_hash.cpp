@@ -332,6 +332,15 @@ bool BackupServerPrepareHash::hash_sha(IFile *f, IExtentIterator* extent_iterato
 
 	do
 	{
+		// Hashing can dominate reconcile-storage runtime on large media files. Polling
+		// the optional callback here keeps interactive aborts responsive while still
+		// stopping only at chunk boundaries, after the current file state is coherent.
+		if (progress_callback != NULL
+			&& progress_callback->should_cancel())
+		{
+			return false;
+		}
+
 		while (curr_extent.offset != -1
 			&& curr_extent.offset + curr_extent.size<fpos)
 		{
@@ -381,6 +390,12 @@ bool BackupServerPrepareHash::hash_sha(IFile *f, IExtentIterator* extent_iterato
 				progress_callback->hash_progress(fpos);
 			}
 
+			if (progress_callback != NULL
+				&& progress_callback->should_cancel())
+			{
+				return false;
+			}
+
 			continue;
 		}
 
@@ -405,6 +420,12 @@ bool BackupServerPrepareHash::hash_sha(IFile *f, IExtentIterator* extent_iterato
 				progress_callback->hash_progress(fpos);
 			}
 
+			if (progress_callback != NULL
+				&& progress_callback->should_cancel())
+			{
+				return false;
+			}
+
 		}
 	}
 	while(rc>0);
@@ -412,6 +433,11 @@ bool BackupServerPrepareHash::hash_sha(IFile *f, IExtentIterator* extent_iterato
 	if (progress_callback != NULL)
 	{
 		progress_callback->hash_progress(fpos);
+
+		if (progress_callback->should_cancel())
+		{
+			return false;
+		}
 	}
 
 	return true;

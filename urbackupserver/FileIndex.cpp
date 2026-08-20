@@ -40,12 +40,20 @@ ICondition *FileIndex::cond=NULL;
 bool FileIndex::do_shutdown=false;
 bool FileIndex::do_flush=false;
 bool FileIndex::do_accept = true;
+FileIndex* FileIndex::immediate_fileindex = NULL;
+bool FileIndex::immediate_transaction_open = false;
 
 
 void FileIndex::operator()(void)
 {
-	mutex=Server->createMutex();
-	cond=Server->createCondition();
+	if(mutex==NULL)
+	{
+		mutex=Server->createMutex();
+	}
+	if(cond==NULL)
+	{
+		cond=Server->createCondition();
+	}
 
 	while(true)
 	{
@@ -122,9 +130,100 @@ void FileIndex::operator()(void)
 	delete this;
 }
 
+bool FileIndex::wait_for_async_state()
+{
+	// The delayed-write cache must exist both for the classic async writer and for
+	// reconcile-storage's synchronous immediate-update mode. Creating it lazily
+	// here avoids NULL dereferences when a short-lived CLI command reaches the
+	// fileindex before the background writer thread had a chance to initialize.
+	if(mutex==NULL)
+	{
+		mutex=Server->createMutex();
+	}
+
+	if(cond==NULL)
+	{
+		cond=Server->createCondition();
+	}
+
+	return mutex!=NULL && cond!=NULL;
+}
+
+void FileIndex::clear_cache_state_locked()
+{
+	cache_buffer_1.clear();
+	cache_buffer_2.clear();
+	do_flush=false;
+}
+
+void FileIndex::begin_immediate_updates(FileIndex& fileindex)
+{
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
+	IScopedLock lock(mutex);
+
+	// reconcile-storage runs in a CLI context where the global thread pool may not
+	// have a spare worker for the asynchronous fileindex writer. Immediate mode
+	// therefore applies LMDB updates directly via the caller-supplied handle while
+	// still filling the cache so later lookups in the same backup can see the new
+	// entries before the transaction is committed.
+	immediate_fileindex=&fileindex;
+	immediate_transaction_open=true;
+	immediate_fileindex->start_transaction();
+	clear_cache_state_locked();
+}
+
+void FileIndex::end_immediate_updates(bool commit)
+{
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
+	IScopedLock lock(mutex);
+
+	if(immediate_fileindex!=NULL && immediate_transaction_open)
+	{
+		if(commit)
+		{
+			immediate_fileindex->commit_transaction();
+		}
+		else
+		{
+			immediate_fileindex->abort_transaction();
+		}
+	}
+
+	immediate_fileindex=NULL;
+	immediate_transaction_open=false;
+	clear_cache_state_locked();
+}
+
 void FileIndex::put_delayed(const SIndexKey& key, int64 value)
 {
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
 	IScopedLock lock(mutex);
+
+	if(immediate_fileindex!=NULL)
+	{
+		(*active_cache_buffer)[key]=value;
+		if(value!=0)
+		{
+			immediate_fileindex->put(key, value);
+		}
+		else
+		{
+			immediate_fileindex->del(key);
+		}
+		return;
+	}
 
 	while(active_cache_buffer->size()>=max_buffer_size || !do_accept)
 	{
@@ -244,6 +343,11 @@ int64 FileIndex::get_with_cache_exact( const SIndexKey& key )
 
 void FileIndex::shutdown()
 {
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
 	IScopedLock lock(mutex);
 
 	do_shutdown=true;
@@ -316,6 +420,16 @@ bool FileIndex::get_from_cache_exact( const SIndexKey& key, const std::map<SInde
 
 void FileIndex::flush()
 {
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
+	if(immediate_fileindex!=NULL)
+	{
+		return;
+	}
+
 	IScopedLock lock(mutex);
 
 	do_flush=true;
@@ -331,6 +445,11 @@ void FileIndex::flush()
 
 void FileIndex::stop_accept()
 {
+	if(!wait_for_async_state())
+	{
+		return;
+	}
+
 	IScopedLock lock(mutex);
 	do_accept = false;
 }

@@ -126,6 +126,8 @@ public:
 
 	virtual void commit_transaction(void)=0;
 
+	virtual void abort_transaction(void)=0;
+
 	virtual void start_iteration()=0;
 
 	virtual std::map<int, int64> get_next_entries_iteration(bool& has_next)=0;
@@ -140,6 +142,10 @@ public:
 
 	static void stop_accept();
 
+	static void begin_immediate_updates(FileIndex& fileindex);
+
+	static void end_immediate_updates(bool commit);
+
 private:
 
 	bool get_from_cache( const FileIndex::SIndexKey &key, const std::map<SIndexKey, int64>& cache, int64& res );
@@ -149,6 +155,10 @@ private:
 	bool get_from_cache_exact( const SIndexKey& key, const std::map<SIndexKey, int64>& cache, int64& res );
 
 	void get_from_cache_all_clients( const SIndexKey &key, const std::map<SIndexKey, int64>& cache, std::map<int, int64> &ret );
+
+	static bool wait_for_async_state();
+
+	static void clear_cache_state_locked();
 
 	static std::map<SIndexKey, int64> cache_buffer_1;
 	static std::map<SIndexKey, int64> cache_buffer_2;
@@ -161,4 +171,6 @@ private:
 
 	static bool do_flush;
 	static bool do_accept;
+	static FileIndex* immediate_fileindex;
+	static bool immediate_transaction_open;
 };

@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <vector>
 #ifndef _WIN32
@@ -145,7 +146,8 @@ struct SStorageBackupEntry
 struct SImportedDatasetBackup
 {
 	SImportedDatasetBackup()
-		: clientid(0), backupid(0), incremental(0), total_size(0), file_rows(0)
+		: clientid(0), backupid(0), incremental(0), total_size(0), file_rows(0),
+		resume_existing_backup(false)
 	{
 	}
 
@@ -157,6 +159,73 @@ struct SImportedDatasetBackup
 	std::string sqlite_time;
 	_i64 total_size;
 	int64 file_rows;
+	bool resume_existing_backup;
+};
+
+enum ELookupStatus
+{
+	ELookupStatus_Error = -1,
+	ELookupStatus_NotFound = 0,
+	ELookupStatus_Found = 1
+};
+
+struct SExistingFileBackupState
+{
+	SExistingFileBackupState()
+		: status(ELookupStatus_NotFound), id(0), complete(false), done(false)
+	{
+	}
+
+	int status;
+	int64 id;
+	bool complete;
+	bool done;
+};
+
+enum ETreeImportResult
+{
+	ETreeImportResult_Ok,
+	ETreeImportResult_Error,
+	ETreeImportResult_Stopped
+};
+
+volatile sig_atomic_t reconcile_stop_requested = 0;
+
+void reconcile_signal_handler(int signum)
+{
+	reconcile_stop_requested = signum;
+}
+
+bool is_reconcile_stop_requested()
+{
+	return reconcile_stop_requested != 0;
+}
+
+class ScopedReconcileSignalHandlers
+{
+public:
+	ScopedReconcileSignalHandlers()
+		: active(false), old_sigint(SIG_DFL), old_sigterm(SIG_DFL)
+	{
+		reconcile_stop_requested = 0;
+		old_sigint = signal(SIGINT, reconcile_signal_handler);
+		old_sigterm = signal(SIGTERM, reconcile_signal_handler);
+		active = true;
+	}
+
+	~ScopedReconcileSignalHandlers()
+	{
+		if (active)
+		{
+			signal(SIGINT, old_sigint);
+			signal(SIGTERM, old_sigterm);
+		}
+	}
+
+private:
+	bool active;
+	void (*old_sigint)(int);
+	void (*old_sigterm)(int);
 };
 
 // The dataset-link reconciliation path reuses the interactive cursor progress helpers
@@ -167,17 +236,11 @@ void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel);
 int current_client_id(IDatabase* db, const std::string& clientname, int64& clientid);
 int current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path);
+SExistingFileBackupState current_file_backup_state(IDatabase* db, const std::string& clientname, const std::string& path);
 std::vector<STableColumnInfo> table_column_info(IDatabase* db, const std::string& dbname, const std::string& table);
 std::string column_list(const std::vector<SColumn>& columns, const std::string& prefix);
 std::string bind_list(size_t n);
 bool should_skip_dataset_entry_name(const std::string& name);
-
-enum ELookupStatus
-{
-	ELookupStatus_Error = -1,
-	ELookupStatus_NotFound = 0,
-	ELookupStatus_Found = 1
-};
 
 std::string strip_trailing_sep(std::string path)
 {
@@ -978,35 +1041,6 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 	return true;
 }
 
-bool insert_dataset_file_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
-	const SImportedDatasetBackup& imported, bool apply)
-{
-	if (!apply)
-	{
-		return true;
-	}
-
-	// Reconstructed backup rows are filled with the same semantically relevant fields
-	// the server uses during normal operation. Optional later-added columns are only
-	// populated when their names are known here so schema extensions keep their defaults.
-	std::map<std::string, std::string> values;
-	values["clientid"] = convert(imported.clientid);
-	values["backuptime"] = imported.sqlite_time;
-	values["incremental"] = convert(imported.incremental);
-	values["path"] = imported.backup_path;
-	values["complete"] = "1";
-	values["running"] = "1970-01-01 00:00:00";
-	values["size_bytes"] = convert(imported.total_size);
-	values["done"] = "1";
-
-	if (!insert_named_row(db, "backups", backup_columns, values))
-	{
-		return false;
-	}
-
-	return true;
-}
-
 bool insert_dataset_image_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& image_columns,
 	int64 clientid, const std::string& sqlite_time, const std::string& image_path,
 	const std::string& image_letter, int incremental, _i64 size_bytes, bool apply)
@@ -1062,6 +1096,11 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 	bool ignore_read_errors, bool is_root, _i64& total_size, int64& file_count,
 	int64& ignored_read_errors_for_backup, SStats& stats)
 {
+	if (is_reconcile_stop_requested())
+	{
+		return false;
+	}
+
 	bool has_error = false;
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
@@ -1081,6 +1120,11 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 
 	for (size_t i = 0; i < files.size(); ++i)
 	{
+		if (is_reconcile_stop_requested())
+		{
+			return false;
+		}
+
 		if (files[i].isdir)
 		{
 			if (should_skip_dataset_entry_name(files[i].name))
@@ -1107,8 +1151,50 @@ bool scan_dataset_file_tree_stats(const std::string& current_path, const std::st
 	return true;
 }
 
-bool build_hash_for_file(const std::string& path, std::string& shahash)
+std::string current_sqlite_timestamp(IDatabase* db)
 {
+	db_results res = db->Read("SELECT CURRENT_TIMESTAMP AS ts");
+	if (res.empty())
+	{
+		return "1970-01-01 00:00:00";
+	}
+	return res[0]["ts"];
+}
+
+class ReconcileHashProgressCallback : public BackupServerPrepareHash::IHashProgressCallback
+{
+public:
+	ReconcileHashProgressCallback()
+		: cancelled(false)
+	{
+	}
+
+	// Storage-import hashing is synchronous and can run on very large media files.
+	// Polling the reconcile stop flag here keeps Ctrl-C responsive while still
+	// returning through the normal import path instead of aborting mid-row.
+	virtual bool should_cancel()
+	{
+		cancelled = cancelled || is_reconcile_stop_requested();
+		return cancelled;
+	}
+
+	virtual void hash_progress(int64)
+	{
+	}
+
+	bool was_cancelled() const
+	{
+		return cancelled;
+	}
+
+private:
+	bool cancelled;
+};
+
+bool build_hash_for_file(const std::string& path, std::string& shahash, bool& cancelled)
+{
+	cancelled = false;
+
 	std::auto_ptr<IFsFile> f(Server->openFile(os_file_prefix(path), MODE_READ));
 	if (f.get() == NULL)
 	{
@@ -1117,11 +1203,13 @@ bool build_hash_for_file(const std::string& path, std::string& shahash)
 	}
 
 	FsExtentIterator extent_iterator(f.get(), 512 * 1024);
+	ReconcileHashProgressCallback progress_callback;
 	if (BackupServer::useTreeHashing())
 	{
 		TreeHash treehash(NULL);
-		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, treehash))
+		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, treehash, &progress_callback))
 		{
+			cancelled = progress_callback.was_cancelled();
 			return false;
 		}
 		shahash = treehash.finalize();
@@ -1129,8 +1217,9 @@ bool build_hash_for_file(const std::string& path, std::string& shahash)
 	else
 	{
 		HashSha512 hashsha;
-		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, hashsha))
+		if (!BackupServerPrepareHash::hash_sha(f.get(), &extent_iterator, true, hashsha, &progress_callback))
 		{
+			cancelled = progress_callback.was_cancelled();
 			return false;
 		}
 		shahash = hashsha.finalize();
@@ -1139,11 +1228,72 @@ bool build_hash_for_file(const std::string& path, std::string& shahash)
 	return true;
 }
 
-bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
+bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
+	const SImportedDatasetBackup& imported, const std::string& fullpath, const std::string& hashpath,
+	const SFile& file_meta, SStats& stats, SCursorProgress& progress, bool& reused_entry)
+{
+	reused_entry = false;
+
+	ServerFilesDao::CondInt64 entry_id = filesdao.lookupEntryIdByPath(fullpath);
+	if (!entry_id.exists)
+	{
+		return true;
+	}
+
+	ServerFilesDao::SFindFileEntry entry = filesdao.getFileEntry(entry_id.value);
+	if (!entry.exists)
+	{
+		return true;
+	}
+
+	// Resume skips only rows that already match the visible storage object for the
+	// same backup. This keeps Ctrl-C resumptions idempotent while still allowing a
+	// later run to rebuild an entry if the partially imported row is obviously for a
+	// different backup or path.
+	if (entry.backupid != imported.backupid
+		|| entry.clientid != imported.clientid
+		|| entry.filesize != file_meta.size
+		|| entry.rsize != file_meta.size
+		|| entry.incremental != imported.incremental
+		|| entry.fullpath != fullpath
+		|| entry.hashpath != hashpath)
+	{
+		return true;
+	}
+
+	if (file_meta.size >= link_file_min_size)
+	{
+		const int64 indexed_id = fileindex.get_with_cache_exact(FileIndex::SIndexKey(entry.shahash.c_str(), entry.filesize, entry.clientid));
+		if (indexed_id == 0)
+		{
+			// A previous run may have been interrupted after the file row was written
+			// but before the delayed LMDB update was persisted. Re-adding the exact key
+			// here repairs the file index without rewriting the files row.
+			FileIndex::put_delayed(FileIndex::SIndexKey(entry.shahash.c_str(), entry.filesize, entry.clientid), entry.id);
+		}
+	}
+
+	++stats.file_rows_reused;
+	reused_entry = true;
+	if (stats.file_rows_reused <= 20)
+	{
+		log_with_cursor_progress(progress, "Reusing already imported storage file row id "
+			+ convert(entry.id) + " for backup \"" + imported.clientname + "/" + imported.backup_path
+			+ "\" path \"" + fullpath + "\"", LL_INFO);
+	}
+	return true;
+}
+
+ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
 	const std::string& relative_path, const std::string& visible_root,
 	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors,
 	int64& ignored_read_errors_for_backup, SStats& stats)
 {
+	if (is_reconcile_stop_requested())
+	{
+		return ETreeImportResult_Stopped;
+	}
+
 	bool has_error = false;
 	std::vector<SFile> files = getFiles(current_path, &has_error);
 	if (has_error)
@@ -1152,7 +1302,7 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 		// directory listing still aborts because there is otherwise no stable base.
 		if (!ignore_read_errors || relative_path.empty())
 		{
-			return false;
+			return ETreeImportResult_Error;
 		}
 
 		++ignored_read_errors_for_backup;
@@ -1165,8 +1315,19 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 	std::sort(files.begin(), files.end());
 	for (size_t i = 0; i < files.size(); ++i)
 	{
+		if (is_reconcile_stop_requested())
+		{
+			return ETreeImportResult_Stopped;
+		}
+
 		const std::string child_relative = relative_path.empty() ? files[i].name : relative_path + os_file_sep() + files[i].name;
 		const std::string physical_path = join_path(current_path, files[i].name);
+		const std::string fullpath = join_path(visible_root, child_relative);
+		std::string hashpath = join_path(join_path(visible_root, ".hashes"), child_relative);
+		if (!FileExists(os_file_prefix(hashpath)))
+		{
+			hashpath.clear();
+		}
 		draw_cursor_progress(progress, stats.file_rows_importable + stats.file_rows_imported + 1,
 			imported.clientname + "/" + imported.backup_path + " " + child_relative, false);
 
@@ -1176,10 +1337,11 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 			{
 				continue;
 			}
-			if (!import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
-				visible_root, imported, progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats))
+			const ETreeImportResult child_result = import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
+				visible_root, imported, progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats);
+			if (child_result != ETreeImportResult_Ok)
 			{
-				return false;
+				return child_result;
 			}
 			continue;
 		}
@@ -1189,12 +1351,31 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 			continue;
 		}
 
-		std::string shahash;
-		if (!build_hash_for_file(physical_path, shahash))
+		if (imported.resume_existing_backup)
 		{
+			bool reused_entry = false;
+			if (!resume_imported_file_entry(filesdao, fileindex, imported, fullpath, hashpath, files[i], stats, progress, reused_entry))
+			{
+				return ETreeImportResult_Error;
+			}
+			if (reused_entry)
+			{
+				continue;
+			}
+		}
+
+		std::string shahash;
+		bool hash_cancelled = false;
+		if (!build_hash_for_file(physical_path, shahash, hash_cancelled))
+		{
+			if (hash_cancelled)
+			{
+				return ETreeImportResult_Stopped;
+			}
+
 			if (!ignore_read_errors)
 			{
-				return false;
+				return ETreeImportResult_Error;
 			}
 
 			// Read and hashing failures are skipped per file so the rest of the backup
@@ -1205,13 +1386,6 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 				+ "\" while importing backup \"" + imported.clientname + "/" + imported.backup_path
 				+ "\" because --ignore-read-errors was specified.", LL_WARNING);
 			continue;
-		}
-
-		const std::string fullpath = join_path(visible_root, child_relative);
-		std::string hashpath = join_path(join_path(visible_root, ".hashes"), child_relative);
-		if (!FileExists(os_file_prefix(hashpath)))
-		{
-			hashpath.clear();
 		}
 
 		++stats.file_rows_importable;
@@ -1229,17 +1403,95 @@ bool import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fil
 		const int64 created = files[i].created != 0 ? files[i].created : files[i].last_modified;
 		if (created != 0 && !update_imported_file_created(filesdao, fileid, created))
 		{
-			return false;
+			return ETreeImportResult_Error;
 		}
 
 		++stats.file_rows_imported;
+
+		// Ctrl-C is honored only after the current file row and matching fileindex
+		// update are durable. That keeps the resume state per file consistent and
+		// allows the next run to skip exactly the files that were already imported.
+		if (is_reconcile_stop_requested())
+		{
+			return ETreeImportResult_Stopped;
+		}
+	}
+
+	return ETreeImportResult_Ok;
+}
+
+bool update_imported_file_backup_state(IDatabase* db, int64 backupid, bool complete, const std::string& running, _i64 size_bytes)
+{
+	IQuery* q = db->Prepare("UPDATE backups SET complete=?, running=?, size_bytes=?, done=1 WHERE id=?", false);
+	if (q == NULL)
+	{
+		return false;
+	}
+	q->Bind(complete ? 1 : 0);
+	q->Bind(running);
+	q->Bind(size_bytes);
+	q->Bind(backupid);
+	const bool ok = q->Write();
+	q->Reset();
+	db->destroyQuery(q);
+	return ok;
+}
+
+bool insert_dataset_file_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
+	const SImportedDatasetBackup& imported, bool apply, bool complete)
+{
+	if (!apply)
+	{
+		return true;
+	}
+
+	std::map<std::string, std::string> values;
+	values["clientid"] = convert(imported.clientid);
+	values["backuptime"] = imported.sqlite_time;
+	values["incremental"] = convert(imported.incremental);
+	values["path"] = imported.backup_path;
+	values["complete"] = complete ? "1" : "0";
+	values["running"] = complete ? "1970-01-01 00:00:00" : current_sqlite_timestamp(db);
+	values["size_bytes"] = convert(imported.total_size);
+	values["done"] = "1";
+
+	if (!insert_named_row(db, "backups", backup_columns, values))
+	{
+		return false;
 	}
 
 	return true;
 }
 
+SExistingFileBackupState current_file_backup_state(IDatabase* db, const std::string& clientname, const std::string& path)
+{
+	SExistingFileBackupState ret;
+	IQuery* q = db->Prepare("SELECT b.id, b.complete, b.done FROM backups b INNER JOIN clients c ON c.id=b.clientid WHERE c.name=? AND b.path=?", false);
+	if (q == NULL)
+	{
+		ret.status = ELookupStatus_Error;
+		return ret;
+	}
+	q->Bind(clientname);
+	q->Bind(path);
+	db_results res = q->Read();
+	q->Reset();
+	db->destroyQuery(q);
+	if (res.empty())
+	{
+		ret.status = ELookupStatus_NotFound;
+		return ret;
+	}
+
+	ret.status = ELookupStatus_Found;
+	ret.id = watoi64(res[0]["id"]);
+	ret.complete = watoi(res[0]["complete"]) != 0;
+	ret.done = watoi(res[0]["done"]) != 0;
+	return ret;
+}
+
 bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
-	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, SStats& stats)
+	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, std::set<int64>& changed_clientids, SStats& stats)
 {
 	SImportedDatasetBackup imported;
 	imported.clientname = entry.clientname;
@@ -1265,6 +1517,21 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		imported.incremental = (!older.empty() && watoi64(older[0]["c"]) > 0) ? 1 : 0;
 	}
 
+	const SExistingFileBackupState existing_backup = current_file_backup_state(db, entry.clientname, entry.backup_path);
+	if (existing_backup.status == ELookupStatus_Error)
+	{
+		return false;
+	}
+	if (existing_backup.status == ELookupStatus_Found && existing_backup.complete)
+	{
+		return true;
+	}
+	if (existing_backup.status == ELookupStatus_Found)
+	{
+		imported.backupid = existing_backup.id;
+		imported.resume_existing_backup = true;
+	}
+
 	++stats.dataset_backups_importable;
 	SCursorProgress count_progress("Scanning storage file backup", 0);
 	int64 ignored_read_errors_for_backup = 0;
@@ -1286,6 +1553,13 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 	if (!scan_dataset_file_tree_stats(entry.root_path, entry.clientname + "/" + entry.backup_path,
 		ignore_read_errors, true, imported.total_size, imported.file_rows, ignored_read_errors_for_backup, stats))
 	{
+		if (is_reconcile_stop_requested())
+		{
+			Server->Log("Stopping storage file backup import for client \"" + entry.clientname + "\" path \""
+				+ entry.backup_path + "\" before backup row creation because termination was requested.", LL_WARNING);
+			return false;
+		}
+
 		log_with_cursor_progress(count_progress, "Skipping storage file backup client \"" + entry.clientname
 			+ "\" path \"" + entry.backup_path
 			+ "\" because its contents could not be read completely. See previous log lines for the concrete filesystem error.", LL_WARNING);
@@ -1293,14 +1567,27 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 	}
 	finish_cursor_progress(count_progress, 0, "done");
 
-	if (!insert_dataset_file_backup_row(db, backup_columns, imported, apply))
+	if (apply && imported.resume_existing_backup)
+	{
+		// A resumed import keeps the existing backup id stable so already imported
+		// file rows continue to belong to the same backup. The state is switched back
+		// to running/incomplete here and finalized only after the last file is done.
+		if (!update_imported_file_backup_state(db, imported.backupid, false, current_sqlite_timestamp(db), imported.total_size))
+		{
+			return false;
+		}
+	}
+	else if (!insert_dataset_file_backup_row(db, backup_columns, imported, apply, false))
 	{
 		return false;
 	}
 
 	if (apply)
 	{
-		imported.backupid = db->getLastInsertID();
+		if (!imported.resume_existing_backup)
+		{
+			imported.backupid = db->getLastInsertID();
+		}
 		ServerFilesDao filesdao(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES));
 		std::auto_ptr<FileIndex> fileindex(create_lmdb_files_index());
 		if (fileindex.get() == NULL)
@@ -1310,17 +1597,54 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 			return false;
 		}
 
+		bool have_resume_lookup = false;
+		if (imported.resume_existing_backup)
+		{
+			if (!filesdao.createTemporaryPathLookupTable()
+				|| !filesdao.createTemporaryPathLookupIndex())
+			{
+				Server->Log("Could not create temporary lookup structures for resuming storage-backed file import of backup id "
+					+ convert(imported.backupid), LL_ERROR);
+				return false;
+			}
+			filesdao.populateTemporaryPathLookupTable(static_cast<int>(imported.backupid));
+			have_resume_lookup = true;
+		}
+
 		SCursorProgress import_progress("Importing storage file rows", 0);
 		const int64 file_rows_imported_before = stats.file_rows_imported;
 		const int64 file_rows_importable_before = stats.file_rows_importable;
-		if (!import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
-			entry.root_path, imported, import_progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats))
+		// reconcile-storage may run without an available asynchronous fileindex
+		// writer thread. Immediate mode keeps LMDB and the in-memory lookup cache in
+		// sync for this backup import without depending on the global thread pool.
+		FileIndex::begin_immediate_updates(*fileindex);
+		const ETreeImportResult import_result = import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
+			entry.root_path, imported, import_progress, apply, ignore_read_errors, ignored_read_errors_for_backup, stats);
+		if (have_resume_lookup)
 		{
-			finish_cursor_progress(import_progress, stats.file_rows_imported, "failed");
+			filesdao.dropTemporaryPathLookupIndex();
+			filesdao.dropTemporaryPathLookupTable();
+		}
+		if (import_result != ETreeImportResult_Ok)
+		{
+			FileIndex::end_immediate_updates(false);
+			finish_cursor_progress(import_progress, stats.file_rows_imported, import_result == ETreeImportResult_Stopped ? "stopped" : "failed");
 
-			// File-tree imports may fail only after the backup row and some file rows
-			// already exist. Those partial rows are removed again so apply mode can
-			// continue with the next visible backup instead of aborting the whole run.
+			if (import_result == ETreeImportResult_Stopped)
+			{
+				if (!update_imported_file_backup_state(db, imported.backupid, false, "1970-01-01 00:00:00", imported.total_size))
+				{
+					return false;
+				}
+				Server->Log("Stopping storage file backup import for client \"" + entry.clientname + "\" path \""
+					+ entry.backup_path + "\" after the current file because termination was requested. "
+					"The partial import remains resumable on the next run.", LL_WARNING);
+				return false;
+			}
+
+			// Filesystem and hashing errors still clean up the new backup rows on the
+			// same run. Resume is reserved for operator-triggered interruption where the
+			// already committed per-file state is intentionally kept.
 			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
 			Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER_FILES)->Write("DELETE FROM files WHERE backupid=" + convert(imported.backupid));
 			stats.file_rows_imported = file_rows_imported_before;
@@ -1330,8 +1654,12 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 				+ "\" because importing its file rows failed. Partial database rows were removed again. See previous log lines for the concrete filesystem or hashing error.", LL_WARNING);
 			return true;
 		}
+		FileIndex::end_immediate_updates(true);
 		finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
-		FileIndex::flush();
+		if (!update_imported_file_backup_state(db, imported.backupid, true, "1970-01-01 00:00:00", imported.total_size))
+		{
+			return false;
+		}
 
 		// Per-backup reporting keeps ignored read errors attributable to the backup
 		// that triggered them, instead of only showing the final global aggregate.
@@ -1342,14 +1670,16 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 				+ " ignored read error(s) because --ignore-read-errors was specified.", LL_WARNING);
 		}
 
-		if (!update_client_rollups(db, imported.clientid))
-		{
-			return false;
-		}
 	}
 
 	if (apply)
 	{
+		// Recomputing client rollups after every imported backup re-scans the full
+		// files table each time. On large installations that made reconcile-storage
+		// appear stalled immediately after the first successful import. Record the
+		// touched client here and recompute its aggregates once after the visible
+		// storage scan has finished.
+		changed_clientids.insert(imported.clientid);
 		++stats.dataset_backups_imported;
 	}
 
@@ -1403,7 +1733,7 @@ std::string storage_image_letter(const SStorageBackupEntry& entry, const std::st
 }
 
 bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnInfo>& image_columns,
-	const SStorageBackupEntry& entry, bool apply, SStats& stats)
+	const SStorageBackupEntry& entry, bool apply, std::set<int64>& changed_clientids, SStats& stats)
 {
 	std::string sqlite_time;
 	if (!parse_backup_time_from_path(entry.backup_path, sqlite_time))
@@ -1477,12 +1807,11 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 	}
 	if (apply)
 	{
+		// Image imports participate in the same deferred rollup update as file
+		// imports so one reconcile-storage run only recomputes client aggregates
+		// once per touched client instead of once per imported backup.
+		changed_clientids.insert(clientid);
 		++stats.dataset_backups_imported;
-	}
-
-	if (apply && !update_client_rollups(db, clientid))
-	{
-		return false;
 	}
 
 	return true;
@@ -1524,28 +1853,33 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 	});
 
 	bool ok = true;
+	std::set<int64> changed_clientids;
 	SCursorProgress progress("Scanning visible storage backups", static_cast<_i64>(entries.size()));
 	for (size_t i = 0; i < entries.size(); ++i)
 	{
-		const SStorageBackupEntry& entry = entries[i];
-		++stats.dataset_backups_seen;
-		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + storage_entry_display_name(entry), false);
-
-		const int exists_status = entry.image
-			? current_storage_image_backup_exists(db, entry)
-			: current_backup_exists(db, entry.clientname, entry.backup_path);
-		if (exists_status == ELookupStatus_Error)
+		if (is_reconcile_stop_requested())
 		{
 			ok = false;
 			break;
 		}
-		if (exists_status == ELookupStatus_Found)
-		{
-			continue;
-		}
+
+		const SStorageBackupEntry& entry = entries[i];
+		++stats.dataset_backups_seen;
+		draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + storage_entry_display_name(entry), false);
 
 		if (entry.image)
 		{
+			const int exists_status = current_storage_image_backup_exists(db, entry);
+			if (exists_status == ELookupStatus_Error)
+			{
+				ok = false;
+				break;
+			}
+			if (exists_status == ELookupStatus_Found)
+			{
+				continue;
+			}
+
 			SStorageBackupEntry current_entry = entry;
 			int64 existing_clientid = 0;
 			const int client_lookup_status = current_client_id(db, entry.clientname, existing_clientid);
@@ -1555,10 +1889,21 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 				break;
 			}
 			current_entry.client_exists_in_db = client_lookup_status == ELookupStatus_Found;
-			ok = ok && import_storage_image_backup(db, image_columns, current_entry, apply, stats);
+			ok = ok && import_storage_image_backup(db, image_columns, current_entry, apply, changed_clientids, stats);
 		}
 		else
 		{
+			const SExistingFileBackupState existing_backup = current_file_backup_state(db, entry.clientname, entry.backup_path);
+			if (existing_backup.status == ELookupStatus_Error)
+			{
+				ok = false;
+				break;
+			}
+			if (existing_backup.status == ELookupStatus_Found && existing_backup.complete)
+			{
+				continue;
+			}
+
 			SStorageBackupEntry current_entry = entry;
 			int64 existing_clientid = 0;
 			const int client_lookup_status = current_client_id(db, entry.clientname, existing_clientid);
@@ -1568,7 +1913,7 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 				break;
 			}
 			current_entry.client_exists_in_db = client_lookup_status == ELookupStatus_Found;
-			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, stats);
+			ok = ok && import_storage_file_backup(db, backup_columns, current_entry, apply, ignore_read_errors, changed_clientids, stats);
 		}
 		if (!ok)
 		{
@@ -1577,6 +1922,20 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 	}
 
 	finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
+	if (ok && apply)
+	{
+		for (std::set<int64>::const_iterator it = changed_clientids.begin(); it != changed_clientids.end(); ++it)
+		{
+			// The deferred rollup pass preserves the same final client metadata as
+			// the old per-backup updates, but reduces full-table SUM/MAX rescans to
+			// one pass per touched client for the whole reconcile-storage run.
+			if (!update_client_rollups(db, *it))
+			{
+				ok = false;
+				break;
+			}
+		}
+	}
 	return ok;
 }
 
@@ -3063,6 +3422,11 @@ void log_summary(const SStats& stats, bool apply)
 
 int reconcile_storage()
 {
+	// reconcile-storage is often run interactively for long migrations. Installing
+	// local SIGINT/SIGTERM handlers lets Ctrl-C stop between consistent file-level
+	// units instead of aborting immediately in the middle of the import code paths.
+	ScopedReconcileSignalHandlers reconcile_signal_handlers;
+
 	std::string import_db_dir = strip_trailing_sep(Server->getServerParameter("import_db"));
 	if (import_db_dir.empty())
 	{
@@ -3138,6 +3502,7 @@ int reconcile_storage()
 
 	const bool have_import_db = !import_db_dir.empty();
 	const bool storage_import_needs_file_index = apply && import_missing_dataset_backups_enabled;
+	const bool storage_import_uses_detached_files_connection = apply && import_missing_dataset_backups_enabled;
 	const bool current_files_rows_will_change = apply
 		&& (remove_malformed_file_rows_enabled || remove_missing_files || have_import_db || import_missing_dataset_backups_enabled);
 
@@ -3171,7 +3536,7 @@ int reconcile_storage()
 	SStats stats;
 	bool ok = true;
 
-	if (apply)
+	if (apply && !storage_import_uses_detached_files_connection)
 	{
 		/*
 		reconcile-storage attaches backup_server_files.db as curr_files to the
@@ -3189,6 +3554,19 @@ int reconcile_storage()
 			Server->Log("Could not start reconcile-storage write transaction.", LL_ERROR);
 			return 1;
 		}
+	}
+	else if (apply)
+	{
+		/*
+		The storage import path reconstructs file rows via ServerFilesDao on
+		URBACKUPDB_SERVER_FILES, i.e. through a second SQLite connection to
+		backup_server_files.db. Holding a long-lived BEGIN IMMEDIATE on the main
+		connection at the same time would self-deadlock those file-row inserts with
+		SQLITE_BUSY. This path therefore runs without the outer transaction and uses
+		the per-backup cleanup already present in import_storage_file_backup() to
+		remove partial rows on failure.
+		*/
+		Server->Log("Running apply mode without outer reconcile-storage transaction because --import-storage writes file rows via a detached SQLite connection.", LL_INFO);
 	}
 
 	if (remove_malformed_file_rows_enabled)
@@ -3258,7 +3636,7 @@ int reconcile_storage()
 		Server->Log("Skipping empty backup removal because --drop-empty-backups was not specified.", LL_INFO);
 	}
 
-	if (apply)
+	if (apply && !storage_import_uses_detached_files_connection)
 	{
 		if (ok)
 		{
