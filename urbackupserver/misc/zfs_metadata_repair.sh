@@ -22,6 +22,7 @@ readonly DATASET_FILE_CONFIG=/etc/urbackup/dataset_file
 dataset_parent=""
 state_root=""
 staging_mount_root=""
+force_rescan=0
 declare -a requested_clients=()
 
 usage()
@@ -46,6 +47,7 @@ Options:
   --promote-repairs           Promote each replacement after the swap. This
                               detaches its clone lineage but can transfer
                               snapshot ownership from its clean base.
+  --rescan                    Ignore cached scan results in the state root
   --state-root <directory>    Store logs and plans here (default: <parent-mount>/.zfs-metadata-repair)
   --staging-mount-root <dir>  Mount replacement clones below this directory
                               (default: <state-root>/mounts)
@@ -112,6 +114,10 @@ while (($#)); do
 		promote_repairs=1
 		shift
 		;;
+	--rescan)
+		force_rescan=1
+		shift
+		;;
 	--state-root)
 		(($# >= 2)) || die "--state-root requires a value"
 		state_root=$2
@@ -168,12 +174,73 @@ readonly unreadable_paths_file="$state_root/unreadable-paths.tsv"
 readonly bad_datasets_file="$state_root/bad-datasets.tsv"
 readonly repair_plan_file="$state_root/repair-plan.tsv"
 readonly archived_properties_file="$state_root/archived-dataset-properties.tsv"
-: > "$all_datasets_file"
-: > "$scan_errors_file"
-: > "$unreadable_paths_file"
-: > "$bad_datasets_file"
-: > "$repair_plan_file"
-: > "$archived_properties_file"
+readonly scan_context_file="$state_root/scan-context"
+
+reset_scan_state()
+{
+	: > "$all_datasets_file"
+	: > "$scan_errors_file"
+	: > "$unreadable_paths_file"
+	: > "$bad_datasets_file"
+}
+
+reset_plan_state()
+{
+	: > "$repair_plan_file"
+	: > "$archived_properties_file"
+}
+
+write_scan_context()
+{
+	local requested_client
+
+	# The scan cache is only safe to reuse when the dataset root and client
+	# filter match. The context file records exactly that and is treated as
+	# plain data, never as shell code.
+	{
+		printf 'dataset_parent=%s\n' "$dataset_parent"
+		for requested_client in "${requested_clients[@]}"; do
+			printf 'client=%s\n' "$requested_client"
+		done
+	} > "$scan_context_file"
+}
+
+scan_context_matches()
+{
+	local line expected_clients serialized_expected serialized_existing
+	local -a existing_clients=()
+
+	[[ -s $scan_context_file ]] || return 1
+	while IFS= read -r line; do
+		case "$line" in
+		dataset_parent=*)
+			[[ ${line#dataset_parent=} == "$dataset_parent" ]] || return 1
+			;;
+		client=*)
+			existing_clients+=("${line#client=}")
+			;;
+		*)
+			return 1
+			;;
+		esac
+	done < "$scan_context_file"
+
+	serialized_expected=$(printf '%s\n' "${requested_clients[@]}" | LC_ALL=C sort)
+	serialized_existing=$(printf '%s\n' "${existing_clients[@]}" | LC_ALL=C sort)
+	[[ $serialized_expected == "$serialized_existing" ]]
+}
+
+should_reuse_scan_state()
+{
+	(( force_rescan == 0 )) || return 1
+	(( apply == 1 )) || return 1
+	(( scan_only == 0 )) || return 1
+	scan_context_matches || return 1
+	[[ -f $all_datasets_file && -f $bad_datasets_file && -f $scan_errors_file && -f $unreadable_paths_file ]] || return 1
+	return 0
+}
+
+reset_plan_state
 
 client_is_requested()
 {
@@ -448,15 +515,25 @@ swap_client_datasets()
 	done < "$client_plan"
 }
 
-collect_datasets
-if [[ ! -s $all_datasets_file ]]; then
-	warn "No matching backup datasets found below $dataset_parent"
-	exit 0
-fi
+if should_reuse_scan_state; then
+	# A prior dry-run already captured the affected datasets for the same scope.
+	# Reusing it keeps the later apply run aligned with the reviewed plan instead
+	# of traversing the tree again and potentially taking hours a second time.
+	log "Reusing existing scan result from state directory: $state_root"
+else
+	reset_scan_state
+	collect_datasets
+	if [[ ! -s $all_datasets_file ]]; then
+		warn "No matching backup datasets found below $dataset_parent"
+		exit 0
+	fi
 
-while IFS=$'\t' read -r client backup dataset mountpoint; do
-	scan_dataset "$dataset" "$mountpoint"
-done < "$all_datasets_file"
+	log "Running fresh metadata scan. Use --rescan later to explicitly refresh this state."
+	while IFS=$'\t' read -r client backup dataset mountpoint; do
+		scan_dataset "$dataset" "$mountpoint"
+	done < "$all_datasets_file"
+	write_scan_context
+fi
 
 if [[ ! -s $bad_datasets_file ]]; then
 	log "No metadata traversal errors found. State directory: $state_root"
