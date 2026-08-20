@@ -1178,6 +1178,10 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Perform a dry-run. This is the default unless --apply is specified.",
 		cmd, false);
 
+	TCLAP::SwitchArg verbose_arg("v", "verbose",
+		"Print per-file rebuild messages instead of summarizing rebuilt .hashes files only in the progress line.",
+		cmd, false);
+
 	TCLAP::SwitchArg skip_db_backup_arg("", "skip-db-backup",
 		"Skip the pre-run database backup. Intended for repeated test dry-runs only.",
 		cmd, false);
@@ -1305,6 +1309,11 @@ int action_reconcile_storage(std::vector<std::string> args)
 	{
 		real_args.push_back("--dry_run");
 		real_args.push_back("true");
+	}
+	if(verbose_arg.getValue())
+	{
+		real_args.push_back("--verbose");
+		real_args.push_back("1");
 	}
 	if(skip_db_backup_arg.getValue())
 	{
