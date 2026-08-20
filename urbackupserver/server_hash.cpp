@@ -419,16 +419,21 @@ void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex
 
 	if(new_for_client || update_fileindex)
 	{
-		const std::string new_entry_msg = "New fileindex entry for \"" + shorten_fileindex_runtime_path(fp, hash_path) + "\""
-			" id=" + convert(entryid)
-			+ " hash=" + base64_encode(reinterpret_cast<const unsigned char*>(shahash.c_str()), bytes_in_index);
+		const std::string short_path = shorten_fileindex_runtime_path(fp, hash_path);
+		const std::string new_entry_msg = "\"" + short_path + "\""
+			//" id=" + convert(entryid)
+			//+ " hash=" + base64_encode(reinterpret_cast<const unsigned char*>(shahash.c_str()), bytes_in_index)
+			;
 
 		// Interactive reconcile-storage imports update a single live status line
-		// instead of emitting one log line per imported file. When no callback is
-		// installed the original LL_DEBUG logging behaviour remains unchanged.
+		// instead of emitting one log line per imported file. The progress renderer
+		// already shows the current import detail after its own separator, so only the
+		// short path is forwarded there to avoid duplicating the same path twice in one
+		// line. When no callback is installed the original LL_DEBUG logging behaviour
+		// remains unchanged and keeps the richer context.
 		if (fileindex_status_message_callback != NULL)
 		{
-			fileindex_status_message_callback(new_entry_msg);
+			fileindex_status_message_callback(short_path);
 		}
 		else
 		{
