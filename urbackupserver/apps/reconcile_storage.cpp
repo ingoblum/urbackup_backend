@@ -51,7 +51,8 @@ struct SStats
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
 		dataset_links(0), dataset_links_created(0), dataset_backups_seen(0),
-		dataset_backups_importable(0), dataset_backups_imported(0), ignored_read_errors(0), hash_metadata_rebuilt(0), broken_storage_link_targets(0),
+		dataset_backups_importable(0), dataset_backups_imported(0), ignored_read_errors(0),
+		hash_metadata_rebuilt(0), hash_metadata_created(0), hash_metadata_repaired(0), broken_storage_link_targets(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
 		malformed_file_rows(0), malformed_file_rows_removed(0), empty_backups(0), empty_backups_removed(0)
 	{
@@ -72,6 +73,8 @@ struct SStats
 	int64 dataset_backups_imported;
 	int64 ignored_read_errors;
 	int64 hash_metadata_rebuilt;
+	int64 hash_metadata_created;
+	int64 hash_metadata_repaired;
 	int64 broken_storage_link_targets;
 	int64 paths_to_migrate;
 	int64 paths_migrated;
@@ -1500,10 +1503,12 @@ bool write_hash_metadata_for_file(const std::string& physical_path, const std::s
 
 void update_hash_metadata_rebuild_status(SCursorProgress& progress, const SStats& stats)
 {
-	// Rebuilding sidecar metadata is expected on migrated storages with incomplete
-	// .hashes trees. A single running counter keeps that repair activity visible
-	// without forcing one terminal log line per rebuilt metadata file.
-	set_cursor_progress_status(progress, "Rebuilt .hashes files: " + convert(stats.hash_metadata_rebuilt));
+	// Missing sidecars and corrupt sidecars have different causes. Showing both
+	// counters in the live status makes it easier to distinguish widespread data
+	// loss from format corruption during long-running storage imports.
+	set_cursor_progress_status(progress, "Rebuilt .hashes files: total " + convert(stats.hash_metadata_rebuilt)
+		+ ", created " + convert(stats.hash_metadata_created)
+		+ ", repaired " + convert(stats.hash_metadata_repaired));
 }
 
 bool resolve_import_file_hash(const std::string& physical_path, const std::string& hashpath, int64 expected_filesize,
@@ -1524,6 +1529,7 @@ bool resolve_import_file_hash(const std::string& physical_path, const std::strin
 		{
 			return true;
 		}
+		const bool hash_metadata_existed = FileExists(os_file_prefix(hashpath));
 
 		if (verbose)
 		{
@@ -1534,6 +1540,14 @@ bool resolve_import_file_hash(const std::string& physical_path, const std::strin
 		if (write_hash_metadata_for_file(physical_path, hashpath, shahash, cancelled, &rebuild_failure_reason, !verbose))
 		{
 			++stats.hash_metadata_rebuilt;
+			if (hash_metadata_existed)
+			{
+				++stats.hash_metadata_repaired;
+			}
+			else
+			{
+				++stats.hash_metadata_created;
+			}
 			if (metadata_changed != NULL)
 			{
 				*metadata_changed = true;
