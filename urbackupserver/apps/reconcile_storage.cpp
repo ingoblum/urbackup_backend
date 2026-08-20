@@ -2156,16 +2156,19 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		{
 			finish_cursor_progress(import_progress, stats.file_rows_imported, "done");
 		}
-		if (imported.hash_metadata_changed
+		const bool readonly_snapshot_missing = imported.resume_existing_backup
+			&& BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile
+			&& SnapshotHelper::isSubvolume(false, entry.clientname, entry.backup_path)
+			&& !SnapshotHelper::hasReadonly(false, entry.clientname, entry.backup_path);
+		if ((imported.hash_metadata_changed || readonly_snapshot_missing)
 			&& BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile
 			&& SnapshotHelper::isSubvolume(false, entry.clientname, entry.backup_path))
 		{
 			std::string refresh_errmsg;
-			// Reconcile-storage only refreshes @ro when it actually modified .hashes.
-			// That keeps unchanged datasets untouched, while repaired ZFS backups get a
-			// new readonly clone origin whose contents match the updated dataset. A
-			// failed refresh leaves the backup incomplete so the next run can retry the
-			// snapshot repair against the already imported file rows.
+			// Reconcile-storage refreshes @ro after modifying .hashes, or repairs a
+			// missing @ro detected while resuming a previous failed refresh. This keeps
+			// unchanged datasets untouched while allowing the incomplete backup to retry
+			// only its missing snapshot instead of rebuilding file rows again.
 			if (!SnapshotHelper::refreshReadonly(false, entry.clientname, entry.backup_path, refresh_errmsg))
 			{
 				update_imported_file_backup_state(db, imported.backupid, false, "1970-01-01 00:00:00", imported.total_size);

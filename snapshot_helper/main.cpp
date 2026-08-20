@@ -621,13 +621,10 @@ bool refresh_readonly(int mode, std::string subvolume_folder)
 					}
 				}
 
-				for(size_t i=0;i<clones.size();++i)
-				{
-					if(exec_wait(find_zfs_cmd(), true, "destroy", (clones[i]+"@"+refresh_name).c_str(), NULL)!=0)
-					{
-						return false;
-					}
-				}
+				// zfs promote reverses the clone relationship: the renamed snapshot is
+				// then the origin of the former parent dataset. It must remain in place;
+				// destroying it would fail on that dependent clone and abort the metadata
+				// refresh before the repaired dataset receives its new @ro snapshot.
 			}
 			else if(exec_wait(find_zfs_cmd(), true, "destroy", ro_snapshot.c_str(), NULL)!=0)
 			{
@@ -914,6 +911,22 @@ int main(int argc, char *argv[])
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
 		return make_readonly(mode, subvolume_folder)?0:1;
+	}
+	else if(cmd=="hasreadonly")
+	{
+		if(argc<5)
+		{
+			std::cout << "Not enough parameters for hasreadonly" << std::endl;
+			return 1;
+		}
+
+		std::string clientname=handleFilename(argv[3]);
+		std::string name=handleFilename(argv[4]);
+		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
+
+		// Reconcile-storage uses this after an interrupted refresh to distinguish a
+		// valid existing @ro origin from a backup that needs only snapshot repair.
+		return is_subvolume(mode, subvolume_folder+"@ro") ? 0 : 1;
 	}
 	else if(cmd=="refreshreadonly")
 	{

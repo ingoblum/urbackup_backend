@@ -113,6 +113,19 @@ bool SnapshotHelper::makeReadonly(bool image, std::string clientname, std::strin
 #endif
 }
 
+bool SnapshotHelper::hasReadonly(bool image, std::string clientname, std::string name)
+{
+#ifdef _WIN32
+	return true;
+#else
+	// An interrupted metadata refresh can leave a resumable backup without @ro.
+	// Querying the helper keeps the dataset-name mapping and privilege handling in
+	// one place instead of duplicating ZFS path construction in reconciliation.
+	int rc = system((helper_name + " " + convert(BackupServer::getSnapshotMethod(image)) + " hasreadonly \"" + clientname + "\" \"" + name + "\"").c_str());
+	return rc == 0;
+#endif
+}
+
 bool SnapshotHelper::refreshReadonly(bool image, std::string clientname, std::string name, std::string& errmsg)
 {
 #ifdef _WIN32
