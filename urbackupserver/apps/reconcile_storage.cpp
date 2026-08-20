@@ -1582,7 +1582,7 @@ bool resolve_import_file_hash(const std::string& physical_path, const std::strin
 	return build_hash_for_file(physical_path, shahash, cancelled);
 }
 
-bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
+bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex, FileIndex* lookup_fileindex,
 	const SImportedDatasetBackup& imported, const std::string& fullpath, const std::string& hashpath,
 	const SFile& file_meta, SStats& stats, SCursorProgress& progress, bool& reused_entry)
 {
@@ -1617,7 +1617,14 @@ bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
 
 	if (file_meta.size >= link_file_min_size)
 	{
-		const int64 indexed_id = fileindex.get_with_cache_exact(FileIndex::SIndexKey(entry.shahash.c_str(), entry.filesize, entry.clientid));
+		FileIndex& lookup_index = lookup_fileindex != NULL ? *lookup_fileindex : fileindex;
+		// Immediate fileindex updates keep a write transaction open on "fileindex"
+		// for the duration of one imported backup. Reusing that same handle for a
+		// cache miss lookup would open a nested read transaction via get(), replace
+		// the active write transaction in LMDBFileIndex::txn and make the next put()
+		// fail with EINVAL. Resume therefore probes the persisted index through a
+		// separate read handle and only uses the write handle for delayed repairs.
+		const int64 indexed_id = lookup_index.get_with_cache_exact(FileIndex::SIndexKey(entry.shahash.c_str(), entry.filesize, entry.clientid));
 		if (indexed_id == 0)
 		{
 			// A previous run may have been interrupted after the file row was written
@@ -1638,7 +1645,7 @@ bool resume_imported_file_entry(ServerFilesDao& filesdao, FileIndex& fileindex,
 	return true;
 }
 
-ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, const std::string& current_path,
+ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, FileIndex& fileindex, FileIndex* lookup_fileindex, const std::string& current_path,
 	const std::string& relative_path, const std::string& visible_root,
 	SImportedDatasetBackup& imported, SCursorProgress& progress, bool apply, bool ignore_read_errors, bool rehash_files, bool verbose,
 	int64& ignored_read_errors_for_backup, SStats& stats)
@@ -1699,7 +1706,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 			{
 				continue;
 			}
-			const ETreeImportResult child_result = import_dataset_file_tree_recursive(filesdao, fileindex, physical_path, child_relative,
+			const ETreeImportResult child_result = import_dataset_file_tree_recursive(filesdao, fileindex, lookup_fileindex, physical_path, child_relative,
 				visible_root, imported, progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats);
 			if (child_result != ETreeImportResult_Ok)
 			{
@@ -1711,7 +1718,7 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 		if (imported.resume_existing_backup)
 		{
 			bool reused_entry = false;
-			if (!resume_imported_file_entry(filesdao, fileindex, imported, fullpath, hashpath, files[i], stats, progress, reused_entry))
+			if (!resume_imported_file_entry(filesdao, fileindex, lookup_fileindex, imported, fullpath, hashpath, files[i], stats, progress, reused_entry))
 			{
 				return ETreeImportResult_Error;
 			}
@@ -1968,6 +1975,20 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 			db->Write("DELETE FROM backups WHERE id=" + convert(imported.backupid));
 			return false;
 		}
+		std::auto_ptr<FileIndex> resume_lookup_fileindex;
+		if (imported.resume_existing_backup)
+		{
+			// Resume needs persisted lookups and immediate LMDB repairs at the same
+			// time. Using a dedicated read handle here avoids nested read transactions
+			// on the write handle that immediate mode keeps open across the whole
+			// import, which otherwise invalidates the active LMDB write transaction.
+			resume_lookup_fileindex.reset(create_lmdb_files_index());
+			if (resume_lookup_fileindex.get() == NULL)
+			{
+				Server->Log("Could not open secondary file index handle for resuming storage-backed file backup import. The file index is missing.", LL_ERROR);
+				return false;
+			}
+		}
 
 		bool have_resume_lookup = false;
 		if (imported.resume_existing_backup)
@@ -1993,8 +2014,8 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		// reconcile-storage may run without an available asynchronous fileindex
 		// writer thread. Immediate mode keeps LMDB and the in-memory lookup cache in
 		// sync for this backup import without depending on the global thread pool.
-		FileIndex::begin_immediate_updates(*fileindex);
-		const ETreeImportResult import_result = import_dataset_file_tree_recursive(filesdao, *fileindex, entry.root_path, std::string(),
+		FileIndex::begin_immediate_updates(*fileindex, resume_lookup_fileindex.get());
+		const ETreeImportResult import_result = import_dataset_file_tree_recursive(filesdao, *fileindex, resume_lookup_fileindex.get(), entry.root_path, std::string(),
 			entry.root_path, imported, import_progress, apply, ignore_read_errors, rehash_files, verbose, ignored_read_errors_for_backup, stats);
 		if (have_resume_lookup)
 		{

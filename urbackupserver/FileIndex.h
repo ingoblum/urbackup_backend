@@ -144,7 +144,7 @@ public:
 
 	static void stop_accept();
 
-	static void begin_immediate_updates(FileIndex& fileindex);
+	static void begin_immediate_updates(FileIndex& fileindex, FileIndex* lookup_fileindex = NULL);
 
 	static void end_immediate_updates(bool commit);
 
@@ -181,6 +181,7 @@ private:
 	static bool do_flush;
 	static bool do_accept;
 	static FileIndex* immediate_fileindex;
+	static FileIndex* immediate_lookup_fileindex;
 	static bool immediate_transaction_open;
 	static FileIndexRuntimeStatusCallback runtime_status_callback;
 };

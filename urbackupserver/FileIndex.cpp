@@ -41,6 +41,7 @@ bool FileIndex::do_shutdown=false;
 bool FileIndex::do_flush=false;
 bool FileIndex::do_accept = true;
 FileIndex* FileIndex::immediate_fileindex = NULL;
+FileIndex* FileIndex::immediate_lookup_fileindex = NULL;
 bool FileIndex::immediate_transaction_open = false;
 FileIndexRuntimeStatusCallback FileIndex::runtime_status_callback = NULL;
 
@@ -157,7 +158,7 @@ void FileIndex::clear_cache_state_locked()
 	do_flush=false;
 }
 
-void FileIndex::begin_immediate_updates(FileIndex& fileindex)
+void FileIndex::begin_immediate_updates(FileIndex& fileindex, FileIndex* lookup_fileindex)
 {
 	if(!wait_for_async_state())
 	{
@@ -170,8 +171,12 @@ void FileIndex::begin_immediate_updates(FileIndex& fileindex)
 	// have a spare worker for the asynchronous fileindex writer. Immediate mode
 	// therefore applies LMDB updates directly via the caller-supplied handle while
 	// still filling the cache so later lookups in the same backup can see the new
-	// entries before the transaction is committed.
+	// entries before the transaction is committed. Cache misses must not recurse
+	// into the same LMDB handle, because that handle already owns a write
+	// transaction for the running import. A dedicated lookup handle preserves
+	// persisted reads without invalidating the active writer transaction.
 	immediate_fileindex=&fileindex;
+	immediate_lookup_fileindex=lookup_fileindex;
 	immediate_transaction_open=true;
 	immediate_fileindex->start_transaction();
 	clear_cache_state_locked();
@@ -199,6 +204,7 @@ void FileIndex::end_immediate_updates(bool commit)
 	}
 
 	immediate_fileindex=NULL;
+	immediate_lookup_fileindex=NULL;
 	immediate_transaction_open=false;
 	clear_cache_state_locked();
 }
@@ -276,6 +282,11 @@ int64 FileIndex::get_with_cache(const FileIndex::SIndexKey& key)
 
 	}
 
+	if(immediate_fileindex==this && immediate_lookup_fileindex!=NULL)
+	{
+		return immediate_lookup_fileindex->get_any_client(key);
+	}
+
 	return get_any_client(key);
 }
 
@@ -296,6 +307,11 @@ int64 FileIndex::get_with_cache_prefer_client(const SIndexKey& key)
 		}
 	}
 
+	if(immediate_fileindex==this && immediate_lookup_fileindex!=NULL)
+	{
+		return immediate_lookup_fileindex->get_prefer_client(key);
+	}
+
 	return get_prefer_client(key);
 }
 
@@ -311,7 +327,15 @@ std::map<int, int64> FileIndex::get_all_clients_with_cache( const SIndexKey& key
 		get_from_cache_all_clients(key, *active_cache_buffer, ret_cache);
 	}
 
-	std::map<int, int64> ret = get_all_clients(key);
+	std::map<int, int64> ret;
+	if(immediate_fileindex==this && immediate_lookup_fileindex!=NULL)
+	{
+		ret = immediate_lookup_fileindex->get_all_clients(key);
+	}
+	else
+	{
+		ret = get_all_clients(key);
+	}
 
 	for (std::map<int, int64>::iterator it = ret_cache.begin(); it != ret_cache.end();++it)
 	{
@@ -353,6 +377,11 @@ int64 FileIndex::get_with_cache_exact( const SIndexKey& key )
 		{
 			return ret;
 		}
+	}
+
+	if(immediate_fileindex==this && immediate_lookup_fileindex!=NULL)
+	{
+		return immediate_lookup_fileindex->get(key);
 	}
 
 	return get(key);
