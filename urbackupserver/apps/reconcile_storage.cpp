@@ -1560,6 +1560,18 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 		draw_cursor_progress(progress, stats.file_rows_importable + stats.file_rows_imported + 1,
 			imported.clientname + "/" + imported.backup_path + " " + child_relative, false);
 
+		// Linux reports a symlink-to-directory as both issym and isdir. Visible UrBackup
+		// storage can contain Windows compatibility links such as "Dokumente und Einstellungen"
+		// that intentionally have a single metadata file in ".hashes". If reconcile-storage
+		// recurses into those links as if they were real directories, it mirrors the link
+		// target below that metadata file and later collides with the existing .hashes entry.
+		// Skip symlink/special entries before directory recursion so only real directories
+		// contribute nested file rows during import.
+		if (files[i].issym || files[i].isspecialf)
+		{
+			continue;
+		}
+
 		if (files[i].isdir)
 		{
 			if (should_skip_dataset_entry_name(files[i].name))
@@ -1572,11 +1584,6 @@ ETreeImportResult import_dataset_file_tree_recursive(ServerFilesDao& filesdao, F
 			{
 				return child_result;
 			}
-			continue;
-		}
-
-		if (files[i].issym || files[i].isspecialf)
-		{
 			continue;
 		}
 
