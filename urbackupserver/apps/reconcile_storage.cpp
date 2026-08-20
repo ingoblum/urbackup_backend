@@ -104,6 +104,7 @@ struct SCursorProgress
 
 	std::string label;
 	std::string detail;
+	std::string status_message;
 	_i64 total;
 	_i64 current;
 	_i64 last_rate_current;
@@ -190,6 +191,10 @@ enum ETreeImportResult
 };
 
 volatile sig_atomic_t reconcile_stop_requested = 0;
+SCursorProgress* active_cursor_progress = NULL;
+SCursorProgress* fileindex_status_progress = NULL;
+
+void set_cursor_progress_status(SCursorProgress& progress, const std::string& msg);
 
 void reconcile_signal_handler(int signum)
 {
@@ -200,6 +205,34 @@ bool is_reconcile_stop_requested()
 {
 	return reconcile_stop_requested != 0;
 }
+
+void reconcile_fileindex_status_message(const std::string& msg)
+{
+	if (fileindex_status_progress != NULL)
+	{
+		set_cursor_progress_status(*fileindex_status_progress, msg);
+	}
+}
+
+class ScopedFileIndexStatusProgress
+{
+public:
+	ScopedFileIndexStatusProgress(SCursorProgress* progress)
+		: previous_progress(fileindex_status_progress)
+	{
+		fileindex_status_progress = progress;
+		set_fileindex_status_message_callback(progress != NULL ? reconcile_fileindex_status_message : NULL);
+	}
+
+	~ScopedFileIndexStatusProgress()
+	{
+		fileindex_status_progress = previous_progress;
+		set_fileindex_status_message_callback(previous_progress != NULL ? reconcile_fileindex_status_message : NULL);
+	}
+
+private:
+	SCursorProgress* previous_progress;
+};
 
 class ScopedReconcileSignalHandlers
 {
@@ -1614,6 +1647,10 @@ bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInf
 		SCursorProgress import_progress("Importing storage file rows", 0);
 		const int64 file_rows_imported_before = stats.file_rows_imported;
 		const int64 file_rows_importable_before = stats.file_rows_importable;
+		// Fileindex insertions can happen for every imported file. Routing those
+		// updates into the active progress line keeps interactive imports readable
+		// while preserving the same information in continuously refreshed form.
+		ScopedFileIndexStatusProgress scoped_fileindex_status(&import_progress);
 		// reconcile-storage may run without an available asynchronous fileindex
 		// writer thread. Immediate mode keeps LMDB and the in-memory lookup cache in
 		// sync for this backup import without depending on the global thread pool.
@@ -2160,14 +2197,37 @@ void pause_cursor_progress(SCursorProgress& progress)
 {
 	if (progress.drawn)
 	{
-		std::cout << "\r";
-		for (size_t i = 0; i < progress.max_line_length; ++i)
-		{
-			std::cout << " ";
-		}
-		std::cout << "\r";
+		// The interactive reconcile-storage workflow redraws the same terminal line
+		// very frequently. ANSI line clearing avoids emitting thousands of padding
+		// spaces into logs or PTY captures while still erasing wrapped leftovers.
+		std::cout << "\r\033[2K";
 		std::cout.flush();
+		progress.drawn = false;
+		if (active_cursor_progress == &progress)
+		{
+			active_cursor_progress = NULL;
+		}
 	}
+}
+
+std::string compact_progress_text(const std::string& text, size_t max_len)
+{
+	if (text.size() <= max_len || max_len < 16)
+	{
+		return text;
+	}
+
+	// Progress lines often contain long paths. Keeping both the prefix and suffix
+	// preserves the operation context as well as the most relevant filename tail.
+	const size_t left_len = (max_len - 3) / 2;
+	const size_t right_len = max_len - 3 - left_len;
+	return text.substr(0, left_len) + "..." + text.substr(text.size() - right_len);
+}
+
+void set_cursor_progress_status(SCursorProgress& progress, const std::string& msg)
+{
+	progress.status_message = msg;
+	draw_cursor_progress(progress, progress.current, progress.detail, false);
 }
 
 void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail, bool force)
@@ -2196,6 +2256,14 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 		progress.rows_per_second = passed_time > 0 ? (new_rows * 1000) / passed_time : 0;
 		progress.last_rate_current = current;
 		progress.last_rate_time = curr_time;
+	}
+
+	if (active_cursor_progress != NULL && active_cursor_progress != &progress)
+	{
+		// reconcile-storage nests multiple progress scopes. Clearing the previously
+		// active line here avoids concatenating a new status or warning onto an older
+		// still-visible progress line from a different scope.
+		pause_cursor_progress(*active_cursor_progress);
 	}
 
 	std::string line;
@@ -2242,27 +2310,24 @@ void draw_cursor_progress(SCursorProgress& progress, _i64 current, const std::st
 			+ " rows, " + convert(progress.rows_per_second) + " rows/s";
 	}
 
+	if (!progress.status_message.empty())
+	{
+		line += " | " + progress.status_message;
+	}
 	if (!detail.empty())
 	{
-		line += " " + detail;
+		line += " | " + detail;
 	}
+	line = compact_progress_text(line, 220);
 
-	if (line.size() > progress.max_line_length)
-	{
-		progress.max_line_length = line.size();
-	}
-	while (line.size() < progress.max_line_length)
-	{
-		line += " ";
-	}
-
-	std::cout << line;
+	std::cout << "\r\033[2K" << line;
 	std::cout.flush();
 
 	progress.current = current;
 	progress.detail = detail;
 	progress.last_draw_time = curr_time;
 	progress.drawn = true;
+	active_cursor_progress = &progress;
 }
 
 void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::string& detail)
@@ -2270,15 +2335,32 @@ void finish_cursor_progress(SCursorProgress& progress, _i64 current, const std::
 	draw_cursor_progress(progress, current, detail, true);
 	if (progress.drawn)
 	{
+		std::cout << "\r\033[2K";
 		std::cout << std::endl;
 		progress.drawn = false;
-		progress.max_line_length = 0;
+		progress.status_message.clear();
+		if (active_cursor_progress == &progress)
+		{
+			active_cursor_progress = NULL;
+		}
 	}
 }
 
 void log_with_cursor_progress(SCursorProgress& progress, const std::string& msg, int loglevel)
 {
-	pause_cursor_progress(progress);
+	if (loglevel < LL_WARNING)
+	{
+		// Informational state changes are folded into the live status line so long
+		// interactive runs do not scroll the terminal continuously. Warnings/errors
+		// still become dedicated log lines below.
+		set_cursor_progress_status(progress, msg);
+		return;
+	}
+
+	if (active_cursor_progress != NULL)
+	{
+		pause_cursor_progress(*active_cursor_progress);
+	}
 	Server->Log(msg, loglevel);
 	draw_cursor_progress(progress, progress.current, progress.detail, true);
 }

@@ -21,6 +21,13 @@ class MaxFileId;
 
 const int64 link_file_min_size = 2048;
 
+typedef void (*FileIndexStatusMessageCallback)(const std::string& msg);
+
+// reconcile-storage can replace the very verbose per-file fileindex debug log with
+// a live status-line update. Other callers keep the existing logging behaviour by
+// leaving this callback unset.
+void set_fileindex_status_message_callback(FileIndexStatusMessageCallback callback);
+
 struct STmpFile
 {
 	STmpFile(int backupid, std::string fp, std::string hashpath)

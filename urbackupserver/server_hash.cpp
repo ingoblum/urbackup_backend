@@ -43,6 +43,12 @@ const size_t freespace_mod=50*1024*1024; //50 MB
 const size_t BUFFER_SIZE=64*1024; //64KB
 
 IMutex * delete_mutex=NULL;
+FileIndexStatusMessageCallback fileindex_status_message_callback = NULL;
+
+void set_fileindex_status_message_callback(FileIndexStatusMessageCallback callback)
+{
+	fileindex_status_message_callback = callback;
+}
 
 void init_mutex1(void)
 {
@@ -380,9 +386,21 @@ void BackupServerHash::addFileSQL(ServerFilesDao& filesdao, FileIndex& fileindex
 
 	if(new_for_client || update_fileindex)
 	{
-		FILEENTRY_DEBUG(Server->Log("New fileindex entry for \"" + fp + "\""
+		const std::string new_entry_msg = "New fileindex entry for \"" + fp + "\""
 			" id=" + convert(entryid)
-			+" hash="+base64_encode(reinterpret_cast<const unsigned char*>(shahash.c_str()), bytes_in_index), LL_DEBUG));
+			+ " hash=" + base64_encode(reinterpret_cast<const unsigned char*>(shahash.c_str()), bytes_in_index);
+
+		// Interactive reconcile-storage imports update a single live status line
+		// instead of emitting one log line per imported file. When no callback is
+		// installed the original LL_DEBUG logging behaviour remains unchanged.
+		if (fileindex_status_message_callback != NULL)
+		{
+			fileindex_status_message_callback(new_entry_msg);
+		}
+		else
+		{
+			FILEENTRY_DEBUG(Server->Log(new_entry_msg, LL_DEBUG));
+		}
 		fileindex.put_delayed(FileIndex::SIndexKey(shahash.c_str(), filesize, clientid), entryid);
 	}
 }
@@ -1972,4 +1990,3 @@ bool BackupServerHash::punchHoleOrZero(IFile * tf, int64 offset, int64 size)
 
 	return true;
 }
-
