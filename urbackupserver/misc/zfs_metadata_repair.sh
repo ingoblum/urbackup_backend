@@ -509,10 +509,12 @@ copy_dataset_tree()
 		# overwrite an inherited good file nor make an unreadable source directory
 		# look empty. Successfully read objects are updated; uncertain old objects
 		# remain until a later verification can decide whether they were deleted.
-		# progress2 reports the complete rsync transfer, while tee retains progress
-		# and read errors in the per-backup log for later review.
+		# progress2 reports the complete rsync transfer on stdout. Expected source
+		# EIO diagnostics stay on stderr and are recorded only in the per-backup
+		# log, so a damaged metadata tree does not make the terminal unusable.
+		: > "$copy_log"
 		set +e
-		LC_ALL=C rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 -- "$source_mountpoint/" "$replacement_mountpoint/" 2>&1 | tee "$copy_log"
+		LC_ALL=C rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive -- "$source_mountpoint/" "$replacement_mountpoint/" 2>>"$copy_log" | tee -a "$copy_log"
 		copy_pipeline_status=("${PIPESTATUS[@]}")
 		set -e
 		rsync_rc=${copy_pipeline_status[0]}
@@ -529,7 +531,7 @@ copy_dataset_tree()
 			warn "rsync returned $rsync_rc for \"$source_mountpoint\"; unreadable entries were not copied. Details: $copy_log"
 		fi
 	else
-		log "DRY-RUN: rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 -- $(printf '%q' "$source_mountpoint/") $(printf '%q' "$replacement_mountpoint/")"
+		log "DRY-RUN: rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive -- $(printf '%q' "$source_mountpoint/") $(printf '%q' "$replacement_mountpoint/")"
 	fi
 }
 
