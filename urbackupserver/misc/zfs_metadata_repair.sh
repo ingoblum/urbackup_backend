@@ -18,6 +18,7 @@ apply=0
 scan_only=0
 prefer_newer_base=0
 promote_repairs=0
+rsync_inplace=0
 readonly DATASET_FILE_CONFIG=/etc/urbackup/dataset_file
 dataset_parent=""
 state_root=""
@@ -44,10 +45,12 @@ Options:
   --apply                     Create replacement datasets and swap them in
   --scan-only                 Scan and write the plan without rebuilding
   --prefer-newer-base         If both neighbours are clean, rebuild backwards
-  --promote-repairs           Promote each replacement after the swap. This
-                              detaches its clone lineage but can transfer
-                              snapshot ownership from its clean base.
-  --rescan                    Ignore cached scan results in the state root
+	  --promote-repairs           Promote each replacement after the swap. This
+	                              detaches its clone lineage but can transfer
+	                              snapshot ownership from its clean base.
+	  --inplace                   Pass --inplace to rsync while rebuilding
+	                              replacement datasets
+	  --rescan                    Ignore cached scan results in the state root
   --state-root <directory>    Store logs and plans here (default: <parent-mount>/.zfs-metadata-repair)
   --staging-mount-root <dir>  Mount replacement clones below this directory
                               (default: <state-root>/mounts)
@@ -112,6 +115,10 @@ while (($#)); do
 		;;
 	--promote-repairs)
 		promote_repairs=1
+		shift
+		;;
+	--inplace)
+		rsync_inplace=1
 		shift
 		;;
 	--rescan)
@@ -497,24 +504,80 @@ create_repair_dataset()
 	fi
 }
 
+remove_inplace_io_error_targets()
+{
+	local source_mountpoint=$1 replacement_mountpoint=$2 copy_log=$3
+	local error_line error_path relative_path replacement_path
+	local removed_count=0 unmapped_count=0
+	# Keep the ERE in a variable so Bash does not reinterpret its literal
+	# parentheses while parsing [[ ... =~ ... ]]. The path is capture group one.
+	local rsync_eio_regex='^rsync: \[[^][]+\] .*\("([^"]*)"\) failed: Input/output error \(5\)$'
+
+	while IFS= read -r error_line; do
+		[[ $error_line == *'failed: Input/output error (5)' ]] || continue
+		if [[ $error_line =~ $rsync_eio_regex ]]; then
+			error_path=${BASH_REMATCH[1]}
+		else
+			printf 'zfs_metadata_repair: could not map rsync EIO line: %s\n' "$error_line" >> "$copy_log"
+			((unmapped_count += 1))
+			continue
+		fi
+
+		if [[ $error_path != "$source_mountpoint/"* ]]; then
+			printf 'zfs_metadata_repair: rsync EIO path is outside the source tree: %s\n' "$error_path" >> "$copy_log"
+			((unmapped_count += 1))
+			continue
+		fi
+		relative_path=${error_path#"$source_mountpoint"/}
+		if [[ -z $relative_path || /$relative_path/ == *'/../'* ]]; then
+			printf 'zfs_metadata_repair: refusing unsafe rsync EIO path: %s\n' "$error_path" >> "$copy_log"
+			((unmapped_count += 1))
+			continue
+		fi
+
+		replacement_path="$replacement_mountpoint/$relative_path"
+		if [[ -e $replacement_path || -L $replacement_path ]]; then
+			# --inplace may have changed the inherited target before rsync discovers
+			# the source EIO. Removing that one target avoids preserving a partially
+			# overwritten file in the repaired dataset or its later @ro snapshot.
+			rm -f -- "$replacement_path" || die "Could not remove target affected by rsync EIO: $replacement_path"
+			printf 'zfs_metadata_repair: removed inplace target after source EIO: %s\n' "$replacement_path" >> "$copy_log"
+			((removed_count += 1))
+		fi
+	done < "$copy_log"
+
+	if (( unmapped_count != 0 )); then
+		warn "Could not safely map $unmapped_count rsync EIO path(s); see $copy_log. No snapshot will be created."
+		return 1
+	fi
+	if (( removed_count != 0 )); then
+		warn "Removed $removed_count target file(s) after rsync source EIO; details: $copy_log"
+	fi
+}
+
 copy_dataset_tree()
 {
 	local source_mountpoint=$1 replacement_mountpoint=$2 copy_log=$3
 	local rsync_rc=0
 	local -a copy_pipeline_status=()
+	local -a rsync_options=(-aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive)
 
 	log "Copying \"$source_mountpoint\" to \"$replacement_mountpoint\""
+	if (( rsync_inplace )); then
+		# Keep the dry-run command identical to apply mode so its review output
+		# accurately shows the requested overwrite behaviour.
+		rsync_options+=(--inplace)
+	fi
 	if (( apply )); then
-		# Do not use --inplace or --delete: source EIO must neither partially
-		# overwrite an inherited good file nor make an unreadable source directory
-		# look empty. Successfully read objects are updated; uncertain old objects
-		# remain until a later verification can decide whether they were deleted.
+		# --delete is deliberately absent: source EIO must not make an unreadable
+		# source directory look empty. --inplace remains opt-in because it can
+		# partially overwrite an inherited good file if the source read fails.
 		# progress2 reports the complete rsync transfer on stdout. Expected source
 		# EIO diagnostics stay on stderr and are recorded only in the per-backup
 		# log, so a damaged metadata tree does not make the terminal unusable.
 		: > "$copy_log"
 		set +e
-		LC_ALL=C rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive -- "$source_mountpoint/" "$replacement_mountpoint/" 2>>"$copy_log" | tee -a "$copy_log"
+		LC_ALL=C rsync "${rsync_options[@]}" -- "$source_mountpoint/" "$replacement_mountpoint/" 2>>"$copy_log" | tee -a "$copy_log"
 		copy_pipeline_status=("${PIPESTATUS[@]}")
 		set -e
 		rsync_rc=${copy_pipeline_status[0]}
@@ -527,11 +590,14 @@ copy_dataset_tree()
 			interrupted=1
 		fi
 		abort_if_interrupted
+		if (( rsync_inplace )); then
+			remove_inplace_io_error_targets "$source_mountpoint" "$replacement_mountpoint" "$copy_log" || die "Could not safely remove every target affected by rsync EIO"
+		fi
 		if (( rsync_rc != 0 )); then
 			warn "rsync returned $rsync_rc for \"$source_mountpoint\"; unreadable entries were not copied. Details: $copy_log"
 		fi
 	else
-		log "DRY-RUN: rsync -aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive -- $(printf '%q' "$source_mountpoint/") $(printf '%q' "$replacement_mountpoint/")"
+		log "DRY-RUN: $(printf '%q ' rsync "${rsync_options[@]}" -- "$source_mountpoint/" "$replacement_mountpoint/")"
 	fi
 }
 
