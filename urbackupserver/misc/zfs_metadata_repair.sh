@@ -508,7 +508,9 @@ remove_inplace_io_error_targets()
 {
 	local source_mountpoint=$1 replacement_mountpoint=$2 copy_log=$3
 	local error_line error_path relative_path replacement_path
-	local removed_count=0 unmapped_count=0
+	local unmapped_count=0
+	local -a replacement_paths=()
+	local -A replacement_paths_seen=()
 	# Keep the ERE in a variable so Bash does not reinterpret its literal
 	# parentheses while parsing [[ ... =~ ... ]]. The path is capture group one.
 	local rsync_eio_regex='^rsync: \[[^][]+\] .*\("([^"]*)"\) failed: Input/output error \(5\)$'
@@ -537,12 +539,12 @@ remove_inplace_io_error_targets()
 
 		replacement_path="$replacement_mountpoint/$relative_path"
 		if [[ -e $replacement_path || -L $replacement_path ]]; then
-			# --inplace may have changed the inherited target before rsync discovers
-			# the source EIO. Removing that one target avoids preserving a partially
-			# overwritten file in the repaired dataset or its later @ro snapshot.
-			rm -f -- "$replacement_path" || die "Could not remove target affected by rsync EIO: $replacement_path"
-			printf 'zfs_metadata_repair: removed inplace target after source EIO: %s\n' "$replacement_path" >> "$copy_log"
-			((removed_count += 1))
+			# A path can appear in more than one rsync diagnostic. Delete it once so
+			# the pre-delete count accurately describes the pending modifications.
+			if [[ ! -v "replacement_paths_seen[$replacement_path]" ]]; then
+				replacement_paths_seen[$replacement_path]=1
+				replacement_paths+=("$replacement_path")
+			fi
 		fi
 	done < "$copy_log"
 
@@ -550,8 +552,15 @@ remove_inplace_io_error_targets()
 		warn "Could not safely map $unmapped_count rsync EIO path(s); see $copy_log. No snapshot will be created."
 		return 1
 	fi
-	if (( removed_count != 0 )); then
-		warn "Removed $removed_count target file(s) after rsync source EIO; details: $copy_log"
+	if ((${#replacement_paths[@]} != 0)); then
+		warn "Post-processing will delete ${#replacement_paths[@]} target file(s) affected by rsync source EIO; details: $copy_log"
+		for replacement_path in "${replacement_paths[@]}"; do
+			# --inplace may have changed the inherited target before rsync discovers
+			# the source EIO. Removing that one target avoids preserving a partially
+			# overwritten file in the repaired dataset or its later @ro snapshot.
+			rm -f -- "$replacement_path" || die "Could not remove target affected by rsync EIO: $replacement_path"
+			printf 'zfs_metadata_repair: removed inplace target after source EIO: %s\n' "$replacement_path" >> "$copy_log"
+		done
 	fi
 }
 
