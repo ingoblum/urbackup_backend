@@ -1333,19 +1333,21 @@ bool read_hash_metadata_shahash(const std::string& hashpath, int64 expected_file
 		return false;
 	}
 
-	const int64 hashfilesize = read_hashdata_size(hashfile.get());
-	if (hashfilesize != expected_filesize)
-	{
-		reason = hashfilesize == -1
-			? "metadata file does not contain hashdata for a regular file"
-			: "metadata file size header " + convert(hashfilesize) + " does not match file size " + convert(expected_filesize);
-		return false;
-	}
-
 	FileMetadata metadata;
 	if (!read_metadata(hashfile.get(), metadata))
 	{
 		reason = "metadata payload could not be read";
+		return false;
+	}
+
+	// Reuse the canonical file_metadata readers for both layout variants here:
+	// historical regular-file sidecars may contain only metadata plus an embedded
+	// shahash, and reconcile-storage can import them without rewriting the sidecar.
+	const int64 hashfilesize = read_hashdata_size(hashfile.get());
+	if (hashfilesize != expected_filesize
+		&& !is_metadata_only(hashfile.get()))
+	{
+		reason = "metadata file size header " + convert(hashfilesize) + " does not match file size " + convert(expected_filesize);
 		return false;
 	}
 
