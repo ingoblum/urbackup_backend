@@ -4113,8 +4113,11 @@ int reconcile_storage()
 	const bool have_import_db = !import_db_dir.empty();
 	const bool storage_import_needs_file_index = apply && import_missing_dataset_backups_enabled;
 	const bool storage_import_uses_detached_files_connection = apply && import_missing_dataset_backups_enabled;
-	const bool current_files_rows_will_change = apply
-		&& (remove_malformed_file_rows_enabled || remove_missing_files || have_import_db || import_missing_dataset_backups_enabled);
+	// Storage imports update the LMDB index alongside every committed SQLite batch.
+	// Only the legacy import/removal paths modify curr_files.files without such an
+	// update, so only those paths require invalidating the index after a successful run.
+	const bool current_files_rows_invalidate_file_index = apply
+		&& (remove_malformed_file_rows_enabled || remove_missing_files || have_import_db);
 
 	// Creating the file index can rebuild backup_server_files.db and internally
 	// destroys all open SQLite handles. Reconcile-storage therefore has to do this
@@ -4274,9 +4277,10 @@ int reconcile_storage()
 	}
 	else if (ok)
 	{
-		// Only operations that insert or delete rows in curr_files.files invalidate the
-		// LMDB index. Path-only updates and backup-table-only changes leave it valid.
-		if (current_files_rows_will_change)
+		// Storage imports keep LMDB synchronized per committed file batch. Path-only
+		// updates and backup-table-only changes also leave it valid; only direct SQL
+		// changes to curr_files.files have to discard it for a later rebuild.
+		if (current_files_rows_invalidate_file_index)
 		{
 			delete_file_index();
 			if (regenerate_index)
