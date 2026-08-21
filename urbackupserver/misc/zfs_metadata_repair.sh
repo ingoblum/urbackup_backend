@@ -13,12 +13,15 @@ shopt -s nullglob
 
 readonly SCRIPT_NAME=${0##*/}
 readonly BACKUP_NAME_RE='^[0-9]{6}-[0-9]{4}(_Image_.+)?$'
+readonly PROMOTION_STATE_PROPERTY='com.urbackup:metadata_repair_promoted'
+readonly NORMALIZATION_STATE_PROPERTY='com.urbackup:metadata_repair_normalized'
 
 apply=0
 scan_only=0
 prefer_newer_base=0
 promote_repairs=0
 rsync_inplace=0
+delete_archived_repairs=0
 readonly DATASET_FILE_CONFIG=/etc/urbackup/dataset_file
 dataset_parent=""
 state_root=""
@@ -45,11 +48,14 @@ Options:
   --apply                     Create replacement datasets and swap them in
   --scan-only                 Scan and write the plan without rebuilding
   --prefer-newer-base         If both neighbours are clean, rebuild backwards
-	  --promote-repairs           Promote each replacement after the swap. This
-	                              detaches its clone lineage but can transfer
-	                              snapshot ownership from its clean base.
+	  --promote-repairs           Normalize each replacement after the swap into
+	                              a root dataset with its own @ro snapshot. The
+	                              resulting backup can be removed by UrBackup's
+	                              unmodified ZFS cleanup routine.
 	  --inplace                   Pass --inplace to rsync while rebuilding
 	                              replacement datasets
+	  --delete                    After a successful --promote-repairs step,
+	                              destroy the matching archived old dataset
 	  --rescan                    Ignore cached scan results in the state root
   --state-root <directory>    Store logs and plans here (default: <parent-mount>/.zfs-metadata-repair)
   --staging-mount-root <dir>  Mount replacement clones below this directory
@@ -121,6 +127,10 @@ while (($#)); do
 		rsync_inplace=1
 		shift
 		;;
+	--delete)
+		delete_archived_repairs=1
+		shift
+		;;
 	--rescan)
 		force_rescan=1
 		shift
@@ -145,6 +155,8 @@ while (($#)); do
 	esac
 done
 
+(( delete_archived_repairs == 0 || promote_repairs == 1 )) || die "--delete requires --promote-repairs"
+
 # The normal path derives the parent from UrBackup's own configuration. An
 # explicit option remains useful for isolated test pools and takes precedence
 # without changing the configuration used by the running server.
@@ -154,7 +166,7 @@ if [[ -z $dataset_parent ]]; then
 	[[ -n $dataset_parent ]] || die "No file-backup dataset parent configured in $DATASET_FILE_CONFIG"
 fi
 
-for required_command in zfs du rsync awk sort; do
+for required_command in zfs du rsync awk sort findmnt; do
 	command -v "$required_command" >/dev/null || die "Required command not found: $required_command"
 done
 
@@ -184,6 +196,7 @@ readonly archived_properties_file="$state_root/archived-dataset-properties.tsv"
 readonly scan_context_file="$state_root/scan-context"
 readonly active_run_id_file="$state_root/active-run-id"
 interrupted=0
+resuming_apply_run=0
 
 initialize_apply_run()
 {
@@ -196,6 +209,7 @@ initialize_apply_run()
 		# Keep replacement dataset names stable after an interruption. This makes
 		# rsync continue into the same clone instead of creating another copy.
 		run_id=$persisted_run_id
+		resuming_apply_run=1
 		log "Resuming interrupted repair run: $run_id"
 	else
 		printf '%s\n' "$run_id" > "$active_run_id_file"
@@ -229,7 +243,12 @@ reset_scan_state()
 reset_plan_state()
 {
 	: > "$repair_plan_file"
-	: > "$archived_properties_file"
+	# A swap may have already archived some datasets when the process stops.
+	# Keep their original properties during a resume because they cannot be
+	# reconstructed after the archive has been made non-mountable.
+	if (( resuming_apply_run == 0 )); then
+		: > "$archived_properties_file"
+	fi
 }
 
 write_scan_context()
@@ -321,28 +340,362 @@ dataset_snapshot_exists()
 	zfs list -H -t snapshot -o name "$1@ro" >/dev/null 2>&1
 }
 
+snapshot_exists()
+{
+	zfs list -H -t snapshot -o name "$1" >/dev/null 2>&1
+}
+
+next_available_snapshot_name()
+{
+	local dataset=$1 snapshot_prefix=$2 candidate suffix=1
+
+	candidate="$dataset@$snapshot_prefix"
+	while snapshot_exists "$candidate"; do
+		candidate="$dataset@${snapshot_prefix}_$suffix"
+		((suffix += 1))
+	done
+	printf '%s\n' "$candidate"
+}
+
+dataset_exists()
+{
+	zfs list -H -o name "$1" >/dev/null 2>&1
+}
+
+replacement_is_marked_promoted()
+{
+	[[ $(zfs get -H -o value "$PROMOTION_STATE_PROPERTY" "$1") == yes ]]
+}
+
+mark_replacement_promoted()
+{
+	# A later clone promotion can make an already promoted predecessor a clone
+	# again. This explicit marker prevents a resume from promoting that dataset
+	# twice merely because its transient origin property changed.
+	run zfs set "$PROMOTION_STATE_PROPERTY"=yes "$1"
+}
+
+record_archive_properties()
+{
+	local source_dataset=$1 archived_dataset=$2 old_mountpoint old_canmount
+
+	# Do not duplicate the record when a previous attempt renamed the dataset
+	# before stopping. The original properties are needed for manual rollback.
+	awk -F '\t' -v archived_dataset="$archived_dataset" '$2 == archived_dataset { found=1 } END { exit !found }' "$archived_properties_file" && return 0
+	old_mountpoint=$(zfs get -H -o value mountpoint "$source_dataset")
+	old_canmount=$(zfs get -H -o value canmount "$source_dataset")
+	printf '%s\t%s\t%s\t%s\n' "$source_dataset" "$archived_dataset" "$old_mountpoint" "$old_canmount" >> "$archived_properties_file"
+}
+
 archive_old_dataset()
 {
-	local source_dataset=$1 archived_dataset=$2 source_mountpoint=$3
-	local old_mountpoint old_canmount
+	local source_dataset=$1 archived_dataset=$2
+	local archived_mounted archived_canmount archived_mountpoint
 
-	if (( apply )); then
-		old_mountpoint=$(zfs get -H -o value mountpoint "$source_dataset")
-		old_canmount=$(zfs get -H -o value canmount "$source_dataset")
-		printf '%s\t%s\t%s\t%s\n' "$source_dataset" "$archived_dataset" "$old_mountpoint" "$old_canmount" >> "$archived_properties_file"
+	if dataset_exists "$source_dataset"; then
+		dataset_exists "$archived_dataset" && die "Both original and archived datasets exist; refusing ambiguous swap state: $source_dataset"
+		record_archive_properties "$source_dataset" "$archived_dataset"
+		# An explicitly configured mountpoint survives zfs rename. The following
+		# state reconciliation is deliberately separate so a busy unmount can be
+		# retried without attempting the already completed rename a second time.
+		run zfs rename "$source_dataset" "$archived_dataset"
+	else
+		dataset_exists "$archived_dataset" || die "Neither original nor archived dataset exists: $source_dataset"
+		log "Original dataset is already archived; continuing swap: $archived_dataset"
 	fi
 
-	# An explicitly configured mountpoint survives zfs rename. Disabling mounts
-	# on the archived rollback copy guarantees that the unchanged storage link
-	# can resolve to the replacement at its original target path.
-	run zfs rename "$source_dataset" "$archived_dataset"
-	if (( apply == 0 )) || [[ $(zfs get -H -o value mounted "$archived_dataset") == yes ]]; then
-		# zfs unmount reports an error for an already unmounted archive, which is
-		# harmless but must not abort an otherwise valid replacement swap.
+	archived_mounted=$(zfs get -H -o value mounted "$archived_dataset")
+	if [[ $archived_mounted == yes ]]; then
+		# A busy archive remains untouched and causes a retryable failure. Its old
+		# mount must not coexist with the replacement at the visible backup path.
 		run zfs unmount "$archived_dataset"
 	fi
-	run zfs set canmount=off "$archived_dataset"
-	run zfs set mountpoint=none "$archived_dataset"
+	archived_canmount=$(zfs get -H -o value canmount "$archived_dataset")
+	[[ $archived_canmount == off ]] || run zfs set canmount=off "$archived_dataset"
+	archived_mountpoint=$(zfs get -H -o value mountpoint "$archived_dataset")
+	[[ $archived_mountpoint == none ]] || run zfs set mountpoint=none "$archived_dataset"
+}
+
+activate_replacement_dataset()
+{
+	local replacement_dataset=$1 source_mountpoint=$2
+	local replacement_mounted replacement_mountpoint actual_mountpoint
+
+	dataset_exists "$replacement_dataset" || die "Replacement dataset is missing: $replacement_dataset"
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	replacement_mountpoint=$(zfs get -H -o value mountpoint "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		# zfs get mountpoint reports the configured property, not necessarily the
+		# current kernel mount location after that property changed while mounted.
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "ZFS reports replacement as mounted but its mount target cannot be determined: $replacement_dataset"
+	fi
+	if [[ $replacement_mounted == yes && $actual_mountpoint == "$source_mountpoint" ]]; then
+		log "Replacement dataset is already mounted at the visible backup path: $replacement_dataset"
+		return 0
+	fi
+	if [[ $replacement_mounted == yes ]]; then
+		# A previous attempt can have changed mountpoint while the clone was still
+		# mounted at staging. Unmount before changing the property so ZFS mounts it
+		# at the visible path on this retry instead of reporting "already mounted".
+		log "Unmounting replacement from \"$actual_mountpoint\" before activation: $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+	fi
+	[[ $replacement_mountpoint == "$source_mountpoint" ]] || run zfs set mountpoint="$source_mountpoint" "$replacement_dataset"
+
+	# The dataset can be mounted again while its property is being updated, for
+	# example by another ZFS-aware process. Recheck immediately before mounting
+	# so a stale staging mount does not make the retry fail with "already mounted".
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "ZFS reports replacement as mounted but its mount target cannot be determined: $replacement_dataset"
+		if [[ $actual_mountpoint == "$source_mountpoint" ]]; then
+			log "Replacement dataset became mounted at the visible backup path: $replacement_dataset"
+			return 0
+		fi
+		log "Unmounting replacement remounted at \"$actual_mountpoint\" before activation: $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+	fi
+
+	log "RUN: zfs mount $replacement_dataset"
+	if zfs mount "$replacement_dataset"; then
+		return 0
+	fi
+
+	# If zfs mount still reports an existing mount, inspect it once more and
+	# retry a normal unmount. Do not use zfs unmount -f: a busy external user
+	# must remain a visible, retryable failure instead of being disrupted.
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "Replacement mount failed and its active target cannot be determined: $replacement_dataset"
+		if [[ $actual_mountpoint == "$source_mountpoint" ]]; then
+			log "Replacement dataset is now mounted at the visible backup path: $replacement_dataset"
+			return 0
+		fi
+		log "Retrying replacement activation after unmounting \"$actual_mountpoint\": $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+		run zfs mount "$replacement_dataset"
+		return 0
+	fi
+	die "Could not mount replacement dataset: $replacement_dataset"
+}
+
+replacement_is_normalized()
+{
+	[[ $(zfs get -H -o value "$NORMALIZATION_STATE_PROPERTY" "$1") == yes ]]
+}
+
+mark_replacement_normalized()
+{
+	# A durable ZFS property makes a retry idempotent even if the process stops
+	# after the dataset swap but before archived predecessors are discarded.
+	run zfs set "$NORMALIZATION_STATE_PROPERTY"=yes "$1"
+}
+
+normalization_dataset_name()
+{
+	printf '%s.__metadata_repair_normalizing_%s' "$1" "$run_id"
+}
+
+normalization_archive_name()
+{
+	printf '%s.__pre_metadata_repair_normalization_%s' "$1" "$run_id"
+}
+
+normalize_replacement_dataset()
+{
+	local replacement_dataset=$1 replacement_mountpoint normalized_dataset archived_dataset
+	local normalized_mounted normalized_mountpoint
+
+	replacement_is_normalized "$replacement_dataset" && {
+		log "Replacement dataset is already normalized: $replacement_dataset"
+		return 0
+	}
+	dataset_snapshot_exists "$replacement_dataset" || die "Cannot normalize replacement without @ro snapshot: $replacement_dataset"
+	replacement_mountpoint=$(zfs get -H -o value mountpoint "$replacement_dataset")
+	[[ $replacement_mountpoint != none && $replacement_mountpoint != - ]] || die "Replacement has no visible mountpoint: $replacement_dataset"
+	normalized_dataset=$(normalization_dataset_name "$replacement_dataset")
+	archived_dataset=$(normalization_archive_name "$replacement_dataset")
+
+	if ! dataset_exists "$normalized_dataset"; then
+		# Cloning the replacement's own @ro creates an exact copy without reading
+		# the repaired tree again. The clone has no local @ro, so zfs promote moves
+		# that identical source snapshot into it without a naming conflict.
+		run zfs clone -o canmount=off -o mountpoint=none "$replacement_dataset@ro" "$normalized_dataset"
+		run zfs promote "$normalized_dataset"
+	fi
+	dataset_snapshot_exists "$normalized_dataset" || die "Normalized replacement lost its required @ro snapshot: $normalized_dataset"
+
+	if dataset_exists "$replacement_dataset"; then
+		# Keep the original replacement hidden until every member of its old clone
+		# graph has been normalized. Its dependent clones are then detached one by
+		# one, allowing a later non-recursive dependency-safe archive cleanup.
+		archive_old_dataset "$replacement_dataset" "$archived_dataset"
+	else
+		dataset_exists "$archived_dataset" || die "Neither replacement nor normalization archive exists: $replacement_dataset"
+		log "Replacement dataset is already archived for normalization: $archived_dataset"
+	fi
+
+	normalized_mounted=$(zfs get -H -o value mounted "$normalized_dataset")
+	if [[ $normalized_mounted == yes ]]; then
+		normalized_mountpoint=$(findmnt -rn -S "$normalized_dataset" -o TARGET 2>/dev/null || true)
+		[[ $normalized_mountpoint == "$replacement_mountpoint" ]] || run zfs unmount "$normalized_dataset"
+	fi
+	run zfs set canmount=on "$normalized_dataset"
+	run zfs set mountpoint="$replacement_mountpoint" "$normalized_dataset"
+	if [[ $(zfs get -H -o value mounted "$normalized_dataset") != yes ]]; then
+		run zfs mount "$normalized_dataset"
+	fi
+	run zfs rename "$normalized_dataset" "$replacement_dataset"
+	mark_replacement_promoted "$replacement_dataset"
+	mark_replacement_normalized "$replacement_dataset"
+	log "Normalized replacement into standalone UrBackup dataset: $replacement_dataset"
+}
+
+delete_archived_repair_datasets()
+{
+	local candidate dependent_dataset dependent_origin progress
+	local -a pending_archives=("$@") next_pending_archives=()
+
+	while ((${#pending_archives[@]} != 0)); do
+		progress=0
+		next_pending_archives=()
+		for candidate in "${pending_archives[@]}"; do
+			dataset_exists "$candidate" || continue
+			for dependent_dataset in "${pending_archives[@]}"; do
+				[[ $dependent_dataset != "$candidate" ]] || continue
+				dataset_exists "$dependent_dataset" || continue
+				dependent_origin=$(zfs get -H -o value origin "$dependent_dataset")
+				if [[ $dependent_origin == "$candidate@"* ]]; then
+					next_pending_archives+=("$candidate")
+					candidate=""
+					break
+				fi
+			done
+			[[ -n $candidate ]] || continue
+
+			# The archive is removed only after its matching replacement completed
+			# promotion. -r clears archive-local snapshots but never uses -R, so
+			# unrelated dependent clones cannot be deleted implicitly.
+			log "Deleting dependency-free archived repair dataset: $candidate"
+			run zfs destroy -r "$candidate"
+			progress=1
+		done
+		if (( progress == 0 )); then
+			die "Cannot delete archived repair datasets because dependencies remain outside the selected archive set: ${next_pending_archives[*]}"
+		fi
+		pending_archives=("${next_pending_archives[@]}")
+	done
+}
+
+promote_repaired_datasets()
+{
+	local dataset relative client leaf backup suffix replacement_dataset origin
+	local progress
+	local -a archived_datasets=() replacement_datasets=() normalization_archives=() pending_replacements=()
+
+	(( promote_repairs )) || return 0
+	while IFS= read -r dataset; do
+		[[ $dataset != "$dataset_parent" ]] || continue
+		relative=${dataset#"$dataset_parent"/}
+		[[ $relative != "$dataset" && $relative != */*/* ]] || continue
+		client=${relative%%/*}
+		leaf=${relative#*/}
+		client_is_requested "$client" || continue
+		backup=${leaf%%.__pre_metadata_repair*}
+		[[ $backup =~ $BACKUP_NAME_RE ]] || continue
+		suffix=${leaf#"$backup.__pre_metadata_repair"}
+		# Old repairs carry _YYYYMMDD-HHMMSS on the archive and .YYYYMMDD-HHMMSS
+		# on the replacement. New and old names are intentionally handled alike;
+		# the suffix only maps an archive to its matching replacement dataset.
+		[[ -z $suffix || $suffix =~ ^_[0-9]{8}-[0-9]{6}$ ]] || continue
+		archived_datasets+=("$dataset")
+	done < <(zfs list -H -o name -r "$dataset_parent")
+
+	for dataset in "${archived_datasets[@]}"; do
+		relative=${dataset#"$dataset_parent"/}
+		client=${relative%%/*}
+		leaf=${relative#*/}
+		backup=${leaf%%.__pre_metadata_repair*}
+		suffix=${leaf#"$backup.__pre_metadata_repair"}
+		if [[ -n $suffix ]]; then
+			replacement_dataset="$dataset_parent/$client/$backup.repair.${suffix#_}"
+		else
+			replacement_dataset="$dataset_parent/$client/$backup.repair"
+		fi
+
+		if ! dataset_exists "$replacement_dataset"; then
+			warn "Archived repair dataset has no matching replacement to promote: $dataset"
+			continue
+		fi
+		replacement_datasets+=("$replacement_dataset")
+	done
+
+	# Older script revisions could already have removed the original archive after
+	# an incomplete promotion. Include their explicitly marked replacements so the
+	# normalizer repairs that state as well instead of leaving hidden origins.
+	while IFS= read -r dataset; do
+		[[ $dataset != "$dataset_parent" ]] || continue
+		relative=${dataset#"$dataset_parent"/}
+		[[ $relative != "$dataset" && $relative != */*/* ]] || continue
+		client=${relative%%/*}
+		leaf=${relative#*/}
+		client_is_requested "$client" || continue
+		[[ $leaf =~ ^[0-9]{6}-[0-9]{4}(_Image_.+)?\.repair(\.[0-9]{8}-[0-9]{6})?$ ]] || continue
+		if replacement_is_marked_promoted "$dataset"; then
+			replacement_datasets+=("$dataset")
+		fi
+	done < <(zfs list -H -o name -r "$dataset_parent")
+
+	if ((${#replacement_datasets[@]} == 0)); then
+		log "No repaired datasets found for promotion"
+		return 0
+	fi
+
+	mapfile -t replacement_datasets < <(printf '%s\n' "${replacement_datasets[@]}" | sort -u)
+	log "Normalizing ${#replacement_datasets[@]} repaired dataset(s) for independent UrBackup deletion"
+	pending_replacements=("${replacement_datasets[@]}")
+	while ((${#pending_replacements[@]} != 0)); do
+		progress=0
+		local -a next_pending_replacements=()
+		for replacement_dataset in "${pending_replacements[@]}"; do
+			dataset_exists "$replacement_dataset" || continue
+			origin=$(zfs get -H -o value origin "$replacement_dataset")
+			# Normalize clone leaves first. This detaches every child from a source
+			# before the source itself is archived, preserving a retryable graph.
+			if [[ $origin != - ]]; then
+				for dataset in "${pending_replacements[@]}"; do
+					[[ $dataset != "$replacement_dataset" ]] || continue
+					dataset_exists "$dataset" || continue
+					[[ $(zfs get -H -o value origin "$dataset") == "$replacement_dataset"@* ]] && {
+						next_pending_replacements+=("$replacement_dataset")
+						replacement_dataset=""
+						break
+					}
+				done
+			fi
+			[[ -n $replacement_dataset ]] || continue
+			normalize_replacement_dataset "$replacement_dataset"
+			normalization_archives+=("$(normalization_archive_name "$replacement_dataset")")
+			progress=1
+		done
+		if (( progress == 0 )); then
+			die "Cannot normalize repaired datasets because clone dependencies remain outside the selected repair set: ${next_pending_replacements[*]}"
+		fi
+		pending_replacements=("${next_pending_replacements[@]}")
+	done
+
+	# The old replacement datasets are now clones of their normalized successors.
+	# Their former children were detached first, so each archive can be destroyed
+	# without -R and no residual metadata-repair snapshot remains visible.
+	delete_archived_repair_datasets "${normalization_archives[@]}"
+	if (( delete_archived_repairs )); then
+		# Once every visible repair dataset is a root with @ro, the original damaged
+		# datasets no longer own active clone origins and may be discarded on request.
+		delete_archived_repair_datasets "${archived_datasets[@]}"
+	fi
 }
 
 scan_dataset()
@@ -710,20 +1063,11 @@ swap_client_datasets()
 		abort_if_interrupted
 		replacement_dataset="$source_dataset.repair.$run_id"
 		archived_dataset="$source_dataset.__pre_metadata_repair_$run_id"
-		zfs list -H -o name "$replacement_dataset" >/dev/null 2>&1 || die "Replacement dataset is missing: $replacement_dataset"
 
-		# The archive is made non-mountable before assigning the old target to the
-		# replacement. Existing storage links therefore keep their exact target.
-		archive_old_dataset "$source_dataset" "$archived_dataset" "$source_mountpoint"
-		run zfs set mountpoint="$source_mountpoint" "$replacement_dataset"
-		run zfs mount "$replacement_dataset"
-
-		if (( promote_repairs )); then
-			# Promotion detaches the replacement from the archived lineage. ZFS may
-			# transfer ownership of the origin snapshot from a clean base, so it is
-			# opt-in and must be reviewed with the generated repair plan beforehand.
-			run zfs promote "$replacement_dataset"
-		fi
+		# Each action reconciles its own observable state. This keeps a retry safe
+		# after a busy mount prevented a prior swap from reaching the next action.
+		archive_old_dataset "$source_dataset" "$archived_dataset"
+		activate_replacement_dataset "$replacement_dataset" "$source_mountpoint"
 	done < "$client_plan"
 }
 
@@ -754,6 +1098,10 @@ else
 fi
 
 if [[ ! -s $bad_datasets_file ]]; then
+	# Promotion is a dataset-state operation, not a repair-plan operation. It
+	# must therefore still find and process prior repairs when no new scan error
+	# is present in the current invocation.
+	promote_repaired_datasets
 	log "No metadata traversal errors found. State directory: $state_root"
 	exit 0
 fi
@@ -780,6 +1128,10 @@ while IFS=$'\t' read -r client; do
 	abort_if_interrupted
 	swap_client_datasets "$client"
 done < <(cut -f1 "$repair_plan_file" | sort -u)
+
+# Search the complete selected scope after all swaps, including dated archive
+# names from earlier runs, instead of promoting only the current plan entries.
+promote_repaired_datasets
 
 log "Migration complete. Old datasets remain archived as a rollback path."
 if (( apply )); then
