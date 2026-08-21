@@ -793,24 +793,30 @@ if (( apply == 0 || scan_only )); then
 	exit 0
 fi
 
-while IFS=$'\t' read -r client; do
-	abort_if_interrupted
-	rebuild_client "$client"
-done < <(cut -f1 "$repair_plan_file" | sort -u)
+delete_client_archived_datasets()
+{
+	local client=$1 client_plan="$state_root/repair-plan.$client.tsv"
+	local plan_client backup source_dataset source_mountpoint base_dataset direction
+	local -a client_archived=()
 
-while IFS=$'\t' read -r client; do
-	abort_if_interrupted
-	swap_client_datasets "$client"
-done < <(cut -f1 "$repair_plan_file" | sort -u)
-
-if (( delete_archived_repairs )); then
-	log "Deleting archived old datasets as requested..."
-	local -a archived_list=()
+	[[ -s $client_plan ]] || return 0
+	log "Deleting archived old datasets for client \"$client\"..."
 	while IFS=$'\t' read -r plan_client backup source_dataset source_mountpoint base_dataset direction; do
-		archived_list+=("$source_dataset.__pre_metadata_repair_$run_id")
-	done < "$repair_plan_file"
-	delete_archived_repair_datasets "${archived_list[@]}"
-fi
+		client_archived+=("$source_dataset.__pre_metadata_repair_$run_id")
+	done < "$client_plan"
+
+	delete_archived_repair_datasets "${client_archived[@]}"
+}
+
+while IFS=$'\t' read -r client; do
+	abort_if_interrupted
+	log "=== Processing client: $client ==="
+	rebuild_client "$client"
+	swap_client_datasets "$client"
+	if (( delete_archived_repairs )); then
+		delete_client_archived_datasets "$client"
+	fi
+done < <(cut -f1 "$repair_plan_file" | sort -u)
 
 log "Migration complete. Replacement datasets are active as UrBackup linear clone chain."
 if (( apply )); then
