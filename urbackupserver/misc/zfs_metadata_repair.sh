@@ -352,6 +352,113 @@ dataset_exists()
 	zfs list -H -o name "$1" >/dev/null 2>&1
 }
 
+record_archive_properties()
+{
+	local source_dataset=$1 archived_dataset=$2 old_mountpoint old_canmount
+
+	# Do not duplicate the record when a previous attempt renamed the dataset
+	# before stopping. The original properties are needed for manual rollback.
+	awk -F '\t' -v archived_dataset="$archived_dataset" '$2 == archived_dataset { found=1 } END { exit !found }' "$archived_properties_file" && return 0
+	old_mountpoint=$(zfs get -H -o value mountpoint "$source_dataset")
+	old_canmount=$(zfs get -H -o value canmount "$source_dataset")
+	printf '%s\t%s\t%s\t%s\n' "$source_dataset" "$archived_dataset" "$old_mountpoint" "$old_canmount" >> "$archived_properties_file"
+}
+
+archive_old_dataset()
+{
+	local source_dataset=$1 archived_dataset=$2
+	local archived_mounted archived_canmount archived_mountpoint
+
+	if dataset_exists "$source_dataset"; then
+		dataset_exists "$archived_dataset" && die "Both original and archived datasets exist; refusing ambiguous swap state: $source_dataset"
+		record_archive_properties "$source_dataset" "$archived_dataset"
+		# An explicitly configured mountpoint survives zfs rename. The following
+		# state reconciliation is deliberately separate so a busy unmount can be
+		# retried without attempting the already completed rename a second time.
+		run zfs rename "$source_dataset" "$archived_dataset"
+	else
+		dataset_exists "$archived_dataset" || die "Neither original nor archived dataset exists: $source_dataset"
+		log "Original dataset is already archived; continuing swap: $archived_dataset"
+	fi
+
+	archived_mounted=$(zfs get -H -o value mounted "$archived_dataset")
+	if [[ $archived_mounted == yes ]]; then
+		# A busy archive remains untouched and causes a retryable failure. Its old
+		# mount must not coexist with the replacement at the visible backup path.
+		run zfs unmount "$archived_dataset"
+	fi
+	archived_canmount=$(zfs get -H -o value canmount "$archived_dataset")
+	[[ $archived_canmount == off ]] || run zfs set canmount=off "$archived_dataset"
+	archived_mountpoint=$(zfs get -H -o value mountpoint "$archived_dataset")
+	[[ $archived_mountpoint == none ]] || run zfs set mountpoint=none "$archived_dataset"
+}
+
+activate_replacement_dataset()
+{
+	local replacement_dataset=$1 source_mountpoint=$2
+	local replacement_mounted replacement_mountpoint actual_mountpoint
+
+	dataset_exists "$replacement_dataset" || die "Replacement dataset is missing: $replacement_dataset"
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	replacement_mountpoint=$(zfs get -H -o value mountpoint "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		# zfs get mountpoint reports the configured property, not necessarily the
+		# current kernel mount location after that property changed while mounted.
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "ZFS reports replacement as mounted but its mount target cannot be determined: $replacement_dataset"
+	fi
+	if [[ $replacement_mounted == yes && $actual_mountpoint == "$source_mountpoint" ]]; then
+		log "Replacement dataset is already mounted at the visible backup path: $replacement_dataset"
+		return 0
+	fi
+	if [[ $replacement_mounted == yes ]]; then
+		# A previous attempt can have changed mountpoint while the clone was still
+		# mounted at staging. Unmount before changing the property so ZFS mounts it
+		# at the visible path on this retry instead of reporting "already mounted".
+		log "Unmounting replacement from \"$actual_mountpoint\" before activation: $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+	fi
+	[[ $replacement_mountpoint == "$source_mountpoint" ]] || run zfs set mountpoint="$source_mountpoint" "$replacement_dataset"
+
+	# The dataset can be mounted again while its property is being updated, for
+	# example by another ZFS-aware process. Recheck immediately before mounting
+	# so a stale staging mount does not make the retry fail with "already mounted".
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "ZFS reports replacement as mounted but its mount target cannot be determined: $replacement_dataset"
+		if [[ $actual_mountpoint == "$source_mountpoint" ]]; then
+			log "Replacement dataset became mounted at the visible backup path: $replacement_dataset"
+			return 0
+		fi
+		log "Unmounting replacement remounted at \"$actual_mountpoint\" before activation: $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+	fi
+
+	log "RUN: zfs mount $replacement_dataset"
+	if zfs mount "$replacement_dataset"; then
+		return 0
+	fi
+
+	# If zfs mount still reports an existing mount, inspect it once more and
+	# retry a normal unmount. Do not use zfs unmount -f: a busy external user
+	# must remain a visible, retryable failure instead of being disrupted.
+	replacement_mounted=$(zfs get -H -o value mounted "$replacement_dataset")
+	if [[ $replacement_mounted == yes ]]; then
+		actual_mountpoint=$(findmnt -rn -S "$replacement_dataset" -o TARGET 2>/dev/null || true)
+		[[ -n $actual_mountpoint ]] || die "Replacement mount failed and its active target cannot be determined: $replacement_dataset"
+		if [[ $actual_mountpoint == "$source_mountpoint" ]]; then
+			log "Replacement dataset is now mounted at the visible backup path: $replacement_dataset"
+			return 0
+		fi
+		log "Retrying replacement activation after unmounting \"$actual_mountpoint\": $replacement_dataset"
+		run zfs unmount "$replacement_dataset"
+		run zfs mount "$replacement_dataset"
+		return 0
+	fi
+	die "Could not mount replacement dataset: $replacement_dataset"
+}
+
 delete_archived_repair_datasets()
 {
 	local candidate
