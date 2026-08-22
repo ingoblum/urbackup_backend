@@ -514,16 +514,52 @@ activate_replacement_dataset()
 delete_archived_repair_datasets()
 {
 	local candidate
-	local -a pending_archives=("$@")
+	local -a pending=() remaining=()
+	local pass=0 progress=1 max_passes i
 
-	# Destroy archived datasets in reverse order (leaf-to-root)
-	for ((i = ${#pending_archives[@]} - 1; i >= 0; i--)); do
-		candidate="${pending_archives[i]}"
+	for candidate in "$@"; do
 		if dataset_exists "$candidate"; then
-			log "Deleting archived repair dataset: $candidate"
-			run zfs destroy -r "$candidate"
+			pending+=("$candidate")
 		fi
 	done
+
+	((${#pending[@]} > 0)) || return 0
+	log "Deleting ${#pending[@]} archived repair dataset(s)..."
+	max_passes=$((${#pending[@]} + 5))
+
+	# Iteratively destroy leaf datasets until all dependents are deleted.
+	# This automatically handles forward, backward, or branched clone chains.
+	while ((${#pending[@]} > 0)) && (( progress )); do
+		progress=0
+		(( pass += 1 ))
+		remaining=()
+
+		for candidate in "${pending[@]}"; do
+			if ! dataset_exists "$candidate"; then
+				progress=1
+				continue
+			fi
+
+			if run zfs destroy -r "$candidate" 2>/dev/null; then
+				progress=1
+			else
+				remaining+=("$candidate")
+			fi
+		done
+
+		pending=("${remaining[@]}")
+		(( pass < max_passes )) || break
+	done
+
+	if ((${#pending[@]} > 0)); then
+		# Final fallback pass with visible warnings if any dataset cannot be deleted
+		for ((i = ${#pending[@]} - 1; i >= 0; i--)); do
+			candidate="${pending[i]}"
+			if dataset_exists "$candidate"; then
+				run zfs destroy -r "$candidate" || warn "Could not delete archived dataset: $candidate"
+			fi
+		done
+	fi
 }
 
 scan_dataset()
