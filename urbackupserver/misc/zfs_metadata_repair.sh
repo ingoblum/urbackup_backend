@@ -19,12 +19,14 @@ scan_only=0
 prefer_newer_base=0
 rsync_inplace=0
 delete_archived_repairs=0
+list_clients_mode=0
 readonly DATASET_FILE_CONFIG=/etc/urbackup/dataset_file
 dataset_parent=""
 state_root=""
 staging_mount_root=""
 force_rescan=0
 declare -a requested_clients=()
+declare -a requested_client_regexes=()
 
 usage()
 {
@@ -42,6 +44,8 @@ overridden for a test or a separate storage tree.
 Options:
   --dataset-parent <dataset>  Override the configured parent dataset
   --client <name>             Restrict processing to one client (repeatable)
+  --client-regex <regex>      Restrict processing by regex pattern (repeatable)
+  --list-clients              List matched clients for filters and exit
   --apply                     Create replacement datasets and swap them in
   --scan-only                 Scan and write the plan without rebuilding
   --inplace                   Pass --inplace to rsync while rebuilding
@@ -98,6 +102,15 @@ while (($#)); do
 		(($# >= 2)) || die "--client requires a value"
 		requested_clients+=("$2")
 		shift 2
+		;;
+	--client-regex)
+		(($# >= 2)) || die "--client-regex requires a value"
+		requested_client_regexes+=("$2")
+		shift 2
+		;;
+	--list-clients)
+		list_clients_mode=1
+		shift
 		;;
 	--apply)
 		apply=1
@@ -242,7 +255,7 @@ reset_plan_state()
 
 write_scan_context()
 {
-	local requested_client
+	local requested_client requested_regex
 
 	# The scan cache is only safe to reuse when the dataset root and client
 	# filter match. The context file records exactly that and is treated as
@@ -252,6 +265,9 @@ write_scan_context()
 		printf 'dataset_parent=%s\n' "$dataset_parent"
 		for requested_client in "${requested_clients[@]}"; do
 			printf 'client=%s\n' "$requested_client"
+		done
+		for requested_regex in "${requested_client_regexes[@]}"; do
+			printf 'regex=%s\n' "$requested_regex"
 		done
 	} > "$scan_context_file"
 }
@@ -275,8 +291,8 @@ read_scan_timestamp()
 
 scan_context_matches()
 {
-	local line expected_clients serialized_expected serialized_existing
-	local -a existing_clients=()
+	local line serialized_expected serialized_existing
+	local -a existing_clients=() existing_regexes=()
 
 	[[ -s $scan_context_file ]] || return 1
 	while IFS= read -r line; do
@@ -289,14 +305,17 @@ scan_context_matches()
 		client=*)
 			existing_clients+=("${line#client=}")
 			;;
+		regex=*)
+			existing_regexes+=("${line#regex=}")
+			;;
 		*)
 			return 1
 			;;
 		esac
 	done < "$scan_context_file"
 
-	serialized_expected=$(printf '%s\n' "${requested_clients[@]}" | LC_ALL=C sort)
-	serialized_existing=$(printf '%s\n' "${existing_clients[@]}" | LC_ALL=C sort)
+	serialized_expected=$(printf '%s\n' "${requested_clients[@]}" "${requested_client_regexes[@]}" | LC_ALL=C sort)
+	serialized_existing=$(printf '%s\n' "${existing_clients[@]}" "${existing_regexes[@]}" | LC_ALL=C sort)
 	[[ $serialized_expected == "$serialized_existing" ]]
 }
 
@@ -310,19 +329,53 @@ should_reuse_scan_state()
 	return 0
 }
 
-initialize_apply_run
-trap handle_interrupt INT TERM
-reset_plan_state
-
 client_is_requested()
 {
-	local client=$1 requested_client
-	((${#requested_clients[@]} == 0)) && return 0
+	local client=$1 requested_client regex
+	((${#requested_clients[@]} == 0)) && ((${#requested_client_regexes[@]} == 0)) && return 0
 	for requested_client in "${requested_clients[@]}"; do
 		[[ $client == "$requested_client" ]] && return 0
 	done
+	for regex in "${requested_client_regexes[@]}"; do
+		if [[ $client =~ $regex ]]; then
+			return 0
+		fi
+	done
 	return 1
 }
+
+collect_datasets()
+{
+	local dataset mountpoint relative client backup
+	: > "$all_datasets_file"
+	while IFS=$'\t' read -r dataset mountpoint; do
+		# Only mounted descendant filesystems can represent a visible backup.
+		[[ $dataset != "$dataset_parent" && $mountpoint != '-' && -d $mountpoint ]] || continue
+		relative=${dataset#"$dataset_parent"/}
+		[[ $relative != "$dataset" ]] || continue
+		client=${relative%%/*}
+		backup=${relative##*/}
+		client_is_requested "$client" || continue
+		[[ $backup =~ $BACKUP_NAME_RE ]] || continue
+		printf '%s\t%s\t%s\t%s\n' "$client" "$backup" "$dataset" "$mountpoint" >> "$all_datasets_file"
+	done < <(zfs list -H -p -t filesystem -o name,mountpoint -r "$dataset_parent")
+
+	sort -t $'\t' -k1,1 -k2,2 "$all_datasets_file" -o "$all_datasets_file"
+}
+
+if (( list_clients_mode )); then
+	collect_datasets
+	if [[ ! -s $all_datasets_file ]]; then
+		warn "No matching clients found below $dataset_parent"
+		exit 0
+	fi
+	cut -f1 "$all_datasets_file" | sort -u
+	exit 0
+fi
+
+initialize_apply_run
+trap handle_interrupt INT TERM
+reset_plan_state
 
 dataset_snapshot_exists()
 {
@@ -479,8 +532,28 @@ scan_dataset()
 	local out_bad=${3:-$bad_datasets_file}
 	local out_errors=${4:-$scan_errors_file}
 	local out_unreadable=${5:-$unreadable_paths_file}
-	local status_file="$state_root/scan-status.$(printf '%s' "$dataset" | tr '/ ' '__').log"
-	local scan_rc=0
+	local dataset_key
+	dataset_key=$(printf '%s' "$dataset" | tr '/ ' '__')
+	local status_file="$state_root/scan-status.$dataset_key.log"
+	local dataset_done_file="$state_root/scan-dataset.$dataset_key.done"
+	local scan_rc=0 scan_message
+
+	if (( force_rescan == 0 )) && [[ -f $dataset_done_file ]]; then
+		if [[ -s $status_file ]]; then
+			log "Dataset \"$dataset\": reusing cached scan result (unreadable entries found)"
+			printf '%s\t%s\n' "$dataset" "$mountpoint" >> "$out_bad"
+			{
+				printf '### dataset=%s mountpoint=%s\n' "$dataset" "$mountpoint"
+				cat "$status_file"
+			} >> "$out_errors"
+			while IFS= read -r scan_message; do
+				printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$out_unreadable"
+			done < "$status_file"
+		else
+			log "Dataset \"$dataset\": reusing cached scan result (clean)"
+		fi
+		return 0
+	fi
 
 	log "Scanning metadata tree of dataset \"$dataset\" at \"$mountpoint\""
 	# GNU du performs a metadata walk without following symlinks. This catches
@@ -501,58 +574,49 @@ scan_dataset()
 			printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$out_unreadable"
 		done < "$status_file"
 	else
-		rm -f "$status_file"
+		: > "$status_file"
 	fi
-}
-
-collect_datasets()
-{
-	local dataset mountpoint relative client backup
-	while IFS=$'\t' read -r dataset mountpoint; do
-		# Only mounted descendant filesystems can represent a visible backup.
-		[[ $dataset != "$dataset_parent" && $mountpoint != '-' && -d $mountpoint ]] || continue
-		relative=${dataset#"$dataset_parent"/}
-		[[ $relative != "$dataset" ]] || continue
-		client=${relative%%/*}
-		backup=${relative##*/}
-		client_is_requested "$client" || continue
-		[[ $backup =~ $BACKUP_NAME_RE ]] || continue
-		printf '%s\t%s\t%s\t%s\n' "$client" "$backup" "$dataset" "$mountpoint" >> "$all_datasets_file"
-	done < <(zfs list -H -p -t filesystem -o name,mountpoint -r "$dataset_parent")
-
-	sort -t $'\t' -k1,1 -k2,2 "$all_datasets_file" -o "$all_datasets_file"
+	touch "$dataset_done_file"
 }
 
 is_bad_dataset()
 {
-	local dataset=$1
-	awk -F '\t' -v dataset="$dataset" '$1 == dataset { found=1 } END { exit !found }' "$bad_datasets_file"
+	local dataset=$1 client=${2:-}
+	local check_file="$bad_datasets_file"
+	if [[ -n $client && -f "$state_root/bad-datasets.$client.tsv" ]]; then
+		check_file="$state_root/bad-datasets.$client.tsv"
+	fi
+	awk -F '\t' -v dataset="$dataset" '$1 == dataset { found=1 } END { exit !found }' "$check_file"
 }
 
 append_plan()
 {
 	local client=$1 backup=$2 source_dataset=$3 source_mountpoint=$4 base_dataset=$5 direction=$6
+	local client_plan="$state_root/repair-plan.$client.tsv"
 
 	# Fields: client, backup, source dataset, source mountpoint, base dataset,
 	# direction. A literal '-' represents an absent base: Bash read treats tabs as
 	# whitespace and would otherwise collapse the empty TSV field, shifting the
 	# direction "empty" into base_dataset during the later apply run.
 	[[ -n $base_dataset ]] || base_dataset=-
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$client" "$backup" "$source_dataset" "$source_mountpoint" "$base_dataset" "$direction" >> "$client_plan"
 	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$client" "$backup" "$source_dataset" "$source_mountpoint" "$base_dataset" "$direction" >> "$repair_plan_file"
 }
 
 build_client_plan()
 {
 	local client=$1
+	local client_plan="$state_root/repair-plan.$client.tsv"
 	local -a backups=() datasets=() mountpoints=() bad=()
 	local line backup dataset mountpoint i start end base_index direction
 
+	: > "$client_plan"
 	while IFS=$'\t' read -r _client backup dataset mountpoint; do
 		[[ $_client == "$client" ]] || continue
 		backups+=("$backup")
 		datasets+=("$dataset")
 		mountpoints+=("$mountpoint")
-		if is_bad_dataset "$dataset"; then
+		if is_bad_dataset "$dataset" "$client"; then
 			bad+=(1)
 		else
 			bad+=(0)
@@ -878,60 +942,117 @@ swap_client_datasets()
 	done < "$client_plan"
 }
 
+is_client_scan_cached()
+{
+	local client=$1
+	(( force_rescan == 0 )) || return 1
+	local client_done="$state_root/scan-status.$client.done"
+	local client_bad="$state_root/bad-datasets.$client.tsv"
+	local client_completed="$state_root/client.$client.completed"
+
+	if [[ -f $client_completed ]]; then
+		return 0
+	fi
+	if [[ -f $client_done ]]; then
+		return 0
+	fi
+	return 1
+}
+
+scan_single_client()
+{
+	local client=$1
+	local client_bad="$state_root/bad-datasets.$client.tsv"
+	local client_errors="$state_root/scan-errors.$client.log"
+	local client_unreadable="$state_root/unreadable-paths.$client.tsv"
+	local client_done="$state_root/scan-status.$client.done"
+	local client_completed="$state_root/client.$client.completed"
+
+	if is_client_scan_cached "$client"; then
+		if [[ -f $client_completed ]] || [[ -f $client_done && ! -s $client_bad ]]; then
+			log "Client \"$client\": already verified/completed (cached clean). Skipping scan."
+			: > "$client_bad"
+		else
+			log "Client \"$client\": reusing cached scan result ($(wc -l < "$client_bad" 2>/dev/null || echo 0) affected dataset(s))."
+		fi
+		return 0
+	fi
+
+	rm -f "$client_done" "$client_completed"
+	if (( force_rescan )); then
+		local _c _b _d _m _dk
+		while IFS=$'\t' read -r _c _b _d _m; do
+			[[ $_c == "$client" ]] || continue
+			_dk=$(printf '%s' "$_d" | tr '/ ' '__')
+			rm -f "$state_root/scan-dataset.$_dk.done" "$state_root/scan-status.$_dk.log"
+		done < "$all_datasets_file"
+	fi
+	local tmp_bad="$client_bad.tmp.$$"
+	local tmp_errors="$client_errors.tmp.$$"
+	local tmp_unreadable="$client_unreadable.tmp.$$"
+	: > "$tmp_bad"
+	: > "$tmp_errors"
+	: > "$tmp_unreadable"
+
+	log "Scanning metadata tree of client \"$client\"..."
+	local _client backup dataset mountpoint
+	while IFS=$'\t' read -r _client backup dataset mountpoint; do
+		[[ $_client == "$client" ]] || continue
+		scan_dataset "$dataset" "$mountpoint" "$tmp_bad" "$tmp_errors" "$tmp_unreadable"
+		abort_if_interrupted
+	done < "$all_datasets_file"
+
+	mv -f "$tmp_bad" "$client_bad"
+	mv -f "$tmp_errors" "$client_errors"
+	mv -f "$tmp_unreadable" "$client_unreadable"
+	touch "$client_done"
+}
+
 perform_metadata_scan()
 {
-	reset_scan_state
 	collect_datasets
 	if [[ ! -s $all_datasets_file ]]; then
 		warn "No matching backup datasets found below $dataset_parent"
 		exit 0
 	fi
 
-	local tmp_scan_errors="$state_root/scan-errors.log.tmp.$$"
-	local tmp_unreadable_paths="$state_root/unreadable-paths.tsv.tmp.$$"
-	local tmp_bad_datasets="$state_root/bad-datasets.tsv.tmp.$$"
-	: > "$tmp_scan_errors"
-	: > "$tmp_unreadable_paths"
-	: > "$tmp_bad_datasets"
-
-	log "Running fresh metadata scan. Use --rescan later to explicitly refresh this state."
-	while IFS=$'\t' read -r client backup dataset mountpoint; do
-		scan_dataset "$dataset" "$mountpoint" "$tmp_bad_datasets" "$tmp_scan_errors" "$tmp_unreadable_paths"
+	local client
+	while IFS=$'\t' read -r client; do
 		abort_if_interrupted
-	done < "$all_datasets_file"
+		scan_single_client "$client"
+	done < <(cut -f1 "$all_datasets_file" | sort -u)
 
-	[[ -f $tmp_bad_datasets ]] && mv -f "$tmp_bad_datasets" "$bad_datasets_file"
-	[[ -f $tmp_scan_errors ]] && mv -f "$tmp_scan_errors" "$scan_errors_file"
-	[[ -f $tmp_unreadable_paths ]] && mv -f "$tmp_unreadable_paths" "$unreadable_paths_file"
+	# Aggregate global state files for the current selection
+	: > "$bad_datasets_file"
+	: > "$scan_errors_file"
+	: > "$unreadable_paths_file"
+
+	while IFS=$'\t' read -r client; do
+		local client_bad="$state_root/bad-datasets.$client.tsv"
+		local client_errors="$state_root/scan-errors.$client.log"
+		local client_unreadable="$state_root/unreadable-paths.$client.tsv"
+		[[ -s $client_bad ]] && cat "$client_bad" >> "$bad_datasets_file"
+		[[ -s $client_errors ]] && cat "$client_errors" >> "$scan_errors_file"
+		[[ -s $client_unreadable ]] && cat "$client_unreadable" >> "$unreadable_paths_file"
+	done < <(cut -f1 "$all_datasets_file" | sort -u)
+
 	write_scan_context
 }
 
-if should_reuse_scan_state; then
-	# Keep cache reuse independent of an optional timestamp. Older cache files
-	# from before the timestamp field remain valid and are reported as unknown.
-	if ! scan_timestamp=$(read_scan_timestamp 2>/dev/null); then
-		scan_timestamp=unknown
-	fi
-	# A prior dry-run already captured the affected datasets for the same scope.
-	# Reusing it keeps the later apply run aligned with the reviewed plan instead
-	# of traversing the tree again and potentially taking hours a second time.
-	log "Reusing existing scan result from state directory: $state_root (created at $scan_timestamp)"
-else
-	perform_metadata_scan
-fi
+perform_metadata_scan
 
 if (( resuming_apply_run == 0 )) || [[ ! -s $repair_plan_file ]]; then
-	if [[ ! -s $bad_datasets_file ]]; then
-		log "No metadata traversal errors found. State directory: $state_root"
-		exit 0
-	fi
-
 	: > "$repair_plan_file"
 	while IFS=$'\t' read -r client; do
 		build_client_plan "$client"
 	done < <(cut -f1 "$all_datasets_file" | sort -u)
 else
 	log "Resuming with existing repair plan: $repair_plan_file ($(wc -l < "$repair_plan_file") dataset(s))"
+fi
+
+if [[ ! -s $bad_datasets_file ]]; then
+	log "No metadata traversal errors found for requested client(s). State directory: $state_root"
+	exit 0
 fi
 
 log "Affected datasets: $(wc -l < "$bad_datasets_file")"
@@ -966,6 +1087,12 @@ while IFS=$'\t' read -r client; do
 	if (( delete_archived_repairs )); then
 		delete_client_archived_datasets "$client"
 	fi
+	# Mark client completed and truncate its bad-datasets file
+	: > "$state_root/bad-datasets.$client.tsv"
+	rm -f "$state_root/repair-plan.$client.tsv"
+	touch "$state_root/client.$client.completed"
+	touch "$state_root/scan-status.$client.done"
+	log "Client \"$client\" repair & migration completed successfully."
 done < <(cut -f1 "$repair_plan_file" | sort -u)
 
 log "Migration complete. Replacement datasets are active as UrBackup linear clone chain."
