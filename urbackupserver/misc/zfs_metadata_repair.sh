@@ -878,6 +878,34 @@ swap_client_datasets()
 	done < "$client_plan"
 }
 
+perform_metadata_scan()
+{
+	reset_scan_state
+	collect_datasets
+	if [[ ! -s $all_datasets_file ]]; then
+		warn "No matching backup datasets found below $dataset_parent"
+		exit 0
+	fi
+
+	local tmp_scan_errors="$state_root/scan-errors.log.tmp.$$"
+	local tmp_unreadable_paths="$state_root/unreadable-paths.tsv.tmp.$$"
+	local tmp_bad_datasets="$state_root/bad-datasets.tsv.tmp.$$"
+	: > "$tmp_scan_errors"
+	: > "$tmp_unreadable_paths"
+	: > "$tmp_bad_datasets"
+
+	log "Running fresh metadata scan. Use --rescan later to explicitly refresh this state."
+	while IFS=$'\t' read -r client backup dataset mountpoint; do
+		scan_dataset "$dataset" "$mountpoint" "$tmp_bad_datasets" "$tmp_scan_errors" "$tmp_unreadable_paths"
+		abort_if_interrupted
+	done < "$all_datasets_file"
+
+	[[ -f $tmp_bad_datasets ]] && mv -f "$tmp_bad_datasets" "$bad_datasets_file"
+	[[ -f $tmp_scan_errors ]] && mv -f "$tmp_scan_errors" "$scan_errors_file"
+	[[ -f $tmp_unreadable_paths ]] && mv -f "$tmp_unreadable_paths" "$unreadable_paths_file"
+	write_scan_context
+}
+
 if should_reuse_scan_state; then
 	# Keep cache reuse independent of an optional timestamp. Older cache files
 	# from before the timestamp field remain valid and are reported as unknown.
@@ -889,23 +917,7 @@ if should_reuse_scan_state; then
 	# of traversing the tree again and potentially taking hours a second time.
 	log "Reusing existing scan result from state directory: $state_root (created at $scan_timestamp)"
 else
-	local tmp_scan_errors="$state_root/scan-errors.log.tmp"
-	local tmp_unreadable_paths="$state_root/unreadable-paths.tsv.tmp"
-	local tmp_bad_datasets="$state_root/bad-datasets.tsv.tmp"
-	: > "$tmp_scan_errors"
-	: > "$tmp_unreadable_paths"
-	: > "$tmp_bad_datasets"
-
-	log "Running fresh metadata scan. Use --rescan later to explicitly refresh this state."
-	while IFS=$'\t' read -r client backup dataset mountpoint; do
-		scan_dataset "$dataset" "$mountpoint" "$tmp_bad_datasets" "$tmp_scan_errors" "$tmp_unreadable_paths"
-		abort_if_interrupted
-	done < "$all_datasets_file"
-
-	mv -f "$tmp_bad_datasets" "$bad_datasets_file"
-	mv -f "$tmp_scan_errors" "$scan_errors_file"
-	mv -f "$tmp_unreadable_paths" "$unreadable_paths_file"
-	write_scan_context
+	perform_metadata_scan
 fi
 
 if (( resuming_apply_run == 0 )) || [[ ! -s $repair_plan_file ]]; then
