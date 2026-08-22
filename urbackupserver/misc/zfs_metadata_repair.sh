@@ -232,11 +232,10 @@ reset_scan_state()
 
 reset_plan_state()
 {
-	: > "$repair_plan_file"
-	# A swap may have already archived some datasets when the process stops.
-	# Keep their original properties during a resume because they cannot be
-	# reconstructed after the archive has been made non-mountable.
-	if (( resuming_apply_run == 0 )); then
+	# If we are resuming an active apply run and an existing repair plan exists,
+	# keep it so an interrupted run continues executing the exact same plan.
+	if (( resuming_apply_run == 0 )) || [[ ! -s $repair_plan_file ]]; then
+		: > "$repair_plan_file"
 		: > "$archived_properties_file"
 	fi
 }
@@ -476,7 +475,11 @@ delete_archived_repair_datasets()
 
 scan_dataset()
 {
-	local dataset=$1 mountpoint=$2 status_file="$state_root/scan-status.$(printf '%s' "$dataset" | tr '/ ' '__').log"
+	local dataset=$1 mountpoint=$2
+	local out_bad=${3:-$bad_datasets_file}
+	local out_errors=${4:-$scan_errors_file}
+	local out_unreadable=${5:-$unreadable_paths_file}
+	local status_file="$state_root/scan-status.$(printf '%s' "$dataset" | tr '/ ' '__').log"
 	local scan_rc=0
 
 	log "Scanning metadata tree of dataset \"$dataset\" at \"$mountpoint\""
@@ -486,16 +489,16 @@ scan_dataset()
 	LC_ALL=C du -a -x --apparent-size -- "$mountpoint" >/dev/null 2>"$status_file" || scan_rc=$?
 	if (( scan_rc != 0 )); then
 		warn "Metadata scan found unreadable entries in dataset \"$dataset\"; details: $status_file"
-		printf '%s\t%s\n' "$dataset" "$mountpoint" >> "$bad_datasets_file"
+		printf '%s\t%s\n' "$dataset" "$mountpoint" >> "$out_bad"
 		{
 			printf '### dataset=%s mountpoint=%s\n' "$dataset" "$mountpoint"
 			cat "$status_file"
-		} >> "$scan_errors_file"
+		} >> "$out_errors"
 		# Preserve the original diagnostic instead of parsing locale- and filename-
 		# dependent du messages. Each row is a reviewable affected path indication
 		# tied to its dataset, including errors for unreadable directories.
 		while IFS= read -r scan_message; do
-			printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$unreadable_paths_file"
+			printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$out_unreadable"
 		done < "$status_file"
 	else
 		rm -f "$status_file"
@@ -787,6 +790,25 @@ resume_replacement_dataset()
 	log "Resuming incomplete replacement dataset: $replacement_dataset"
 }
 
+resolve_replacement_dataset()
+{
+	local source_dataset=$1 candidate
+	# Check current run_id first
+	if dataset_exists "$source_dataset.repair.$run_id"; then
+		printf '%s\n' "$source_dataset.repair.$run_id"
+		return 0
+	fi
+	# Check any existing completed .repair.* dataset with @ro snapshot
+	while IFS= read -r candidate; do
+		if dataset_snapshot_exists "$candidate"; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done < <(zfs list -H -o name -r "${source_dataset%/*}" 2>/dev/null | grep -E "^${source_dataset}\.repair\." || true)
+
+	printf '%s.repair.%s\n' "$source_dataset" "$run_id"
+}
+
 rebuild_client()
 {
 	local client=$1 client_plan="$state_root/repair-plan.$client.tsv"
@@ -802,7 +824,7 @@ rebuild_client()
 		# See append_plan: restore the explicit empty-base marker before choosing
 		# between a ZFS clone and a freshly created replacement filesystem.
 		[[ $base_dataset != - ]] || base_dataset=""
-		replacement_dataset="$source_dataset.repair.$run_id"
+		replacement_dataset=$(resolve_replacement_dataset "$source_dataset")
 		replacement_mountpoint="$staging_mount_root/$client/$backup"
 		copy_log="$state_root/rsync.$client.$backup.log"
 		if (( apply )); then
@@ -837,7 +859,7 @@ swap_client_datasets()
 	log "Swapping rebuilt datasets for client \"$client\" while preserving existing storage links"
 	while IFS=$'\t' read -r plan_client backup source_dataset source_mountpoint base_dataset direction; do
 		abort_if_interrupted
-		replacement_dataset="$source_dataset.repair.$run_id"
+		replacement_dataset=$(resolve_replacement_dataset "$source_dataset")
 		archived_dataset="$source_dataset.__pre_metadata_repair_$run_id"
 
 		# Each action reconciles its own observable state. This keeps a retry safe
@@ -867,29 +889,38 @@ if should_reuse_scan_state; then
 	# of traversing the tree again and potentially taking hours a second time.
 	log "Reusing existing scan result from state directory: $state_root (created at $scan_timestamp)"
 else
-	reset_scan_state
-	collect_datasets
-	if [[ ! -s $all_datasets_file ]]; then
-		warn "No matching backup datasets found below $dataset_parent"
-		exit 0
-	fi
+	local tmp_scan_errors="$state_root/scan-errors.log.tmp"
+	local tmp_unreadable_paths="$state_root/unreadable-paths.tsv.tmp"
+	local tmp_bad_datasets="$state_root/bad-datasets.tsv.tmp"
+	: > "$tmp_scan_errors"
+	: > "$tmp_unreadable_paths"
+	: > "$tmp_bad_datasets"
 
 	log "Running fresh metadata scan. Use --rescan later to explicitly refresh this state."
 	while IFS=$'\t' read -r client backup dataset mountpoint; do
-		scan_dataset "$dataset" "$mountpoint"
+		scan_dataset "$dataset" "$mountpoint" "$tmp_bad_datasets" "$tmp_scan_errors" "$tmp_unreadable_paths"
 		abort_if_interrupted
 	done < "$all_datasets_file"
+
+	mv -f "$tmp_bad_datasets" "$bad_datasets_file"
+	mv -f "$tmp_scan_errors" "$scan_errors_file"
+	mv -f "$tmp_unreadable_paths" "$unreadable_paths_file"
 	write_scan_context
 fi
 
-if [[ ! -s $bad_datasets_file ]]; then
-	log "No metadata traversal errors found. State directory: $state_root"
-	exit 0
-fi
+if (( resuming_apply_run == 0 )) || [[ ! -s $repair_plan_file ]]; then
+	if [[ ! -s $bad_datasets_file ]]; then
+		log "No metadata traversal errors found. State directory: $state_root"
+		exit 0
+	fi
 
-while IFS=$'\t' read -r client; do
-	build_client_plan "$client"
-done < <(cut -f1 "$all_datasets_file" | sort -u)
+	: > "$repair_plan_file"
+	while IFS=$'\t' read -r client; do
+		build_client_plan "$client"
+	done < <(cut -f1 "$all_datasets_file" | sort -u)
+else
+	log "Resuming with existing repair plan: $repair_plan_file ($(wc -l < "$repair_plan_file") dataset(s))"
+fi
 
 log "Affected datasets: $(wc -l < "$bad_datasets_file")"
 log "Repair plan: $repair_plan_file"
