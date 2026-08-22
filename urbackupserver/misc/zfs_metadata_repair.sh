@@ -556,11 +556,33 @@ scan_dataset()
 	fi
 
 	log "Scanning metadata tree of dataset \"$dataset\" at \"$mountpoint\""
+	local fifo="$state_root/scan.fifo.$$"
+	rm -f "$fifo"
+	mkfifo "$fifo"
+	: > "$status_file"
+
+	# Launch du in the background with stderr redirected to the FIFO.
 	# GNU du performs a metadata walk without following symlinks. This catches
 	# ZFS EIO errors in directories and inode metadata while avoiding Windows
 	# compatibility links such as 'Dokumente und Einstellungen'.
-	LC_ALL=C du -a -x --apparent-size -- "$mountpoint" >/dev/null 2>"$status_file" || scan_rc=$?
-	if (( scan_rc != 0 )); then
+	LC_ALL=C du -a -x --apparent-size -- "$mountpoint" >/dev/null 2>"$fifo" &
+	local du_pid=$!
+
+	# Read the first error from the FIFO. As soon as an error line arrives,
+	# du is terminated immediately without scanning the rest of the dataset.
+	local first_error=""
+	if IFS= read -r first_error < "$fifo"; then
+		if [[ -n $first_error ]]; then
+			printf '%s\n' "$first_error" > "$status_file"
+			kill -TERM "$du_pid" 2>/dev/null || true
+			wait "$du_pid" 2>/dev/null || true
+		fi
+	else
+		wait "$du_pid" 2>/dev/null || true
+	fi
+	rm -f "$fifo"
+
+	if [[ -s $status_file ]]; then
 		warn "Metadata scan found unreadable entries in dataset \"$dataset\"; details: $status_file"
 		printf '%s\t%s\n' "$dataset" "$mountpoint" >> "$out_bad"
 		{
@@ -573,8 +595,6 @@ scan_dataset()
 		while IFS= read -r scan_message; do
 			printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$out_unreadable"
 		done < "$status_file"
-	else
-		: > "$status_file"
 	fi
 	touch "$dataset_done_file"
 }
