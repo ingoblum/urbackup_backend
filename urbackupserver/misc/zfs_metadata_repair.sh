@@ -607,6 +607,7 @@ scan_dataset()
 	# Read the first error from the FIFO. As soon as an error line arrives,
 	# du is terminated immediately without scanning the rest of the dataset.
 	local first_error=""
+	local wait_rc=0
 	if IFS= read -r first_error < "$fifo"; then
 		if [[ -n $first_error ]]; then
 			printf '%s\n' "$first_error" > "$status_file"
@@ -614,9 +615,14 @@ scan_dataset()
 			wait "$du_pid" 2>/dev/null || true
 		fi
 	else
-		wait "$du_pid" 2>/dev/null || true
+		wait "$du_pid" 2>/dev/null || wait_rc=$?
 	fi
 	rm -f "$fifo"
+
+	if (( interrupted )); then
+		rm -f "$status_file"
+		return 0
+	fi
 
 	if [[ -s $status_file ]]; then
 		warn "Metadata scan found unreadable entries in dataset \"$dataset\"; details: $status_file"
@@ -631,8 +637,12 @@ scan_dataset()
 		while IFS= read -r scan_message; do
 			printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "$scan_message" >> "$out_unreadable"
 		done < "$status_file"
+		touch "$dataset_done_file"
+	elif (( wait_rc == 0 )); then
+		touch "$dataset_done_file"
+	else
+		warn "Metadata scan of dataset \"$dataset\" exited with status $wait_rc without captured error"
 	fi
-	touch "$dataset_done_file"
 }
 
 is_bad_dataset()
@@ -826,7 +836,7 @@ copy_dataset_tree()
 	local source_mountpoint=$1 replacement_mountpoint=$2 copy_log=$3
 	local rsync_rc=0
 	local -a copy_pipeline_status=()
-	local -a rsync_options=(-aHAXS --numeric-ids --ignore-errors --info=progress2 --no-inc-recursive)
+	local -a rsync_options=(-aHAXS --numeric-ids --ignore-errors --force --info=progress2 --no-inc-recursive)
 
 	log "Copying \"$source_mountpoint\" to \"$replacement_mountpoint\""
 	if (( rsync_inplace )); then
