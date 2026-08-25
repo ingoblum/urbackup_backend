@@ -511,11 +511,41 @@ activate_replacement_dataset()
 	die "Could not mount replacement dataset: $replacement_dataset"
 }
 
+detach_archived_dataset_clones()
+{
+	local candidate=$1
+	local snap clone snap_name new_snap_name
+	local -a snaps=()
+
+	# Find all snapshots of this candidate dataset
+	while IFS= read -r snap; do
+		[[ -n $snap ]] || continue
+		snaps+=("$snap")
+	done < <(zfs list -H -t snapshot -o name -r "$candidate" 2>/dev/null || true)
+
+	for snap in "${snaps[@]}"; do
+		for clone in $(zfs get -H -o value clones "$snap" 2>/dev/null | tr ',' ' '); do
+			[[ $clone != "-" && -n $clone ]] || continue
+			# Only promote active datasets, not other archived repair datasets
+			if [[ $clone != *.__pre_metadata_repair_* ]]; then
+				snap_name=${snap#*@}
+				if zfs list -H -t snapshot -o name "$clone@$snap_name" >/dev/null 2>&1; then
+					new_snap_name="pre_repair_${snap_name}_$$"
+					log "Renaming conflicting origin snapshot on \"$candidate\" to \"$new_snap_name\" before promotion..."
+					run zfs rename "$snap" "$candidate@$new_snap_name" || true
+				fi
+				log "Promoting active clone \"$clone\" to detach from archived dataset \"$candidate\"..."
+				run zfs promote "$clone" || warn "Could not promote active clone: $clone"
+			fi
+		done
+	done
+}
+
 delete_archived_repair_datasets()
 {
 	local candidate
 	local -a pending=() remaining=()
-	local pass=0 progress=1 max_passes i
+	local pass=0 progress=1 max_passes i last_error=""
 
 	for candidate in "$@"; do
 		if dataset_exists "$candidate"; then
@@ -525,16 +555,22 @@ delete_archived_repair_datasets()
 
 	((${#pending[@]} > 0)) || return 0
 	log "Deleting ${#pending[@]} archived repair dataset(s)..."
+
+	# Detach any active clones by promoting them first
+	for candidate in "${pending[@]}"; do
+		detach_archived_dataset_clones "$candidate"
+	done
+
 	max_passes=$((${#pending[@]} + 5))
 
-	# Iteratively destroy leaf datasets until all dependents are deleted.
-	# This automatically handles forward, backward, or branched clone chains.
+	# Iteratively destroy leaf datasets in reverse/topological order
 	while ((${#pending[@]} > 0)) && (( progress )); do
 		progress=0
 		(( pass += 1 ))
 		remaining=()
 
-		for candidate in "${pending[@]}"; do
+		for ((i = ${#pending[@]} - 1; i >= 0; i--)); do
+			candidate="${pending[i]}"
 			if ! dataset_exists "$candidate"; then
 				progress=1
 				continue
@@ -552,13 +588,9 @@ delete_archived_repair_datasets()
 	done
 
 	if ((${#pending[@]} > 0)); then
-		# Final fallback pass with visible warnings if any dataset cannot be deleted
-		for ((i = ${#pending[@]} - 1; i >= 0; i--)); do
-			candidate="${pending[i]}"
-			if dataset_exists "$candidate"; then
-				run zfs destroy -r "$candidate" || warn "Could not delete archived dataset: $candidate"
-			fi
-		done
+		candidate="${pending[0]}"
+		last_error=$(zfs destroy -r "$candidate" 2>&1 || true)
+		die "Failed to delete archived dataset \"$candidate\": $last_error"
 	fi
 }
 
@@ -934,6 +966,15 @@ is_backup_already_swapped()
 	if dataset_exists "$archived_dataset" && dataset_exists "$source_dataset"; then
 		return 0
 	fi
+
+	# If the archive was recorded in archived_properties_file (meaning swap occurred)
+	# and the authentic dataset exists, it is already swapped (even if the archive was already deleted)
+	if [[ -s $archived_properties_file ]] && dataset_exists "$source_dataset"; then
+		if awk -F '\t' -v src="$source_dataset" -v arch="$archived_dataset" '($1 == src || $2 == arch) { found=1 } END { exit !found }' "$archived_properties_file" 2>/dev/null; then
+			return 0
+		fi
+	fi
+
 	return 1
 }
 
