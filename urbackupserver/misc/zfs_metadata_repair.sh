@@ -511,6 +511,18 @@ activate_replacement_dataset()
 	die "Could not mount replacement dataset: $replacement_dataset"
 }
 
+unique_snapshot_name()
+{
+	local d1=$1 d2=$2 prefix=$3 candidate suffix=1
+
+	candidate="$prefix"
+	while snapshot_exists "$d1@$candidate" || snapshot_exists "$d2@$candidate"; do
+		candidate="${prefix}_${suffix}"
+		((suffix += 1))
+	done
+	printf '%s\n' "$candidate"
+}
+
 detach_archived_dataset_clones()
 {
 	local candidate=$1
@@ -529,10 +541,11 @@ detach_archived_dataset_clones()
 			# Only promote active datasets, not other archived repair datasets
 			if [[ $clone != *.__pre_metadata_repair_* ]]; then
 				snap_name=${snap#*@}
-				if zfs list -H -t snapshot -o name "$clone@$snap_name" >/dev/null 2>&1; then
-					new_snap_name="pre_repair_${snap_name}_$$"
+				if snapshot_exists "$clone@$snap_name"; then
+					new_snap_name=$(unique_snapshot_name "$candidate" "$clone" "pre_repair_${snap_name}")
 					log "Renaming conflicting origin snapshot on \"$candidate\" to \"$new_snap_name\" before promotion..."
-					run zfs rename "$snap" "$candidate@$new_snap_name" || true
+					run zfs rename "$snap" "$candidate@$new_snap_name"
+					snap="$candidate@$new_snap_name"
 				fi
 				log "Promoting active clone \"$clone\" to detach from archived dataset \"$candidate\"..."
 				run zfs promote "$clone" || warn "Could not promote active clone: $clone"
