@@ -857,6 +857,10 @@ copy_dataset_tree()
 		copy_pipeline_status=("${PIPESTATUS[@]}")
 		set -e
 		rsync_rc=${copy_pipeline_status[0]}
+		if (( interrupted || rsync_rc == 20 || rsync_rc == 130 || copy_pipeline_status[1] == 130 )); then
+			interrupted=1
+			abort_if_interrupted
+		fi
 		if (( copy_pipeline_status[1] != 0 )); then
 			die "Could not write rsync output log: $copy_log"
 		fi
@@ -920,6 +924,58 @@ resume_replacement_dataset()
 	log "Resuming incomplete replacement dataset: $replacement_dataset"
 }
 
+is_backup_already_swapped()
+{
+	local source_dataset=$1
+	local archived_dataset="$source_dataset.__pre_metadata_repair_$run_id"
+
+	# If the archived original exists and the authentic dataset exists,
+	# the swap for this backup was already completed in this run.
+	if dataset_exists "$archived_dataset" && dataset_exists "$source_dataset"; then
+		return 0
+	fi
+	return 1
+}
+
+resolve_base_dataset()
+{
+	local base_dataset=$1
+	local stripped candidate
+
+	[[ -n $base_dataset ]] || return 0
+
+	# 1. Exact base snapshot exists
+	if dataset_snapshot_exists "$base_dataset"; then
+		printf '%s\n' "$base_dataset"
+		return 0
+	fi
+
+	# 2. Base was recorded as .repair.*, but that dataset was already swapped to its authentic name
+	stripped=${base_dataset%.repair.*}
+	if [[ $stripped != "$base_dataset" ]] && dataset_snapshot_exists "$stripped"; then
+		printf '%s\n' "$stripped"
+		return 0
+	fi
+
+	# 3. Base was recorded with another run_id in the plan, but active run_id repair exists
+	if [[ $stripped != "$base_dataset" ]] && dataset_snapshot_exists "$stripped.repair.$run_id"; then
+		printf '%s.repair.%s\n' "$stripped" "$run_id"
+		return 0
+	fi
+
+	# 4. Any completed .repair.* snapshot exists
+	if [[ $stripped != "$base_dataset" ]]; then
+		while IFS= read -r candidate; do
+			if dataset_snapshot_exists "$candidate"; then
+				printf '%s\n' "$candidate"
+				return 0
+			fi
+		done < <(zfs list -H -o name -r "${stripped%/*}" 2>/dev/null | grep -E "^${stripped}\.repair\." || true)
+	fi
+
+	printf '%s\n' "$base_dataset"
+}
+
 resolve_replacement_dataset()
 {
 	local source_dataset=$1 candidate
@@ -954,6 +1010,20 @@ rebuild_client()
 		# See append_plan: restore the explicit empty-base marker before choosing
 		# between a ZFS clone and a freshly created replacement filesystem.
 		[[ $base_dataset != - ]] || base_dataset=""
+		base_dataset=$(resolve_base_dataset "$base_dataset")
+
+		if is_backup_already_swapped "$source_dataset"; then
+			log "Backup dataset is already rebuilt and swapped; skipping rebuild: $source_dataset"
+			replacement_dataset="$source_dataset.repair.$run_id"
+			if dataset_exists "$replacement_dataset"; then
+				if [[ $(zfs get -H -o value mounted "$replacement_dataset" 2>/dev/null || true) == yes ]]; then
+					run zfs unmount "$replacement_dataset"
+				fi
+				run zfs destroy -r "$replacement_dataset"
+			fi
+			continue
+		fi
+
 		replacement_dataset=$(resolve_replacement_dataset "$source_dataset")
 		replacement_mountpoint="$staging_mount_root/$client/$backup"
 		copy_log="$state_root/rsync.$client.$backup.log"
@@ -989,8 +1059,15 @@ swap_client_datasets()
 	log "Swapping rebuilt datasets for client \"$client\" while preserving existing storage links"
 	while IFS=$'\t' read -r plan_client backup source_dataset source_mountpoint base_dataset direction; do
 		abort_if_interrupted
-		replacement_dataset=$(resolve_replacement_dataset "$source_dataset")
 		archived_dataset="$source_dataset.__pre_metadata_repair_$run_id"
+
+		if is_backup_already_swapped "$source_dataset"; then
+			log "Backup dataset is already swapped; ensuring mount is active: $source_dataset"
+			activate_replacement_dataset "$source_dataset" "$source_mountpoint"
+			continue
+		fi
+
+		replacement_dataset=$(resolve_replacement_dataset "$source_dataset")
 
 		# Each action reconciles its own observable state. This keeps a retry safe
 		# after a busy mount prevented a prior swap from reaching the next action.
