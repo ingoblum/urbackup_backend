@@ -1261,6 +1261,15 @@ if (( apply == 0 || scan_only )); then
 	exit 0
 fi
 
+cleanup_temporary_repair_snapshots()
+{
+	local target_root=$1 snap
+	while IFS= read -r snap; do
+		[[ $snap == *@pre_repair_* ]] || continue
+		run zfs destroy "$snap" 2>/dev/null || warn "Could not delete temporary snapshot: $snap"
+	done < <(zfs list -H -t snapshot -o name -r "$target_root" 2>/dev/null || true)
+}
+
 delete_client_archived_datasets()
 {
 	local client=$1 client_plan="$state_root/repair-plan.$client.tsv"
@@ -1274,6 +1283,7 @@ delete_client_archived_datasets()
 	done < "$client_plan"
 
 	delete_archived_repair_datasets "${client_archived[@]}"
+	cleanup_temporary_repair_snapshots "$dataset_parent/$client"
 }
 
 while IFS=$'\t' read -r client; do
