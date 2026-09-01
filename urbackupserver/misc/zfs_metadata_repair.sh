@@ -25,6 +25,7 @@ dataset_parent=""
 state_root=""
 staging_mount_root=""
 force_rescan=0
+one_pass=0
 declare -a requested_clients=()
 declare -a requested_client_regexes=()
 
@@ -50,6 +51,7 @@ Options:
   --scan-only                 Scan and write the plan without rebuilding
   --inplace                   Pass --inplace to rsync while rebuilding
                               replacement datasets
+  --one-pass                  Do not pass --no-inc-recursive to rsync
   --delete                    After a successful swap, destroy the matching
                               archived old dataset
   --rescan                    Ignore cached scan results in the state root
@@ -130,6 +132,10 @@ while (($#)); do
 		;;
 	--inplace)
 		rsync_inplace=1
+		shift
+		;;
+	--one-pass)
+		one_pass=1
 		shift
 		;;
 	--delete)
@@ -411,8 +417,8 @@ record_archive_properties()
 	# Do not duplicate the record when a previous attempt renamed the dataset
 	# before stopping. The original properties are needed for manual rollback.
 	awk -F '\t' -v archived_dataset="$archived_dataset" '$2 == archived_dataset { found=1 } END { exit !found }' "$archived_properties_file" && return 0
-	old_mountpoint=$(zfs get -H -o value mountpoint "$source_dataset")
-	old_canmount=$(zfs get -H -o value canmount "$source_dataset")
+	old_mountpoint=$(zfs get -H -o value mountpoint "$archived_dataset")
+	old_canmount=$(zfs get -H -o value canmount "$archived_dataset")
 	printf '%s\t%s\t%s\t%s\n' "$source_dataset" "$archived_dataset" "$old_mountpoint" "$old_canmount" >> "$archived_properties_file"
 }
 
@@ -423,11 +429,11 @@ archive_old_dataset()
 
 	if dataset_exists "$source_dataset"; then
 		dataset_exists "$archived_dataset" && die "Both original and archived datasets exist; refusing ambiguous swap state: $source_dataset"
-		record_archive_properties "$source_dataset" "$archived_dataset"
 		# An explicitly configured mountpoint survives zfs rename. The following
 		# state reconciliation is deliberately separate so a busy unmount can be
 		# retried without attempting the already completed rename a second time.
 		run zfs rename "$source_dataset" "$archived_dataset"
+		record_archive_properties "$source_dataset" "$archived_dataset"
 	else
 		dataset_exists "$archived_dataset" || die "Neither original nor archived dataset exists: $source_dataset"
 		log "Original dataset is already archived; continuing swap: $archived_dataset"
@@ -881,13 +887,16 @@ copy_dataset_tree()
 	local source_mountpoint=$1 replacement_mountpoint=$2 copy_log=$3
 	local rsync_rc=0
 	local -a copy_pipeline_status=()
-	local -a rsync_options=(-aHAXS --numeric-ids --ignore-errors --force --info=progress2 --no-inc-recursive)
+	local -a rsync_options=(-aHAXS --numeric-ids --ignore-errors --force --info=progress2)
 
 	log "Copying \"$source_mountpoint\" to \"$replacement_mountpoint\""
 	if (( rsync_inplace )); then
 		# Keep the dry-run command identical to apply mode so its review output
 		# accurately shows the requested overwrite behaviour.
 		rsync_options+=(--inplace)
+	fi
+	if ! (( one_pass )); then
+		rsync_options+=(--no-inc-recursive)
 	fi
 	if (( apply )); then
 		# --delete is deliberately absent: source EIO must not make an unreadable
@@ -973,6 +982,12 @@ is_backup_already_swapped()
 {
 	local source_dataset=$1
 	local archived_dataset="$source_dataset.__pre_metadata_repair_$run_id"
+	local replacement_dataset="$source_dataset.repair.$run_id"
+
+	# If the temporary replacement clone still exists, it was not yet swapped/renamed to source_dataset.
+	if dataset_exists "$replacement_dataset"; then
+		return 1
+	fi
 
 	# If the archived original exists and the authentic dataset exists,
 	# the swap for this backup was already completed in this run.
