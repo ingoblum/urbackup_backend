@@ -12,8 +12,8 @@ ServerDownloadThreadGroup::ServerDownloadThreadGroup(FileClient& fc, FileClientC
 	{
 		ServerDlThread dl_thread;
 
-		FileClient* curr_fc;
-		FileClientChunked* curr_fc_chunked;
+		FileClient* curr_fc = NULL;
+		FileClientChunked* curr_fc_chunked = NULL;
 		if (i == 0)
 		{
 			curr_fc = &fc;
@@ -38,8 +38,7 @@ ServerDownloadThreadGroup::ServerDownloadThreadGroup(FileClient& fc, FileClientC
 				curr_fc->setProgressLogCallback(client_main);
 			}
 
-			if (incremental_num > 0 &&
-				intra_file_diffs)
+			if (fc_chunked != NULL && intra_file_diffs)
 			{
 				std::auto_ptr<FileClientChunked> new_fc;
 				if (client_main->getClientChunkedFilesrvConnection(new_fc, server_settings, client_main, 60000))
@@ -49,12 +48,14 @@ ServerDownloadThreadGroup::ServerDownloadThreadGroup(FileClient& fc, FileClientC
 					if (new_fc->hasError())
 					{
 						ServerLogger::Log(logid, "Failed to connect chunked FileClient "+convert(i)+ " -1", LL_WARNING);
+						delete curr_fc;
 						continue;
 					}
 				}
 				else
 				{
 					ServerLogger::Log(logid, "Failed to connect chunked FileClient " + convert(i) + " -2", LL_WARNING);
+					delete curr_fc;
 					continue;
 				}
 
