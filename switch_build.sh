@@ -68,7 +68,7 @@ full_ver = f"{base_ver} (git-{git_hash}, {git_date}: {git_msg})"
 span_html = f'<span id="urbackup_version" style="cursor:help" title="Commit: {git_hash} ({git_date})&#10;Message: {git_msg}">UrBackup {base_ver} ({git_hash}, {git_date})</span>'
 
 content = re.sub(r'<div style="display:none" id="server_version_full">.*?</div>', f'<div style="display:none" id="server_version_full">{full_ver}</div>', content)
-content = re.sub(r'(?:UrBackup[^\n<]*|<span id="urbackup_version"[^\n]*</span>)\s*\|\s*<a href="javascript:\s*aboutUrBackup\(\)"', f'{span_html} | <a href="javascript: aboutUrBackup()"', content)
+content = re.sub(r'<span class="pull-right">[\s\S]*?<a href="javascript:\s*aboutUrBackup\(\)"', f'<span class="pull-right">\n\t\t\t\t\t\t\t{span_html} | <a href="javascript: aboutUrBackup()"', content)
 
 with open('urbackupserver/www/index.htm', 'w', encoding='utf-8') as f:
     f.write(content)
