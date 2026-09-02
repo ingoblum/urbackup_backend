@@ -206,6 +206,16 @@ endif
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/js/vs/basic-languages/src/* "$(DESTDIR)$(datadir)/urbackup/www/js/vs/basic-languages/src/"
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/js/vs/editor/* "$(DESTDIR)$(datadir)/urbackup/www/js/vs/editor/"
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/*.htm "$(DESTDIR)$(datadir)/urbackup/www/"
+	@if [ -f "$(DESTDIR)$(datadir)/urbackup/www/index.htm" ]; then \
+		base="2.5.37"; \
+		h="unknown"; d=""; m=""; \
+		if [ -d "$(srcdir)/.git" ] && command -v git >/dev/null 2>&1; then \
+			h=$$(git -C "$(srcdir)" rev-parse --short HEAD 2>/dev/null || echo "unknown"); \
+			d=$$(git -C "$(srcdir)" log -1 --format=%cd --date=short 2>/dev/null || echo ""); \
+			m=$$(git -C "$(srcdir)" log -1 --format=%s 2>/dev/null || echo ""); \
+		fi; \
+		python3 -c "import re, html, sys; base='$$base'; h='$$h'; d='$$d'; m=html.escape('$$m', quote=True); fn=sys.argv[1]; c=open(fn,'r',encoding='utf-8').read(); full=f'{base} (git-{h}, {d}: {m})' if h!='unknown' else base; span=f'<span id=\"urbackup_version\" style=\"cursor:help\" title=\"Commit: {h} ({d})&#10;Message: {m}\">UrBackup {base} ({h}, {d})</span>' if h!='unknown' else f'UrBackup {base}'; c=re.sub(r'<div style=\"display:none\" id=\"server_version_full\">.*?</div>', f'<div style=\"display:none\" id=\"server_version_full\">{full}</div>', c); c=re.sub(r'<span class=\"pull-right\">[\s\S]*?<a href=\"javascript:\s*aboutUrBackup\(\)\"', f'<span class=\"pull-right\">\n\t\t\t\t\t\t\t{span} | <a href=\"javascript: aboutUrBackup()\"', c); open(fn,'w',encoding='utf-8').write(c)" "$(DESTDIR)$(datadir)/urbackup/www/index.htm" 2>/dev/null || true; \
+	fi
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/*.ico "$(DESTDIR)$(datadir)/urbackup/www/"
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/css/*.css "$(DESTDIR)$(datadir)/urbackup/www/css/"
 	$(INSTALL_DATA) $(INSTALL_OPTS) $(srcdir)/urbackupserver/www/images/*.png "$(DESTDIR)$(datadir)/urbackup/www/images/"
