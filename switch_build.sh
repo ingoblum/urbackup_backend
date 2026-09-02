@@ -38,6 +38,41 @@ switch_build()
 		    sed -i "s/BUILDID/0/g" configure.ac
 		fi
 	fi
+	if [[ "x$cbuild" == "xserver" ]] && [ -f urbackupserver/www/index.htm ]; then
+		update_www_version
+	fi
+}
+
+update_www_version()
+{
+	local base_ver="2.5.37"
+	local git_hash="unknown" git_date="" git_msg=""
+	if command -v git >/dev/null 2>&1 && [ -d .git ]; then
+		git_hash=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+		git_date=$(git log -1 --format=%cd --date=short 2>/dev/null || echo "")
+		git_msg=$(git log -1 --format=%s 2>/dev/null || echo "")
+	fi
+
+	python3 - <<PYEOF 2>/dev/null || true
+import re, html
+
+base_ver = "${base_ver}"
+git_hash = "${git_hash}"
+git_date = "${git_date}"
+git_msg = html.escape("""${git_msg}""", quote=True)
+
+with open('urbackupserver/www/index.htm', 'r', encoding='utf-8') as f:
+    content = f.read()
+
+full_ver = f"{base_ver} (git-{git_hash}, {git_date}: {git_msg})"
+span_html = f'<span id="urbackup_version" style="cursor:help" title="Commit: {git_hash} ({git_date})&#10;Message: {git_msg}">UrBackup {base_ver} ({git_hash}, {git_date})</span>'
+
+content = re.sub(r'<div style="display:none" id="server_version_full">.*?</div>', f'<div style="display:none" id="server_version_full">{full_ver}</div>', content)
+content = re.sub(r'(?:UrBackup[^\n<]*|<span id="urbackup_version"[^\n]*</span>)\s*\|\s*<a href="javascript:\s*aboutUrBackup\(\)"', f'{span_html} | <a href="javascript: aboutUrBackup()"', content)
+
+with open('urbackupserver/www/index.htm', 'w', encoding='utf-8') as f:
+    f.write(content)
+PYEOF
 }
 
 switch()
