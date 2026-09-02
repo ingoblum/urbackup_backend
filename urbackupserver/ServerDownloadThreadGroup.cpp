@@ -16,6 +16,7 @@ ServerDownloadThreadGroup::ServerDownloadThreadGroup(FileClient& fc, FileClientC
 		FileClientChunked* curr_fc_chunked = NULL;
 		if (i == 0)
 		{
+			// Thread 0 uses the existing connections owned by the caller (IncrFileBackup/FullFileBackup).
 			curr_fc = &fc;
 			curr_fc_chunked = fc_chunked;
 			dl_thread.fc = NULL;
@@ -23,45 +24,54 @@ ServerDownloadThreadGroup::ServerDownloadThreadGroup(FileClient& fc, FileClientC
 		}
 		else
 		{
-			curr_fc = new FileClient(false, client_main->getIdentity(), 
+			// Auxiliary threads (i > 0) require their own dedicated connections.
+			// Use smart pointers (RAII) so that if any connection step fails and triggers 'continue',
+			// all allocated connections are automatically cleaned up without memory leaks.
+			std::auto_ptr<FileClient> new_fc(new FileClient(false, client_main->getIdentity(), 
 				client_main->getProtocolVersions().filesrv_protocol_version,
-				client_main->isOnInternetConnection(), client_main, use_tmpfiles ? NULL : client_main);
-			_u32 rc = client_main->getClientFilesrvConnection(curr_fc, server_settings, 60000);
+				client_main->isOnInternetConnection(), client_main, use_tmpfiles ? NULL : client_main));
+
+			_u32 rc = client_main->getClientFilesrvConnection(new_fc.get(), server_settings, 60000);
 			if (rc != ERR_CONNECTED)
 			{
 				ServerLogger::Log(logid, "Failed to connect FileClient "+convert(i), LL_WARNING);
-				delete curr_fc;
 				continue;
 			}
 			else
 			{
-				curr_fc->setProgressLogCallback(client_main);
+				new_fc->setProgressLogCallback(client_main);
 			}
 
+			// If chunked file transfers are active for this backup (fc_chunked != NULL && intra_file_diffs),
+			// each worker thread MUST establish its own FileClientChunked connection.
+			// Previously, this checked (incremental_num > 0 && intra_file_diffs), which incorrectly evaluated
+			// to false on the first incremental backup (incremental_num == 0) or resumed full backups.
+			// Combined with curr_fc_chunked being uninitialized, auxiliary threads erroneously reused
+			// Thread 0's fc_chunked pointer across multiple threads concurrently, leading to data races,
+			// glibc malloc heap corruption, and double-free on shutdown.
+			std::auto_ptr<FileClientChunked> new_fc_chunked;
 			if (fc_chunked != NULL && intra_file_diffs)
 			{
-				std::auto_ptr<FileClientChunked> new_fc;
-				if (client_main->getClientChunkedFilesrvConnection(new_fc, server_settings, client_main, 60000))
+				if (client_main->getClientChunkedFilesrvConnection(new_fc_chunked, server_settings, client_main, 60000))
 				{
-					new_fc->setProgressLogCallback(client_main);
-					new_fc->setDestroyPipe(true);
-					if (new_fc->hasError())
+					new_fc_chunked->setProgressLogCallback(client_main);
+					new_fc_chunked->setDestroyPipe(true);
+					if (new_fc_chunked->hasError())
 					{
 						ServerLogger::Log(logid, "Failed to connect chunked FileClient "+convert(i)+ " -1", LL_WARNING);
-						delete curr_fc;
 						continue;
 					}
 				}
 				else
 				{
 					ServerLogger::Log(logid, "Failed to connect chunked FileClient " + convert(i) + " -2", LL_WARNING);
-					delete curr_fc;
 					continue;
 				}
-
-				curr_fc_chunked = new_fc.release();
 			}
 
+			// All required connections were established; transfer ownership to ServerDownloadThreadGroup.
+			curr_fc = new_fc.release();
+			curr_fc_chunked = new_fc_chunked.release();
 			dl_thread.fc = curr_fc;
 			dl_thread.fc_chunked = curr_fc_chunked;
 		}
