@@ -4297,6 +4297,15 @@ int reconcile_storage()
 				Server->Log("Apply complete. File index was removed and will be rebuilt on next startup/check.", LL_INFO);
 			}
 		}
+		else if (regenerate_index && !file_index_exists())
+		{
+			if (!ensure_file_index_available_for_reconcile(true))
+			{
+				Server->Log("Apply completed, but regenerating the missing file index failed.", LL_ERROR);
+				return 1;
+			}
+			Server->Log("Apply complete. Missing file index was rebuilt as requested by --regenerate-index.", LL_INFO);
+		}
 		else
 		{
 			Server->Log("Apply complete. File index remained unchanged because no indexed file rows were modified.", LL_INFO);
