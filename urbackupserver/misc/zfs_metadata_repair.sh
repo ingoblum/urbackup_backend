@@ -532,31 +532,31 @@ unique_snapshot_name()
 detach_archived_dataset_clones()
 {
 	local candidate=$1
-	local snap clone snap_name new_snap_name
-	local -a snaps=()
+	local snap clone snap_name new_snap_name progress=1 pass=0 max_passes=50
 
-	# Find all snapshots of this candidate dataset
-	while IFS= read -r snap; do
-		[[ -n $snap ]] || continue
-		snaps+=("$snap")
-	done < <(zfs list -H -t snapshot -o name -r "$candidate" 2>/dev/null || true)
-
-	for snap in "${snaps[@]}"; do
-		for clone in $(zfs get -H -o value clones "$snap" 2>/dev/null | tr ',' ' '); do
-			[[ $clone != "-" && -n $clone ]] || continue
-			# Only promote active datasets, not other archived repair datasets
-			if [[ $clone != *.__pre_metadata_repair_* ]]; then
-				snap_name=${snap#*@}
-				if snapshot_exists "$clone@$snap_name"; then
-					new_snap_name=$(unique_snapshot_name "$candidate" "$clone" "pre_repair_${snap_name}")
-					log "Renaming conflicting origin snapshot on \"$candidate\" to \"$new_snap_name\" before promotion..."
-					run zfs rename "$snap" "$candidate@$new_snap_name"
-					snap="$candidate@$new_snap_name"
+	while (( progress && pass < max_passes )); do
+		progress=0
+		(( pass += 1 ))
+		while IFS= read -r snap; do
+			[[ -n $snap ]] || continue
+			for clone in $(zfs get -H -o value clones "$snap" 2>/dev/null | tr ',' ' '); do
+				[[ $clone != "-" && -n $clone ]] || continue
+				# Only promote active datasets, not other archived repair datasets
+				if [[ $clone != *.__pre_metadata_repair_* ]]; then
+					snap_name=${snap#*@}
+					if snapshot_exists "$clone@$snap_name"; then
+						new_snap_name=$(unique_snapshot_name "$candidate" "$clone" "pre_repair_${snap_name}")
+						log "Renaming conflicting origin snapshot on \"$candidate\" to \"$new_snap_name\" before promotion..."
+						run zfs rename "$snap" "$candidate@$new_snap_name"
+						snap="$candidate@$new_snap_name"
+					fi
+					log "Promoting active clone \"$clone\" to detach from archived dataset \"$candidate\"..."
+					run zfs promote "$clone" || warn "Could not promote active clone: $clone"
+					progress=1
+					break 2 # restart snapshot scan because dataset tree changed after promote
 				fi
-				log "Promoting active clone \"$clone\" to detach from archived dataset \"$candidate\"..."
-				run zfs promote "$clone" || warn "Could not promote active clone: $clone"
-			fi
-		done
+			done
+		done < <(zfs list -H -t snapshot -o name -r "$candidate" 2>/dev/null || true)
 	done
 }
 
