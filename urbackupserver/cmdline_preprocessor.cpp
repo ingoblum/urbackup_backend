@@ -1234,6 +1234,18 @@ int action_reconcile_storage(std::vector<std::string> args)
 		"Remove file backup rows that have no file metadata rows after reconciliation.",
 		cmd, false);
 
+	TCLAP::SwitchArg remove_untracked_datasets_arg("", "remove-untracked-datasets",
+		"Remove ZFS datasets and links that are not tracked in the UrBackup database.",
+		cmd, false);
+
+	TCLAP::SwitchArg remove_unknown_datasets_arg("", "remove-unknown-datasets",
+		"Alias for --remove-untracked-datasets.",
+		cmd, false);
+
+	TCLAP::ValueArg<int> min_dataset_age_hours_arg("", "min-dataset-age-hours",
+		"Minimum age in hours for untracked datasets to be eligible for removal (default: 2 hours).",
+		false, 2, "hours", cmd);
+
 	TCLAP::ValueArg<std::string> user_arg("u", "user",
 		"Change process to run as specific user",
 		false, "root", "user", cmd);
@@ -1373,6 +1385,14 @@ int action_reconcile_storage(std::vector<std::string> args)
 	{
 		real_args.push_back("--drop_empty_backups");
 		real_args.push_back("true");
+	}
+	if(remove_untracked_datasets_arg.getValue()
+		|| remove_unknown_datasets_arg.getValue())
+	{
+		real_args.push_back("--remove_untracked_datasets");
+		real_args.push_back("true");
+		real_args.push_back("--min_dataset_age_hours");
+		real_args.push_back(convert(min_dataset_age_hours_arg.getValue()));
 	}
 
 	return run_real_main(real_args);

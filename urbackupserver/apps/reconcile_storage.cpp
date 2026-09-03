@@ -50,7 +50,9 @@ struct SStats
 		: old_backups_seen(0), missing_backups_importable(0), missing_backups_imported(0),
 		missing_backups_skipped(0), file_rows_importable(0), file_rows_imported(0),
 		file_rows_reused(0), file_rows_skipped_malformed(0),
-		dataset_links(0), dataset_links_created(0), dataset_backups_seen(0),
+		dataset_links(0), dataset_links_created(0),
+		untracked_datasets(0), untracked_datasets_removed(0),
+		dataset_backups_seen(0),
 		dataset_backups_importable(0), dataset_backups_imported(0), ignored_read_errors(0),
 		hash_metadata_rebuilt(0), hash_metadata_created(0), hash_metadata_repaired(0), broken_storage_link_targets(0),
 		paths_to_migrate(0), paths_migrated(0), missing_files(0), missing_files_removed(0),
@@ -68,6 +70,8 @@ struct SStats
 	int64 file_rows_skipped_malformed;
 	int64 dataset_links;
 	int64 dataset_links_created;
+	int64 untracked_datasets;
+	int64 untracked_datasets_removed;
 	int64 dataset_backups_seen;
 	int64 dataset_backups_importable;
 	int64 dataset_backups_imported;
@@ -759,6 +763,80 @@ int current_image_backup_exists(IDatabase* db, const std::string& clientname, co
 	q->Reset();
 	db->destroyQuery(q);
 	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
+}
+
+time_t parse_backup_unix_time(const std::string& backup_path)
+{
+	if (backup_path.size() < 11)
+	{
+		return 0;
+	}
+
+	const std::string stamp = backup_path.substr(0, 11);
+	if (stamp[6] != '-')
+	{
+		return 0;
+	}
+
+	tm t;
+	memset(&t, 0, sizeof(t));
+	t.tm_year = 100 + watoi(stamp.substr(0, 2));
+	t.tm_mon = watoi(stamp.substr(2, 2)) - 1;
+	t.tm_mday = watoi(stamp.substr(4, 2));
+	t.tm_hour = watoi(stamp.substr(7, 2));
+	t.tm_min = watoi(stamp.substr(9, 2));
+	t.tm_sec = 0;
+	t.tm_isdst = -1;
+
+	return mktime(&t);
+}
+
+int check_image_dataset_exists_in_db(IDatabase* db, const std::string& clientname, const std::string& backup_path)
+{
+	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+		"WHERE c.name=? AND (i.path LIKE ? OR i.path LIKE ?)", false);
+	if (q == NULL)
+	{
+		return ELookupStatus_Error;
+	}
+	q->Bind(clientname);
+	q->Bind("%/" + clientname + "/" + backup_path + "/%");
+	q->Bind("%/" + backup_path + "/%");
+	db_results res = q->Read();
+	q->Reset();
+	db->destroyQuery(q);
+	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
+}
+
+bool is_client_backup_recently_active(IDatabase* db, const std::string& clientname)
+{
+	IQuery* q = db->Prepare("SELECT COUNT(*) AS c FROM backups b INNER JOIN clients c ON c.id=b.clientid "
+		"WHERE c.name=? AND b.done=0 AND b.running > datetime('now', '-2 hours')", false);
+	if (q != NULL)
+	{
+		q->Bind(clientname);
+		db_results res = q->Read();
+		q->Reset();
+		db->destroyQuery(q);
+		if (!res.empty() && watoi(res[0]["c"]) > 0)
+		{
+			return true;
+		}
+	}
+	IQuery* qi = db->Prepare("SELECT COUNT(*) AS c FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+		"WHERE c.name=? AND i.complete=0 AND i.running > datetime('now', '-2 hours')", false);
+	if (qi != NULL)
+	{
+		qi->Bind(clientname);
+		db_results res = qi->Read();
+		qi->Reset();
+		db->destroyQuery(qi);
+		if (!res.empty() && watoi(res[0]["c"]) > 0)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 int64 ensure_client(IDatabase* db, const std::string& clientname, bool apply)
@@ -2681,6 +2759,210 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 	return ok;
 }
 
+bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
+	const std::string& storage_prefix, int min_age_hours, bool apply, SStats& stats)
+{
+	const bool file_zfs_links = BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile;
+	const bool image_zfs_links = BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs;
+
+	if (!file_zfs_links && !image_zfs_links)
+	{
+		Server->Log("Skipping untracked dataset removal because neither file nor image backups use dataset-backed subvolumes.", LL_INFO);
+		return true;
+	}
+
+	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
+	bool ok = true;
+	const time_t now = time(NULL);
+	const int64 min_age_seconds = static_cast<int64>(std::max(0, min_age_hours)) * 3600;
+
+	if (file_zfs_links)
+	{
+		const std::string dataset_file = read_trimmed_file_if_exists("/etc/urbackup/dataset_file");
+		std::vector<SDatasetEntry> entries;
+		if (!list_zfs_dataset_entries(dataset_file, false, entries))
+		{
+			return false;
+		}
+
+		std::sort(entries.begin(), entries.end(), [](const SDatasetEntry& a, const SDatasetEntry& b)
+		{
+			if (a.clientname != b.clientname) return a.clientname < b.clientname;
+			return a.backup_path < b.backup_path;
+		});
+
+		SCursorProgress progress("Checking for untracked file datasets", static_cast<_i64>(entries.size()));
+		for (size_t i = 0; i < entries.size(); ++i)
+		{
+			const SDatasetEntry& entry = entries[i];
+			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+
+			if (!matches_client_filter(client_filters, entry.clientname))
+			{
+				continue;
+			}
+			if (should_skip_storage_visible_entry_name(entry.clientname)
+				|| should_skip_storage_visible_entry_name(entry.backup_path))
+			{
+				continue;
+			}
+
+			std::string dummy_time;
+			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
+			{
+				continue;
+			}
+
+			const time_t backup_time = parse_backup_unix_time(entry.backup_path);
+			if (backup_time > 0 && (now - backup_time) < min_age_seconds)
+			{
+				continue;
+			}
+
+			if (is_client_backup_recently_active(db, entry.clientname))
+			{
+				log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
+					+ "\" because a backup was recently active", LL_WARNING);
+				continue;
+			}
+
+			const int exists_status = current_backup_exists(db, entry.clientname, entry.backup_path);
+			if (exists_status == ELookupStatus_Error)
+			{
+				ok = false;
+				continue;
+			}
+			if (exists_status == ELookupStatus_Found)
+			{
+				// Backup is tracked in database. Keep it untouched.
+				continue;
+			}
+
+			// Untracked dataset found!
+			++stats.untracked_datasets;
+			log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove")
+				+ " untracked file dataset \"" + entry.dataset_name
+				+ "\" client \"" + entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
+
+			if (apply)
+			{
+				if (!SnapshotHelper::removeFilesystem(false, entry.clientname, entry.backup_path))
+				{
+					log_with_cursor_progress(progress, "Failed to remove untracked file filesystem for dataset \""
+						+ entry.dataset_name + "\"", LL_ERROR);
+					ok = false;
+				}
+				else
+				{
+					++stats.untracked_datasets_removed;
+				}
+
+				const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+				if (os_get_file_type(os_file_prefix(link_path)) != 0)
+				{
+					Server->deleteFile(os_file_prefix(link_path));
+				}
+			}
+		}
+
+		finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
+	}
+
+	if (image_zfs_links)
+	{
+		const std::string dataset_image = read_trimmed_file_if_exists("/etc/urbackup/dataset");
+		std::vector<SDatasetEntry> entries;
+		if (!list_zfs_dataset_entries(dataset_image, true, entries))
+		{
+			return false;
+		}
+
+		std::sort(entries.begin(), entries.end(), [](const SDatasetEntry& a, const SDatasetEntry& b)
+		{
+			if (a.clientname != b.clientname) return a.clientname < b.clientname;
+			return a.backup_path < b.backup_path;
+		});
+
+		SCursorProgress progress("Checking for untracked image datasets", static_cast<_i64>(entries.size()));
+		for (size_t i = 0; i < entries.size(); ++i)
+		{
+			const SDatasetEntry& entry = entries[i];
+			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+
+			if (!matches_client_filter(client_filters, entry.clientname))
+			{
+				continue;
+			}
+			if (should_skip_storage_visible_entry_name(entry.clientname)
+				|| should_skip_storage_visible_entry_name(entry.backup_path))
+			{
+				continue;
+			}
+
+			std::string dummy_time;
+			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
+			{
+				continue;
+			}
+
+			const time_t backup_time = parse_backup_unix_time(entry.backup_path);
+			if (backup_time > 0 && (now - backup_time) < min_age_seconds)
+			{
+				continue;
+			}
+
+			if (is_client_backup_recently_active(db, entry.clientname))
+			{
+				log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
+					+ "\" because a backup was recently active", LL_WARNING);
+				continue;
+			}
+
+			const int exists_status = check_image_dataset_exists_in_db(db, entry.clientname, entry.backup_path);
+			if (exists_status == ELookupStatus_Error)
+			{
+				ok = false;
+				continue;
+			}
+			if (exists_status == ELookupStatus_Found)
+			{
+				// Backup is tracked in database. Keep it untouched.
+				continue;
+			}
+
+			// Untracked dataset found!
+			++stats.untracked_datasets;
+			log_with_cursor_progress(progress, std::string(apply ? "Removing" : "Would remove")
+				+ " untracked image dataset \"" + entry.dataset_name
+				+ "\" client \"" + entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
+
+			if (apply)
+			{
+				if (!SnapshotHelper::removeFilesystem(true, entry.clientname, entry.backup_path))
+				{
+					log_with_cursor_progress(progress, "Failed to remove untracked image filesystem for dataset \""
+						+ entry.dataset_name + "\"", LL_ERROR);
+					ok = false;
+				}
+				else
+				{
+					++stats.untracked_datasets_removed;
+				}
+
+				const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+				if (os_get_file_type(os_file_prefix(link_path)) != 0)
+				{
+					Server->deleteFile(os_file_prefix(link_path));
+				}
+			}
+		}
+
+		finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
+	}
+
+	return ok;
+}
+
 bool get_file_size(const std::string& path, _i64& size)
 {
 	if (!FileExists(os_file_prefix(path)))
@@ -4040,6 +4322,8 @@ void log_summary(const SStats& stats, bool apply)
 	Server->Log("  malformed file rows skipped during import: " + convert(stats.file_rows_skipped_malformed), LL_INFO);
 	Server->Log(std::string("  dataset links ") + (apply ? "created: " : "would create: ")
 		+ convert(apply ? stats.dataset_links_created : stats.dataset_links), LL_INFO);
+	Server->Log(std::string("  untracked datasets ") + (apply ? "removed: " : "would remove: ")
+		+ convert(apply ? stats.untracked_datasets_removed : stats.untracked_datasets), LL_INFO);
 	Server->Log("  visible storage backups seen: " + convert(stats.dataset_backups_seen), LL_INFO);
 	Server->Log("  visible storage backups importable: " + convert(stats.dataset_backups_importable), LL_INFO);
 	Server->Log(std::string("  visible storage backups ") + (apply ? "imported: " : "would import: ")
@@ -4081,6 +4365,8 @@ int reconcile_storage()
 	const bool remove_missing_files = Server->getServerParameter("remove_missing_files") == "true";
 	const bool remove_malformed_file_rows_enabled = Server->getServerParameter("remove_malformed_file_rows") == "true";
 	const bool recreate_missing_dataset_links_enabled = Server->getServerParameter("recreate_missing_dataset_links") == "true";
+	const bool remove_untracked_datasets_enabled = Server->getServerParameter("remove_untracked_datasets") == "true";
+	const int min_dataset_age_hours = watoi(Server->getServerParameter("min_dataset_age_hours"));
 	bool import_missing_dataset_backups_enabled = Server->getServerParameter("import_storage") == "true";
 	const bool ignore_read_errors = Server->getServerParameter("ignore_read_errors") == "true";
 	const bool rehash_files = Server->getServerParameter("rehash_files") == "true";
@@ -4092,9 +4378,22 @@ int reconcile_storage()
 	}
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 
+	const bool database_modifying_actions = apply && (
+		migrate_existing_file_paths ||
+		remove_missing_files ||
+		remove_malformed_file_rows_enabled ||
+		import_missing_dataset_backups_enabled ||
+		drop_empty_backups ||
+		!import_db_dir.empty()
+	);
+
 	if (skip_db_backup)
 	{
 		Server->Log("Skipping pre-run database backup because --skip-db-backup was specified.", LL_WARNING);
+	}
+	else if (!database_modifying_actions)
+	{
+		Server->Log("Skipping database backup because the current action(s) do not modify the database.", LL_INFO);
 	}
 	else if (!backup_current_database(backup_database_dir))
 	{
@@ -4237,6 +4536,17 @@ int reconcile_storage()
 	else
 	{
 		Server->Log("Skipping dataset link recreation because --recreate-missing-dataset-links was not specified.", LL_INFO);
+	}
+
+	if (remove_untracked_datasets_enabled)
+	{
+		warn_if_dataset_detection_failed();
+		ok = ok && remove_untracked_datasets(db, client_filter, new_storage_prefix,
+			min_dataset_age_hours > 0 ? min_dataset_age_hours : 2, apply, stats);
+	}
+	else
+	{
+		Server->Log("Skipping untracked dataset removal because --remove-untracked-datasets was not specified.", LL_INFO);
 	}
 
 	if (import_missing_dataset_backups_enabled)
