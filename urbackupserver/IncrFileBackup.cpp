@@ -376,9 +376,11 @@ bool IncrFileBackup::doFileBackup()
 			else if (zfs_file)
 			{
 				std::string mountpoint = SnapshotHelper::getMountpoint(false, clientname, backuppath_single);
-				if (mountpoint.empty())
+				if (mountpoint.empty() || mountpoint == "none")
 				{
 					ServerLogger::Log(logid, "Could not find mountpoint of snapshot of client " + clientname + " path " + backuppath_single, LL_ERROR);
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					has_early_error = true;
 					return false;
 				}
@@ -386,6 +388,9 @@ bool IncrFileBackup::doFileBackup()
 				if (!os_link_symbolic(mountpoint, backuppath + ".startup-del"))
 				{
 					ServerLogger::Log(logid, "Could create symlink to mountpoint at " + backuppath + " to " + mountpoint + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + ".startup-del");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					has_early_error = true;
 					return false;
 				}
@@ -393,6 +398,9 @@ bool IncrFileBackup::doFileBackup()
 				if (!os_rename_file(backuppath + ".startup-del", backuppath))
 				{
 					ServerLogger::Log(logid, "Could rename symlink at " + backuppath + ".startup-del to " + backuppath + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + ".startup-del");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					has_early_error = true;
 					return false;
 				}
@@ -401,6 +409,11 @@ bool IncrFileBackup::doFileBackup()
 			if(!os_create_dir(os_file_prefix(backuppath_hashes)))
 			{
 				ServerLogger::Log(logid, "Cannot create hash path (Server error)", LL_ERROR);
+				if (zfs_file)
+				{
+					Server->deleteFile(backuppath);
+				}
+				SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 				has_early_error=true;
 				return false;
 			}
@@ -412,9 +425,11 @@ bool IncrFileBackup::doFileBackup()
 			if (zfs_file)
 			{
 				std::string mountpoint = SnapshotHelper::getMountpoint(false, clientname, backuppath_single);
-				if (mountpoint.empty())
+				if (mountpoint.empty() || mountpoint == "none")
 				{
 					ServerLogger::Log(logid, "Could not find mountpoint of snapshot of client " + clientname + " path " + backuppath_single, LL_ERROR);
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single + snap_startup_del);
 					has_early_error = true;
 					return false;
 				}
@@ -422,6 +437,9 @@ bool IncrFileBackup::doFileBackup()
 				if (!os_link_symbolic(mountpoint, backuppath + ".startup-del"))
 				{
 					ServerLogger::Log(logid, "Could create symlink to mountpoint at " + backuppath + " to " + mountpoint + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + ".startup-del");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single + snap_startup_del);
 					has_early_error = true;
 					return false;
 				}
@@ -432,6 +450,9 @@ bool IncrFileBackup::doFileBackup()
 				if (!os_rename_file(backuppath + ".startup-del", backuppath))
 				{
 					ServerLogger::Log(logid, "Could rename symlink at " + backuppath + ".startup-del to " + backuppath + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + ".startup-del");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single + snap_startup_del);
 					has_early_error = true;
 					return false;
 				}
@@ -439,6 +460,8 @@ bool IncrFileBackup::doFileBackup()
 				if (FileExists(backuppath_hashes + os_file_sep() + sync_fn))
 				{
 					ServerLogger::Log(logid, "Could not delete sync file. File still exists.", LL_ERROR);
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single + snap_startup_del);
 					has_early_error = true;
 					return false;
 				}

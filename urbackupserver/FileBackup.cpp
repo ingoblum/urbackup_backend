@@ -1618,21 +1618,29 @@ bool FileBackup::constructBackupPath(bool on_snapshot, bool create_fs, std::stri
 			if (zfs_file)
 			{
 				std::string mountpoint = SnapshotHelper::getMountpoint(false, clientname, backuppath_single);
-				if (mountpoint.empty())
+				if (mountpoint.empty() || mountpoint == "none")
 				{
 					ServerLogger::Log(logid, "Could not find mountpoint of snapshot of client " + clientname + " path " + backuppath_single, LL_ERROR);
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					return false;
 				}
 
 				if (!os_link_symbolic(mountpoint, backuppath + "_new"))
 				{
 					ServerLogger::Log(logid, "Could create symlink to mountpoint at " + backuppath+ " to " + mountpoint + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + "_new");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					return false;
 				}
 
 				if (!os_rename_file(backuppath + "_new", backuppath))
 				{
 					ServerLogger::Log(logid, "Could rename symlink at " + backuppath + "_new to " + backuppath + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(backuppath + "_new");
+					Server->deleteFile(backuppath);
+					SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 					return false;
 				}
 			}
@@ -1644,6 +1652,11 @@ bool FileBackup::constructBackupPath(bool on_snapshot, bool create_fs, std::stri
 			if (!b)
 			{
 				ServerLogger::Log(logid, "Error creating hash folder. " + os_last_error_str(), LL_ERROR);
+				if (zfs_file)
+				{
+					Server->deleteFile(backuppath);
+				}
+				SnapshotHelper::removeFilesystem(false, clientname, backuppath_single);
 				return false;
 			}
 

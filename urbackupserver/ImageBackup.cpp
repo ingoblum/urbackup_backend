@@ -2323,21 +2323,29 @@ std::string ImageBackup::constructImagePath(const std::string &letter, std::stri
 			else if (BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs)
 			{
 				std::string mountpoint = SnapshotHelper::getMountpoint(true, clientname, backuppath_single);
-				if (mountpoint.empty())
+				if (mountpoint.empty() || mountpoint == "none")
 				{
 					ServerLogger::Log(logid, "Could not find mountpoint of snapshot of client " + clientname + " path " + backuppath_single, LL_ERROR);
+					Server->deleteFile(image_folder);
+					SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 					return std::string();
 				}
 
 				if (!os_link_symbolic(mountpoint, image_folder+"_new"))
 				{
 					ServerLogger::Log(logid, "Could create symlink to mountpoint at " + image_folder + " to " + mountpoint+". "+os_last_error_str(), LL_ERROR);
+					Server->deleteFile(image_folder + "_new");
+					Server->deleteFile(image_folder);
+					SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 					return std::string();
 				}
 
 				if (!os_rename_file(image_folder + "_new", image_folder))
 				{
 					ServerLogger::Log(logid, "Could rename symlink at " + image_folder + "_new to " + image_folder + ". " + os_last_error_str(), LL_ERROR);
+					Server->deleteFile(image_folder + "_new");
+					Server->deleteFile(image_folder);
+					SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 					return std::string();
 				}
 			}
@@ -2411,21 +2419,29 @@ std::string ImageBackup::constructImagePath(const std::string &letter, std::stri
 				if (BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs)
 				{
 					std::string mountpoint = SnapshotHelper::getMountpoint(true, clientname, backuppath_single);
-					if (mountpoint.empty())
+					if (mountpoint.empty() || mountpoint == "none")
 					{
 						ServerLogger::Log(logid, "Could not find mountpoint of snapshot of client " + clientname + " path " + backuppath_single, LL_ERROR);
+						Server->deleteFile(image_folder);
+						SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 						return std::string();
 					}
 
 					if (!os_link_symbolic(mountpoint, image_folder + "_new"))
 					{
 						ServerLogger::Log(logid, "Could create symlink to mountpoint at " + image_folder + " to " + mountpoint + ". " + os_last_error_str(), LL_ERROR);
+						Server->deleteFile(image_folder + "_new");
+						Server->deleteFile(image_folder);
+						SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 						return std::string();
 					}
 
 					if (!os_rename_file(image_folder + "_new", image_folder))
 					{
 						ServerLogger::Log(logid, "Could rename symlink at " + image_folder + "_new to " + image_folder + ". " + os_last_error_str(), LL_ERROR);
+						Server->deleteFile(image_folder + "_new");
+						Server->deleteFile(image_folder);
+						SnapshotHelper::removeFilesystem(true, clientname, backuppath_single);
 						return std::string();
 					}
 				}
