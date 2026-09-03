@@ -1275,6 +1275,23 @@ int action_reconcile_storage(std::vector<std::string> args)
 
 	cmd.parse(args);
 
+	const bool has_action = !import_db_dir_arg.getValue().empty()
+		|| migrate_existing_file_paths_arg.getValue()
+		|| remove_missing_files_arg.getValue()
+		|| remove_malformed_file_rows_arg.getValue()
+		|| recreate_dataset_links_arg.getValue()
+		|| import_dataset_backups_arg.getValue()
+		|| drop_empty_backups_arg.getValue()
+		|| remove_untracked_datasets_arg.getValue()
+		|| remove_unknown_datasets_arg.getValue();
+
+	if (!has_action)
+	{
+		std::cout << "No reconciliation action specified." << std::endl << std::endl;
+		cmd.getOutput()->usage(cmd);
+		return 1;
+	}
+
 	real_args.push_back("--no-server");
 	real_args.push_back("--workingdir");
 	real_args.push_back(VARDIR);

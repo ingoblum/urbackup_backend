@@ -4377,6 +4377,22 @@ int reconcile_storage()
 		import_missing_dataset_backups_enabled = Server->getServerParameter("import_missing_dataset_backups") == "true";
 	}
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
+	const bool have_import_db = !import_db_dir.empty();
+
+	const bool has_action = have_import_db
+		|| migrate_existing_file_paths
+		|| remove_missing_files
+		|| remove_malformed_file_rows_enabled
+		|| recreate_missing_dataset_links_enabled
+		|| remove_untracked_datasets_enabled
+		|| import_missing_dataset_backups_enabled
+		|| drop_empty_backups;
+
+	if (!has_action)
+	{
+		Server->Log("No reconciliation action specified. Use --help to see available actions.", LL_ERROR);
+		return 1;
+	}
 
 	const bool database_modifying_actions = apply && (
 		migrate_existing_file_paths ||
@@ -4384,7 +4400,7 @@ int reconcile_storage()
 		remove_malformed_file_rows_enabled ||
 		import_missing_dataset_backups_enabled ||
 		drop_empty_backups ||
-		!import_db_dir.empty()
+		have_import_db
 	);
 
 	if (skip_db_backup)
@@ -4438,7 +4454,6 @@ int reconcile_storage()
 	}
 	Server->Log("Using new storage prefix \"" + new_storage_prefix + "\"", LL_INFO);
 
-	const bool have_import_db = !import_db_dir.empty();
 	const bool storage_import_needs_file_index = apply && import_missing_dataset_backups_enabled;
 	const bool storage_import_uses_detached_files_connection = apply && import_missing_dataset_backups_enabled;
 	// Storage imports update the LMDB index alongside every committed SQLite batch.
