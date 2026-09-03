@@ -2511,6 +2511,7 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_filter,
 	const std::string& storage_prefix, bool apply, SStats& stats)
 {
+	(void)db;
 	const bool file_zfs_links = BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile;
 	const bool image_zfs_links = BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs;
 
@@ -2520,55 +2521,70 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 		return true;
 	}
 
+	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
 	bool ok = true;
 
 	if (file_zfs_links)
 	{
-		std::string sql = "SELECT b.id AS backupid, b.path AS backup_path, c.name AS client_name "
-			"FROM backups b INNER JOIN clients c ON c.id=b.clientid";
-		const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
-		if (!client_filter_expr.empty())
+		const std::string dataset_file = read_trimmed_file_if_exists("/etc/urbackup/dataset_file");
+		std::vector<SDatasetEntry> entries;
+		if (!list_zfs_dataset_entries(dataset_file, false, entries))
 		{
-			sql += " WHERE " + client_filter_expr;
+			return false;
 		}
-		sql += " ORDER BY c.name ASC, b.path ASC";
 
-		IQuery* q = db->Prepare(sql, false);
-		IDatabaseCursor* cursor = q->Cursor();
-		db_single_result row;
-		int64 processed_rows = 0;
-		SCursorProgress progress("Recreating file dataset links", 0);
-
-		while (cursor->next(row))
+		std::sort(entries.begin(), entries.end(), [](const SDatasetEntry& a, const SDatasetEntry& b)
 		{
-			++processed_rows;
-			const std::string clientname = row_result_value(row, "client_name");
-			const std::string backup_path = row_result_value(row, "backup_path");
-			draw_cursor_progress(progress, processed_rows, clientname + "/" + backup_path, false);
+			if (a.clientname != b.clientname) return a.clientname < b.clientname;
+			return a.backup_path < b.backup_path;
+		});
 
-			const std::string link_path = join_path(join_path(storage_prefix, clientname), backup_path);
+		SCursorProgress progress("Recreating file dataset links", static_cast<_i64>(entries.size()));
+		for (size_t i = 0; i < entries.size(); ++i)
+		{
+			const SDatasetEntry& entry = entries[i];
+			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+
+			if (!matches_client_filter(client_filters, entry.clientname))
+			{
+				continue;
+			}
+			if (should_skip_storage_visible_entry_name(entry.clientname)
+				|| should_skip_storage_visible_entry_name(entry.backup_path))
+			{
+				continue;
+			}
+
+			std::string dummy_time;
+			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
+			{
+				continue;
+			}
+
+			const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
 			if (os_get_file_type(os_file_prefix(link_path)) != 0)
 			{
 				continue;
 			}
-			if (!SnapshotHelper::isSubvolume(false, clientname, backup_path))
+
+			std::string mountpoint = entry.mountpoint;
+			if (mountpoint.empty() || mountpoint == "none" || mountpoint == "-")
 			{
-				continue;
+				mountpoint = SnapshotHelper::getMountpoint(false, entry.clientname, entry.backup_path);
 			}
 
-			const std::string mountpoint = SnapshotHelper::getMountpoint(false, clientname, backup_path);
-			if (mountpoint.empty())
+			if (mountpoint.empty() || mountpoint == "none" || mountpoint == "-")
 			{
-				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for file backup id "
-					+ row_result_value(row, "backupid") + " client \"" + clientname + "\" path \"" + backup_path + "\"", LL_WARNING);
+				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for file dataset \""
+					+ entry.dataset_name + "\" client \"" + entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
 				ok = false;
 				continue;
 			}
 
 			++stats.dataset_links;
 			log_with_cursor_progress(progress, std::string(apply ? "Recreating" : "Would recreate")
-				+ " file dataset link for backup id " + row_result_value(row, "backupid")
-				+ " client \"" + clientname + "\" path \"" + backup_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
+				+ " file dataset link for dataset \"" + entry.dataset_name
+				+ "\" client \"" + entry.clientname + "\" path \"" + entry.backup_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
 
 			if (!create_dataset_link_at_path(mountpoint, link_path, apply))
 			{
@@ -2582,75 +2598,70 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 			}
 		}
 
-		finish_cursor_progress(progress, processed_rows, "done");
-		const bool cursor_ok = !cursor->has_error();
-		cursor->shutdown();
-		db->destroyQuery(q);
-		ok = ok && cursor_ok;
+		finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
 	}
 
 	if (image_zfs_links)
 	{
-		std::string sql = "SELECT i.id AS backupid, i.path AS image_path, c.name AS client_name "
-			"FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE i.complete=1";
-		const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
-		if (!client_filter_expr.empty())
+		const std::string dataset_image = read_trimmed_file_if_exists("/etc/urbackup/dataset");
+		std::vector<SDatasetEntry> entries;
+		if (!list_zfs_dataset_entries(dataset_image, true, entries))
 		{
-			sql += " AND " + client_filter_expr;
+			return false;
 		}
-		sql += " ORDER BY c.name ASC, i.path ASC";
 
-		IQuery* q = db->Prepare(sql, false);
-		IDatabaseCursor* cursor = q->Cursor();
-		db_single_result row;
-		int64 processed_rows = 0;
-		SCursorProgress progress("Recreating image dataset links", 0);
-
-		while (cursor->next(row))
+		std::sort(entries.begin(), entries.end(), [](const SDatasetEntry& a, const SDatasetEntry& b)
 		{
-			++processed_rows;
-			const std::string clientname = row_result_value(row, "client_name");
-			const std::string image_path = row_result_value(row, "image_path");
-			draw_cursor_progress(progress, processed_rows, clientname + "/" + image_path, false);
+			if (a.clientname != b.clientname) return a.clientname < b.clientname;
+			return a.backup_path < b.backup_path;
+		});
 
-			if (!should_recreate_image_dataset_link(row))
+		SCursorProgress progress("Recreating image dataset links", static_cast<_i64>(entries.size()));
+		for (size_t i = 0; i < entries.size(); ++i)
+		{
+			const SDatasetEntry& entry = entries[i];
+			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
+
+			if (!matches_client_filter(client_filters, entry.clientname))
+			{
+				continue;
+			}
+			if (should_skip_storage_visible_entry_name(entry.clientname)
+				|| should_skip_storage_visible_entry_name(entry.backup_path))
 			{
 				continue;
 			}
 
-			const std::string image_folder = ExtractFilePath(image_path);
-			const std::string backup_path = ExtractFileName(image_folder);
-			if (image_folder.empty() || backup_path.empty())
+			std::string dummy_time;
+			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
 			{
 				continue;
 			}
 
-			// Image backup rows may still point at an old storage prefix after migration.
-			// Recreate the visible link below the current storage prefix so the server sees
-			// the same layout it would have created during the original backup run.
-			const std::string link_path = join_path(join_path(storage_prefix, clientname), backup_path);
+			const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
 			if (os_get_file_type(os_file_prefix(link_path)) != 0)
 			{
 				continue;
 			}
-			if (!SnapshotHelper::isSubvolume(true, clientname, backup_path))
+
+			std::string mountpoint = entry.mountpoint;
+			if (mountpoint.empty() || mountpoint == "none" || mountpoint == "-")
 			{
-				continue;
+				mountpoint = SnapshotHelper::getMountpoint(true, entry.clientname, entry.backup_path);
 			}
 
-			const std::string mountpoint = SnapshotHelper::getMountpoint(true, clientname, backup_path);
-			if (mountpoint.empty())
+			if (mountpoint.empty() || mountpoint == "none" || mountpoint == "-")
 			{
-				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for image backup id "
-					+ row_result_value(row, "backupid") + " client \"" + clientname + "\" path \"" + image_path + "\"", LL_WARNING);
+				log_with_cursor_progress(progress, "Dataset mountpoint lookup failed for image dataset \""
+					+ entry.dataset_name + "\" client \"" + entry.clientname + "\" path \"" + entry.backup_path + "\"", LL_WARNING);
 				ok = false;
 				continue;
 			}
 
 			++stats.dataset_links;
 			log_with_cursor_progress(progress, std::string(apply ? "Recreating" : "Would recreate")
-				+ " image dataset link for backup id " + row_result_value(row, "backupid")
-				+ " client \"" + clientname + "\" path \"" + link_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
+				+ " image dataset link for dataset \"" + entry.dataset_name
+				+ "\" client \"" + entry.clientname + "\" path \"" + link_path + "\" -> \"" + mountpoint + "\"", LL_INFO);
 
 			if (!create_dataset_link_at_path(mountpoint, link_path, apply))
 			{
@@ -2664,11 +2675,7 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 			}
 		}
 
-		finish_cursor_progress(progress, processed_rows, "done");
-		const bool cursor_ok = !cursor->has_error();
-		cursor->shutdown();
-		db->destroyQuery(q);
-		ok = ok && cursor_ok;
+		finish_cursor_progress(progress, static_cast<_i64>(entries.size()), "done");
 	}
 
 	return ok;
