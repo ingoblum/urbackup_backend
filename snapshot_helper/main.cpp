@@ -649,6 +649,7 @@ int zfs_test()
 	}
 	
 	std::string clientdir=getBackupfolderPath(mode_zfs)+os_file_sep()+"testA54hj5luZtlorr494";
+	remove_subvolume(mode_zfs, clientdir, true);
 	
 	if(create_subvolume(mode_zfs, clientdir)
 		&& remove_subvolume(mode_zfs, clientdir) )
@@ -656,6 +657,7 @@ int zfs_test()
 		std::cout << "ZFS TEST OK" << std::endl;
 		
 		clientdir=getBackupfolderPath(mode_zfs_file)+os_file_sep()+"testA54hj5luZtlorr494";
+		remove_subvolume(mode_zfs, clientdir, true);
 		
 		if(getBackupfolderPath(mode_zfs_file).empty())
 		{
