@@ -2244,19 +2244,41 @@ bool find_image_payload_in_backup_root(const std::string& backup_root, std::stri
 	return false;
 }
 
+static std::string format_image_letter(std::string letter)
+{
+	// For standard Windows single-character drive letters (e.g. "C"), append ':' to match UrBackup's canonical format
+	if (letter.size() == 1 && ((letter[0] >= 'A' && letter[0] <= 'Z') || (letter[0] >= 'a' && letter[0] <= 'z')))
+	{
+		letter += ":";
+	}
+	return letter;
+}
+
 std::string storage_image_letter(const SStorageBackupEntry& entry, const std::string& image_name)
 {
 	const std::string marker = "_Image_";
 	size_t pos = entry.backup_path.find(marker);
 	if (pos != std::string::npos && pos + marker.size() < entry.backup_path.size())
 	{
-		return entry.backup_path.substr(pos + marker.size(), 1);
+		size_t start = pos + marker.size();
+		size_t end = entry.backup_path.find_first_of("/\\", start);
+		std::string raw = (end == std::string::npos) ? entry.backup_path.substr(start) : entry.backup_path.substr(start, end - start);
+		if (!raw.empty())
+		{
+			return format_image_letter(raw);
+		}
 	}
 
 	pos = image_name.find("Image_");
 	if (pos != std::string::npos && pos + 6 < image_name.size())
 	{
-		return image_name.substr(pos + 6, 1);
+		size_t start = pos + 6;
+		size_t end = image_name.find('_', start);
+		std::string raw = (end == std::string::npos) ? image_name.substr(start) : image_name.substr(start, end - start);
+		if (!raw.empty())
+		{
+			return format_image_letter(raw);
+		}
 	}
 
 	return std::string();
