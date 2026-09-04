@@ -265,6 +265,13 @@ int exec_wait(const std::string& path, std::string& stdout, ...)
 		}
 		
 		close(pipefd[1]);
+
+		int nullfd = open("/dev/null", O_WRONLY);
+		if(nullfd != -1)
+		{
+			dup2(nullfd, 2);
+			close(nullfd);
+		}
 		
 		int rc = execvp(path.c_str(), args.data());
 		exit(rc);
@@ -507,47 +514,24 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 		zfs_elevate();
 
 		// Root causes and details for ZFS dataset removal failures:
-		// 1. EBUSY / Mounted Datasets:
-		//    "zfs destroy -r" without "-f" fails when the dataset is still mounted
-		//    (or shadowed by overlapping mountpoints). Adding "-f" forces unmounting
-		//    before destruction.
+		// 1. Non-existent datasets:
+		//    If subvolume_folder does not exist, return true immediately. Running "zfs destroy"
+		//    or querying snapshots on non-existent datasets causes spurious error noise on stderr.
 		//
-		// 2. Flawed assumption of "@ro" snapshot name for dependent clones:
-		//    The original code strictly assumed that dependent clones only attach to a
-		//    snapshot named "@ro" (e.g. subvolume_folder + "@ro").
-		//    This failed in real-world scenarios:
-		//    a) When the snapshot was already renamed to "@" + rename_name (e.g. @260630-1435)
-		//       during an earlier partial removal attempt.
-		//    b) When UrBackup or repair scripts created snapshots named after the backup
-		//       timestamp (e.g. apo-ad1/260630-1435@260630-1435).
-		//    In those cases, "zfs get clones subvolume_folder@ro" failed with
-		//    "dataset does not exist", immediately aborting clone dependency resolution.
-		//    Fix: Dynamically query all existing snapshots on the dataset via
-		//    "zfs list -t snapshot -d 1" and inspect each for dependent clones.
+		// 2. Clones and snapshot dependencies:
+		//    ZFS prevents destroying a dataset if any of its snapshots have dependent clones.
+		//    We discover all actual snapshots with "zfs list -t snapshot -d 1", check each for clones,
+		//    rename "@ro" snapshots if needed, and promote a dependent clone using "zfs promote".
+		//    Promoting the clone reverses the origin relationship, transferring the snapshots to the
+		//    clone and leaving the target dataset free of dependents so it can be destroyed.
 		//
-		// 3. Clone promotion instead of flawed snapshot destruction:
-		//    Using "zfs promote <clone>" reverses the parent-clone relationship: the clone
-		//    becomes the new owner of the snapshot and lineage, leaving the target dataset
-		//    with zero dependent clones so it can be safely destroyed.
-		//    The old code erroneously attempted to destroy the snapshot on the promoted clone
-		//    after deleting the dataset ("destroy clones[i]@rename_name"). If other clones
-		//    still branched from that snapshot or the snapshot formed the baseline of the clone,
-		//    destroying it failed and caused remove_subvolume to report failure even though
-		//    the subvolume itself was already deleted.
+		// 3. EBUSY / Shadowed Mountpoints:
+		//    If "zfs destroy -f -r" fails due to unmount errors (e.g. mountpoint shadowed by parent
+		//    dataset or in use), we attempt "zfs unmount -f" and setting "mountpoint=none" before retrying.
 
-		int rc=exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
-		if (rc == 0)
+		if (!is_subvolume(mode, subvolume_folder))
 		{
-			if (!quiet)
-			{
-				std::cout << "Destroyed subvol " << subvolume_folder << " successfully." << std::endl;
-			}
 			return true;
-		}
-
-		if (!quiet)
-		{
-			std::cout << "Checking " << subvolume_folder << " for dependencies..." << std::endl;
 		}
 
 		std::vector<std::string> snapshots;
@@ -566,14 +550,7 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 			}
 		}
 
-		const std::string ro_snap = subvolume_folder + "@ro";
-		if (std::find(snapshots.begin(), snapshots.end(), ro_snap) == snapshots.end())
-		{
-			snapshots.push_back(ro_snap);
-		}
-
 		const std::string rename_name = ExtractFileName(subvolume_folder);
-		bool had_dependencies = false;
 
 		for (size_t s = 0; s < snapshots.size(); ++s)
 		{
@@ -606,7 +583,6 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 				continue;
 			}
 
-			had_dependencies = true;
 			if (!quiet)
 			{
 				std::cout << "Dependencies exist on snapshot " << snap << " (" << clones.size() << " clone(s))..." << std::endl;
@@ -641,6 +617,19 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 		{
 			std::cout << "Destroying subvol " << subvolume_folder << "..." << std::endl;
 		}
+		int rc = exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
+		if (rc == 0)
+		{
+			if (!quiet)
+			{
+				std::cout << "Destroyed subvol " << subvolume_folder << " successfully." << std::endl;
+			}
+			return true;
+		}
+
+		// Fallback for unmount issues (e.g. shadowed or busy mounts)
+		exec_wait(find_zfs_cmd(), false, "unmount", "-f", subvolume_folder.c_str(), NULL);
+		exec_wait(find_zfs_cmd(), false, "set", "mountpoint=none", subvolume_folder.c_str(), NULL);
 		rc = exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
 		if (rc == 0)
 		{
