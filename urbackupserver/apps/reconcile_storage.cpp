@@ -3306,6 +3306,9 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 				continue;
 			}
 
+			// Wenn für einen Client gerade ein Backup aktiv ist, wird das Dataset
+			// vorsichtshalber nicht angerührt. Die Warnung wird pro Client dedupliziert,
+			// um Log-Überflutung bei mehreren Datasets desselben Clients zu vermeiden.
 			if (is_client_backup_recently_active(db, entry.clientname))
 			{
 				if (warned_active_clients.insert(entry.clientname).second)
