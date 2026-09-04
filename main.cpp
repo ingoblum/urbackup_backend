@@ -319,26 +319,21 @@ int main_fkt(int argc, char *argv[])
 					p=carg.substr(1, carg.size()-1);
 
 				std::string v;
-
-				if( narg.size()>0 && narg[0]!='-' )
+				size_t g=p.find("=");
+				if(g!=std::string::npos)
+				{
+					v=p.substr(g+1);
+					p=p.substr(0,g);
+				}
+				else if( narg.size()>0 && narg[0]!='-' )
 				{
 					v=narg;
 					++i;
 				}
 				else
 				{
-					size_t g=p.find_last_of("=");
-					if(g!=std::string::npos)
-					{
-						v=p.substr(g+1);
-						p=p.substr(0,g);
-					}
-					else
-					{
-						v="true";
-					}
+					v="true";
 				}
-
 
 				srv_params[p]=v;
 			}

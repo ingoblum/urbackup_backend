@@ -1315,18 +1315,15 @@ int action_reconcile_storage(std::vector<std::string> args)
 	const std::string import_db_dir = import_db_dir_arg.getValue();
 	if(!import_db_dir.empty())
 	{
-		real_args.push_back("--import_db");
-		real_args.push_back(import_db_dir);
+		real_args.push_back("--import_db=" + import_db_dir);
 	}
 	if(!backup_database_arg.getValue().empty())
 	{
-		real_args.push_back("--backup_database");
-		real_args.push_back(backup_database_arg.getValue());
+		real_args.push_back("--backup_database=" + backup_database_arg.getValue());
 	}
 	if(!new_storage_prefix_arg.getValue().empty())
 	{
-		real_args.push_back("--new_storage_prefix");
-		real_args.push_back(new_storage_prefix_arg.getValue());
+		real_args.push_back("--new_storage_prefix=" + new_storage_prefix_arg.getValue());
 	}
 	if(!client_arg.getValue().empty())
 	{
@@ -1341,8 +1338,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 			}
 			client_filter += client_arg.getValue()[i];
 		}
-		real_args.push_back("--client");
-		real_args.push_back(client_filter);
+		real_args.push_back("--client=" + client_filter);
 	}
 	if(!client_regex_arg.getValue().empty())
 	{
@@ -1355,11 +1351,17 @@ int action_reconcile_storage(std::vector<std::string> args)
 			}
 			client_regex += client_regex_arg.getValue()[i];
 		}
-		real_args.push_back("--client_regex");
-		real_args.push_back(client_regex);
+		real_args.push_back("--client_regex=" + client_regex);
 	}
 	if(!interval_arg.getValue().empty())
 	{
+		// Root cause:
+		// When an interval starts with '-' (such as "-260630-0000" to specify an upper bound),
+		// passing "--interval" and the value as separate argv elements causes the inner
+		// argv parser in main.cpp (main_fkt) to treat the leading dash as a switch prefix,
+		// incorrectly defaulting the value to "true".
+		// Passing the parameter as "--interval=<value>" ensures that values starting with '-'
+		// are parsed as the parameter value rather than standalone flags.
 		std::string interval_param;
 		for(size_t i=0;i<interval_arg.getValue().size();++i)
 		{
@@ -1369,8 +1371,7 @@ int action_reconcile_storage(std::vector<std::string> args)
 			}
 			interval_param += interval_arg.getValue()[i];
 		}
-		real_args.push_back("--interval");
-		real_args.push_back(interval_param);
+		real_args.push_back("--interval=" + interval_param);
 	}
 	if(apply_arg.getValue())
 	{
