@@ -95,16 +95,6 @@ std::string getBackupfolderPath(int mode)
 	return fn;
 }
 
-std::string handleFilename(std::string fn)
-{
-	fn=conv_filename(fn);
-	if(fn=="..")
-	{
-		return "";
-	}
-	return fn;
-}
-
 std::string sanitize_zfs_name(std::string name)
 {
 	std::string res;
@@ -133,6 +123,23 @@ std::string sanitize_zfs_name(std::string name)
 		}
 	}
 	return res;
+}
+
+std::string handleFilename(std::string fn, int mode = 0)
+{
+	if(mode == mode_zfs || mode == mode_zfs_file)
+	{
+		fn = sanitize_zfs_name(fn);
+	}
+	else
+	{
+		fn = conv_filename(fn);
+	}
+	if(fn == ".." || fn.find("..") != std::string::npos)
+	{
+		return "";
+	}
+	return fn;
 }
 
 std::string get_subvolume_folder(int mode, const std::string& backupfolder, const std::string& clientname, const std::string& name)
@@ -490,57 +497,123 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 	else if(mode==mode_zfs)
 	{
 		zfs_elevate();
-		int rc=exec_wait(find_zfs_cmd(), false, "destroy", "-r", subvolume_folder.c_str(), NULL);
-		
-		if (rc!=0)
+		int rc=exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
+		if (rc == 0)
+		{
+			if (!quiet)
+			{
+				std::cout << "Destroyed subvol " << subvolume_folder << " successfully." << std::endl;
+			}
+			return true;
+		}
+
+		if (!quiet)
 		{
 			std::cout << "Checking " << subvolume_folder << " for dependencies..." << std::endl;
-			std::string clone_data;
-			rc=exec_wait(find_zfs_cmd(), clone_data, "get", "-H", "-o", "value", "clones", (subvolume_folder+"@ro").c_str(), NULL);
-			std::string rename_name = ExtractFileName(subvolume_folder);
-			if(rc==0)
+		}
+
+		std::vector<std::string> snapshots;
+		std::string snap_list_out;
+		if (exec_wait(find_zfs_cmd(), snap_list_out, "list", "-H", "-o", "name", "-t", "snapshot", "-d", "1", subvolume_folder.c_str(), NULL) == 0)
+		{
+			std::vector<std::string> lines;
+			Tokenize(snap_list_out, lines, "\n");
+			for (size_t i = 0; i < lines.size(); ++i)
 			{
-				std::vector<std::string> clones;
-				Tokenize(clone_data, clones, "\n");
-				std::cout << "Dependencies exist..." << std::endl;
-
-				if (exec_wait(find_zfs_cmd(), true, "rename", (subvolume_folder+"@ro").c_str(), (subvolume_folder+"@"+rename_name).c_str(), NULL)!=0 && is_subvolume(mode, subvolume_folder+"@ro"))
+				std::string s = trim(lines[i]);
+				if (!s.empty())
 				{
-					return false;
+					snapshots.push_back(s);
 				}
-
-				for(size_t i=0;i<clones.size();++i)
-				{
-					std::cout << "Promoting " << clones[i].c_str() << "..." << std::endl;
-					if(exec_wait(find_zfs_cmd(), true, "promote", clones[i].c_str(), NULL)!=0)
-					{
-						break;
-					}
-				}
-			
-				std::cout << "Destroying subvol " << subvolume_folder << "..." << std::endl;
-				if(exec_wait(find_zfs_cmd(), true, "destroy", "-r", subvolume_folder.c_str(), NULL)!=0)
-				{
-					return false;
-				}
-
-				for(size_t i=0;i<clones.size();++i)
-				{
-					if(exec_wait(find_zfs_cmd(), true, "destroy", (clones[i]+"@"+rename_name).c_str(), NULL)!=0)
-					{
-						return false;
-					}
-				}
-			}
-			else
-			{
-				return false;
 			}
 		}
 
-		std::cout << "Destroyed subvol " << subvolume_folder << " successfully." << std::endl;
-		return rc==0;
+		const std::string ro_snap = subvolume_folder + "@ro";
+		if (std::find(snapshots.begin(), snapshots.end(), ro_snap) == snapshots.end())
+		{
+			snapshots.push_back(ro_snap);
+		}
 
+		const std::string rename_name = ExtractFileName(subvolume_folder);
+		bool had_dependencies = false;
+
+		for (size_t s = 0; s < snapshots.size(); ++s)
+		{
+			const std::string& snap = snapshots[s];
+			std::string clone_data;
+			if (exec_wait(find_zfs_cmd(), clone_data, "get", "-H", "-o", "value", "clones", snap.c_str(), NULL) != 0)
+			{
+				continue;
+			}
+
+			std::vector<std::string> raw_clones;
+			Tokenize(clone_data, raw_clones, ",");
+			std::vector<std::string> clones;
+			for (size_t i = 0; i < raw_clones.size(); ++i)
+			{
+				std::vector<std::string> sub_lines;
+				Tokenize(raw_clones[i], sub_lines, "\n");
+				for (size_t j = 0; j < sub_lines.size(); ++j)
+				{
+					std::string c = trim(sub_lines[j]);
+					if (!c.empty() && c != "-")
+					{
+						clones.push_back(c);
+					}
+				}
+			}
+
+			if (clones.empty())
+			{
+				continue;
+			}
+
+			had_dependencies = true;
+			if (!quiet)
+			{
+				std::cout << "Dependencies exist on snapshot " << snap << " (" << clones.size() << " clone(s))..." << std::endl;
+			}
+
+			// If the snapshot is named @ro, rename it so promoted clone won't collide with future @ro
+			if (snap.size() >= 3 && snap.substr(snap.size() - 3) == "@ro")
+			{
+				const std::string target_snap = subvolume_folder + "@" + rename_name;
+				if (exec_wait(find_zfs_cmd(), !quiet, "rename", snap.c_str(), target_snap.c_str(), NULL) != 0
+					&& is_subvolume(mode, snap))
+				{
+					return false;
+				}
+			}
+
+			// Promoting the clone transfers the snapshot to the clone and reverses the parent-clone relationship
+			for (size_t i = 0; i < clones.size(); ++i)
+			{
+				if (!quiet)
+				{
+					std::cout << "Promoting " << clones[i] << "..." << std::endl;
+				}
+				if (exec_wait(find_zfs_cmd(), !quiet, "promote", clones[i].c_str(), NULL) == 0)
+				{
+					break;
+				}
+			}
+		}
+
+		if (!quiet)
+		{
+			std::cout << "Destroying subvol " << subvolume_folder << "..." << std::endl;
+		}
+		rc = exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
+		if (rc == 0)
+		{
+			if (!quiet)
+			{
+				std::cout << "Destroyed subvol " << subvolume_folder << " successfully." << std::endl;
+			}
+			return true;
+		}
+
+		return false;
 	}
 	return false;
 #endif
@@ -747,8 +820,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
@@ -762,8 +835,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
@@ -777,9 +850,9 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string src_name=handleFilename(argv[4]);
-		std::string dst_name=handleFilename(argv[5]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string src_name=handleFilename(argv[4], mode);
+		std::string dst_name=handleFilename(argv[5], mode);
 
 		std::string subvolume_src_folder=get_subvolume_folder(mode, backupfolder, clientname, src_name);
 		std::string subvolume_dst_folder=get_subvolume_folder(mode, backupfolder, clientname, dst_name);
@@ -794,8 +867,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
@@ -892,8 +965,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
@@ -907,8 +980,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 		
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 		
@@ -922,8 +995,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 
 		// Reconcile-storage uses this after an interrupted refresh to distinguish a
@@ -938,8 +1011,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		std::string clientname=handleFilename(argv[3]);
-		std::string name=handleFilename(argv[4]);
+		std::string clientname=handleFilename(argv[3], mode);
+		std::string name=handleFilename(argv[4], mode);
 
 		std::string subvolume_folder=get_subvolume_folder(mode, backupfolder, clientname, name);
 

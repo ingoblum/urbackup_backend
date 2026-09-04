@@ -3273,6 +3273,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 		});
 
 		SCursorProgress progress("Checking for untracked file datasets", static_cast<_i64>(entries.size()));
+		std::set<std::string> warned_active_clients;
 		for (size_t i = 0; i < entries.size(); ++i)
 		{
 			const SDatasetEntry& entry = entries[i];
@@ -3307,8 +3308,11 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 
 			if (is_client_backup_recently_active(db, entry.clientname))
 			{
-				log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
-					+ "\" because a backup was recently active", LL_WARNING);
+				if (warned_active_clients.insert(entry.clientname).second)
+				{
+					log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
+						+ "\" because a backup was recently active", LL_WARNING);
+				}
 				continue;
 			}
 
@@ -3370,6 +3374,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 		});
 
 		SCursorProgress progress("Checking for untracked image datasets", static_cast<_i64>(entries.size()));
+		std::set<std::string> warned_active_clients;
 		for (size_t i = 0; i < entries.size(); ++i)
 		{
 			const SDatasetEntry& entry = entries[i];
@@ -3404,8 +3409,11 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 
 			if (is_client_backup_recently_active(db, entry.clientname))
 			{
-				log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
-					+ "\" because a backup was recently active", LL_WARNING);
+				if (warned_active_clients.insert(entry.clientname).second)
+				{
+					log_with_cursor_progress(progress, "Skipping client \"" + entry.clientname
+						+ "\" because a backup was recently active", LL_WARNING);
+				}
 				continue;
 			}
 
