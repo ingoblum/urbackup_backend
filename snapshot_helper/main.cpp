@@ -125,14 +125,14 @@ std::string sanitize_zfs_name(std::string name)
 	return res;
 }
 
-// Frühere Fehlerursache bei Profil-Clients (z.B. ingo-server:media):
-// conv_filename() ersetzte Doppelpunkte (':') unkonditioniert durch Unterstriche ('_').
-// Dadurch wurde der ZFS-Dataset-Pfad für Profilclients von "ingo-server:media" fälschlicherweise
-// zu "ingo-server_media" umgeformt (z.B. data/urbackup/files/ingo-server_media/260711-0105).
-// Da ZFS-Datasets für Profile jedoch regulär Doppelpunkte im Namen tragen, schlug jede
-// Operation (zfs list, zfs destroy etc.) mit "dataset does not exist" fehl.
-// Für mode_zfs und mode_zfs_file wird daher sanitize_zfs_name() verwendet, welches Doppelpunkte
-// erhält und native Klammer-Profile wie [media] in :media überführt.
+// Former root cause for profile clients (e.g. ingo-server:media):
+// conv_filename() unconditionally replaced colons (':') with underscores ('_').
+// This mangled the ZFS dataset path for profile clients from "ingo-server:media"
+// into "ingo-server_media" (e.g. data/urbackup/files/ingo-server_media/260711-0105).
+// Because ZFS datasets for profiles legitimately contain colons in their name, every
+// operation (zfs list, zfs destroy, etc.) failed with "dataset does not exist".
+// For mode_zfs and mode_zfs_file, sanitize_zfs_name() is used instead, which preserves
+// colons and converts native bracket profile names like [media] into :media.
 std::string handleFilename(std::string fn, int mode = 0)
 {
 	if(mode == mode_zfs || mode == mode_zfs_file)
@@ -506,34 +506,34 @@ bool remove_subvolume(int mode, std::string subvolume_folder, bool quiet=false)
 	{
 		zfs_elevate();
 
-		// Ausführliche Dokumentation der ZFS-Fehlerursachen bei der Dataset-Löschung:
-		// 1. EBUSY / Gemountete Datasets:
-		//    "zfs destroy -r" ohne die Option "-f" scheitert, wenn das Dataset noch aktiv
-		//    gemountet ist (oder überdeckte/shadowed Mountpoints vorliegen). Die Option "-f"
-		//    erzwingt das Aushängen (force unmount) vor dem Löschen.
+		// Root causes and details for ZFS dataset removal failures:
+		// 1. EBUSY / Mounted Datasets:
+		//    "zfs destroy -r" without "-f" fails when the dataset is still mounted
+		//    (or shadowed by overlapping mountpoints). Adding "-f" forces unmounting
+		//    before destruction.
 		//
-		// 2. Fehlerannahme bezüglich "@ro"-Snapshots bei abhängigen Klonen:
-		//    Der ursprüngliche Code ging fest davon aus, dass Klone ausschließlich an einem
-		//    Snapshot namens "@ro" hängen (z.B. subvolume_folder + "@ro").
-		//    Dies schlug in folgenden realen Szenarien fehl:
-		//    a) Wenn der Snapshot in einem vorherigen partiellen Löschversuch bereits in
-		//       "@" + rename_name (z.B. @260630-1435) umbenannt wurde.
-		//    b) Wenn UrBackup oder Reparatur-Skripte Snapshots unter dem Zeitstempelnamen
-		//       angelegt hatten (z.B. apo-ad1/260630-1435@260630-1435).
-		//    In diesen Fällen lieferte "zfs get clones subvolume_folder@ro" den Fehler
-		//    "dataset does not exist", wodurch die Abhängigkeitsauflösung sofort abbrach.
-		//    Lösung: Alle vorhandenen Snapshots des Datasets via "zfs list -t snapshot -d 1"
-		//    dynamisch ermitteln und auf Klone prüfen.
+		// 2. Flawed assumption of "@ro" snapshot name for dependent clones:
+		//    The original code strictly assumed that dependent clones only attach to a
+		//    snapshot named "@ro" (e.g. subvolume_folder + "@ro").
+		//    This failed in real-world scenarios:
+		//    a) When the snapshot was already renamed to "@" + rename_name (e.g. @260630-1435)
+		//       during an earlier partial removal attempt.
+		//    b) When UrBackup or repair scripts created snapshots named after the backup
+		//       timestamp (e.g. apo-ad1/260630-1435@260630-1435).
+		//    In those cases, "zfs get clones subvolume_folder@ro" failed with
+		//    "dataset does not exist", immediately aborting clone dependency resolution.
+		//    Fix: Dynamically query all existing snapshots on the dataset via
+		//    "zfs list -t snapshot -d 1" and inspect each for dependent clones.
 		//
-		// 3. Klon-Promotion statt fehlerhafter Snapshot-Zerstörung:
-		//    Mittels "zfs promote <clone>" wird die Klon-Hierarchie umgekehrt: Der Klon wird
-		//    zum neuen Eigentümer des Snapshots und der Historie, sodass das Ziel-Dataset
-		//    keine abhängigen Klone mehr besitzt und gefahrlos zerstört werden kann.
-		//    Der alte Code versuchte nach dem Löschen des Datasets fälschlicherweise noch,
-		//    den Snapshot auf dem beförderten Klon zu zerstören ("destroy clones[i]@rename_name").
-		//    Wenn weitere Klone an diesem Snapshot hingen oder der Snapshot die Basis des
-		//    Klons bildete, schlug dies fehl und ließ remove_subvolume fälschlicherweise
-		//    einen Fehler zurückgeben, obwohl das Subvolume selbst bereits gelöscht war.
+		// 3. Clone promotion instead of flawed snapshot destruction:
+		//    Using "zfs promote <clone>" reverses the parent-clone relationship: the clone
+		//    becomes the new owner of the snapshot and lineage, leaving the target dataset
+		//    with zero dependent clones so it can be safely destroyed.
+		//    The old code erroneously attempted to destroy the snapshot on the promoted clone
+		//    after deleting the dataset ("destroy clones[i]@rename_name"). If other clones
+		//    still branched from that snapshot or the snapshot formed the baseline of the clone,
+		//    destroying it failed and caused remove_subvolume to report failure even though
+		//    the subvolume itself was already deleted.
 
 		int rc=exec_wait(find_zfs_cmd(), !quiet, "destroy", "-f", "-r", subvolume_folder.c_str(), NULL);
 		if (rc == 0)
