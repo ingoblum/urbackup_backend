@@ -1167,8 +1167,19 @@ int action_reconcile_storage(std::vector<std::string> args)
 		false, "", "path", cmd);
 
 	TCLAP::MultiArg<std::string> client_arg("", "client",
-		"Only reconcile the specified client(s). Repeat --client for multiple exact client names. Defaults to all clients.",
+		"Only reconcile the specified client(s). Supports native client[profile] and ZFS client:profile naming interchangeably. Repeat --client for multiple exact client names. Defaults to all clients.",
 		false, "client name", cmd);
+
+	TCLAP::MultiArg<std::string> client_regex_arg("", "client-regex",
+		"Only reconcile clients matching the specified regex pattern(s). Matches native client[profile] and ZFS client:profile naming interchangeably. Repeat --client-regex for multiple patterns.",
+		false, "regex", cmd);
+
+	TCLAP::MultiArg<std::string> interval_arg("", "interval",
+		"Filter dataset operations (links, cleanup, import) by backup timestamp interval in yymmdd-hhmm format. "
+		"Syntax: <time> (exact), -<time> (up to <time>, inclusive), <time>- (from <time> onwards, inclusive), "
+		"<start>-<end> or [<start>-<end>] (inclusive range), ]<start>-<end>[ (exclusive range), "
+		"or mixed brackets ]<start>-<end> / <start>-<end>[. Repeatable.",
+		false, "interval", cmd);
 
 	TCLAP::SwitchArg apply_arg("", "apply",
 		"Apply database changes. Without this option the command only performs a dry-run.",
@@ -1332,6 +1343,34 @@ int action_reconcile_storage(std::vector<std::string> args)
 		}
 		real_args.push_back("--client");
 		real_args.push_back(client_filter);
+	}
+	if(!client_regex_arg.getValue().empty())
+	{
+		std::string client_regex;
+		for(size_t i=0;i<client_regex_arg.getValue().size();++i)
+		{
+			if(i>0)
+			{
+				client_regex += "\n";
+			}
+			client_regex += client_regex_arg.getValue()[i];
+		}
+		real_args.push_back("--client_regex");
+		real_args.push_back(client_regex);
+	}
+	if(!interval_arg.getValue().empty())
+	{
+		std::string interval_param;
+		for(size_t i=0;i<interval_arg.getValue().size();++i)
+		{
+			if(i>0)
+			{
+				interval_param += "\n";
+			}
+			interval_param += interval_arg.getValue()[i];
+		}
+		real_args.push_back("--interval");
+		real_args.push_back(interval_param);
 	}
 	if(apply_arg.getValue())
 	{

@@ -28,6 +28,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <set>
 #include <signal.h>
 #include <string>
@@ -354,6 +355,39 @@ std::string shell_single_quote(const std::string& value)
 	return ret;
 }
 
+std::string client_name_to_zfs(const std::string& name)
+{
+	const size_t open_b = name.find('[');
+	const size_t close_b = name.rfind(']');
+	if (open_b != std::string::npos && close_b != std::string::npos && close_b > open_b)
+	{
+		return name.substr(0, open_b) + ":" + name.substr(open_b + 1, close_b - open_b - 1) + name.substr(close_b + 1);
+	}
+	return name;
+}
+
+std::string client_name_to_native(const std::string& name)
+{
+	if (name.find('[') == std::string::npos)
+	{
+		const size_t colon = name.find(':');
+		if (colon != std::string::npos)
+		{
+			return name.substr(0, colon) + "[" + name.substr(colon + 1) + "]";
+		}
+	}
+	return name;
+}
+
+std::set<std::string> get_client_name_variants(const std::string& name)
+{
+	std::set<std::string> variants;
+	variants.insert(name);
+	variants.insert(client_name_to_zfs(name));
+	variants.insert(client_name_to_native(name));
+	return variants;
+}
+
 std::set<std::string> parse_client_filter_set(const std::string& client_filter)
 {
 	std::set<std::string> ret;
@@ -364,34 +398,153 @@ std::set<std::string> parse_client_filter_set(const std::string& client_filter)
 		const std::string clientname = trim(toks[i]);
 		if (!clientname.empty())
 		{
-			ret.insert(clientname);
+			const std::set<std::string> variants = get_client_name_variants(clientname);
+			ret.insert(variants.begin(), variants.end());
 		}
 	}
 	return ret;
 }
 
-bool matches_client_filter(const std::set<std::string>& client_filters, const std::string& clientname)
+bool parse_client_regex_list(const std::string& client_regex, std::vector<std::regex>& regexes)
 {
-	return client_filters.empty() || client_filters.find(clientname) != client_filters.end();
+	regexes.clear();
+	std::vector<std::string> toks;
+	Tokenize(client_regex, toks, "\n");
+	for (size_t i = 0; i < toks.size(); ++i)
+	{
+		const std::string pat = trim(toks[i]);
+		if (!pat.empty())
+		{
+			try
+			{
+				regexes.push_back(std::regex(pat, std::regex::ECMAScript));
+			}
+			catch (const std::regex_error& e)
+			{
+				Server->Log("Invalid client regex pattern \"" + pat + "\": " + e.what(), LL_ERROR);
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
-std::string client_filter_sql_expr(const std::string& client_filter, const std::string& qualified_column)
+bool matches_client_filter_or_regex(const std::set<std::string>& client_filters,
+	const std::vector<std::regex>& client_regexes,
+	const std::string& clientname)
+{
+	if (client_filters.empty() && client_regexes.empty())
+	{
+		return true;
+	}
+
+	const std::string native_name = client_name_to_native(clientname);
+	const std::string zfs_name = client_name_to_zfs(clientname);
+
+	if (!client_filters.empty())
+	{
+		if (client_filters.find(clientname) != client_filters.end()
+			|| client_filters.find(native_name) != client_filters.end()
+			|| client_filters.find(zfs_name) != client_filters.end())
+		{
+			return true;
+		}
+	}
+
+	for (size_t i = 0; i < client_regexes.size(); ++i)
+	{
+		if (std::regex_search(clientname, client_regexes[i])
+			|| std::regex_search(native_name, client_regexes[i])
+			|| std::regex_search(zfs_name, client_regexes[i]))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool matches_client_filter(const std::set<std::string>& client_filters, const std::string& clientname)
+{
+	if (client_filters.empty()) return true;
+	const std::string native_name = client_name_to_native(clientname);
+	const std::string zfs_name = client_name_to_zfs(clientname);
+	return client_filters.find(clientname) != client_filters.end()
+		|| client_filters.find(native_name) != client_filters.end()
+		|| client_filters.find(zfs_name) != client_filters.end();
+}
+
+std::string client_filter_sql_expr(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex, const std::string& qualified_column)
 {
 	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
-	if (client_filters.empty())
+	std::vector<std::regex> client_regexes;
+	if (!client_regex.empty())
+	{
+		parse_client_regex_list(client_regex, client_regexes);
+	}
+
+	if (client_filters.empty() && client_regexes.empty())
 	{
 		return std::string();
 	}
 
-	if (client_filters.size() == 1)
+	std::set<std::string> matched_clients = client_filters;
+
+	if (!client_regexes.empty() && db != NULL)
 	{
-		return qualified_column + "=" + sql_string(*client_filters.begin());
+		IQuery* q = db->Prepare("SELECT name FROM clients", false);
+		if (q != NULL)
+		{
+			db_results res = q->Read();
+			q->Reset();
+			db->destroyQuery(q);
+			for (size_t i = 0; i < res.size(); ++i)
+			{
+				const std::string name = res[i]["name"];
+				if (matches_client_filter_or_regex(client_filters, client_regexes, name))
+				{
+					const std::set<std::string> variants = get_client_name_variants(name);
+					matched_clients.insert(variants.begin(), variants.end());
+				}
+			}
+		}
+		IQuery* q_old = db->Prepare("SELECT name FROM old_main.clients", false);
+		if (q_old != NULL)
+		{
+			db_results res_old = q_old->Read();
+			q_old->Reset();
+			db->destroyQuery(q_old);
+			for (size_t i = 0; i < res_old.size(); ++i)
+			{
+				const std::string name = res_old[i]["name"];
+				if (matches_client_filter_or_regex(client_filters, client_regexes, name))
+				{
+					const std::set<std::string> variants = get_client_name_variants(name);
+					matched_clients.insert(variants.begin(), variants.end());
+				}
+			}
+		}
+		if (matched_clients.empty())
+		{
+			return "1=0";
+		}
+	}
+
+	if (matched_clients.empty())
+	{
+		return std::string();
+	}
+
+	if (matched_clients.size() == 1)
+	{
+		return qualified_column + "=" + sql_string(*matched_clients.begin());
 	}
 
 	std::string ret = qualified_column + " IN (";
-	for (std::set<std::string>::const_iterator it = client_filters.begin(); it != client_filters.end(); ++it)
+	for (std::set<std::string>::const_iterator it = matched_clients.begin(); it != matched_clients.end(); ++it)
 	{
-		if (it != client_filters.begin())
+		if (it != matched_clients.begin())
 		{
 			ret += ", ";
 		}
@@ -400,6 +553,276 @@ std::string client_filter_sql_expr(const std::string& client_filter, const std::
 	ret += ")";
 	return ret;
 }
+
+std::string client_filter_sql_expr(const std::string& client_filter, const std::string& qualified_column)
+{
+	return client_filter_sql_expr(NULL, client_filter, std::string(), qualified_column);
+}
+
+bool is_backup_timestamp_component(const std::string& backup_path)
+{
+	if (backup_path.size() < 11 || backup_path[6] != '-')
+	{
+		return false;
+	}
+
+	for (size_t i = 0; i < 6; ++i)
+	{
+		if (backup_path[i] < '0' || backup_path[i] > '9')
+		{
+			return false;
+		}
+	}
+	for (size_t i = 7; i < 11; ++i)
+	{
+		if (backup_path[i] < '0' || backup_path[i] > '9')
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool is_valid_backup_stamp(const std::string& s)
+{
+	return s.size() == 11 && is_backup_timestamp_component(s);
+}
+
+struct SBackupInterval
+{
+	bool enabled;
+	bool is_exact;
+	bool has_start;
+	bool start_inclusive;
+	std::string start_stamp;
+	bool has_end;
+	bool end_inclusive;
+	std::string end_stamp;
+
+	SBackupInterval()
+		: enabled(false), is_exact(false),
+		  has_start(false), start_inclusive(true),
+		  has_end(false), end_inclusive(true)
+	{
+	}
+};
+
+bool parse_single_interval(const std::string& raw_spec, SBackupInterval& interval)
+{
+	std::string spec = trim(raw_spec);
+	if (spec.empty())
+	{
+		return false;
+	}
+
+	bool start_inclusive = true;
+	bool end_inclusive = true;
+
+	if (!spec.empty())
+	{
+		if (spec[0] == '[')
+		{
+			start_inclusive = true;
+			spec = spec.substr(1);
+		}
+		else if (spec[0] == ']')
+		{
+			start_inclusive = false;
+			spec = spec.substr(1);
+		}
+	}
+
+	if (!spec.empty())
+	{
+		if (spec[spec.size() - 1] == ']')
+		{
+			end_inclusive = true;
+			spec = spec.substr(0, spec.size() - 1);
+		}
+		else if (spec[spec.size() - 1] == '[')
+		{
+			end_inclusive = false;
+			spec = spec.substr(0, spec.size() - 1);
+		}
+	}
+
+	spec = trim(spec);
+	if (spec.empty())
+	{
+		return false;
+	}
+
+	interval = SBackupInterval();
+
+	// Case 1: Open-ended left: -<time>
+	if (spec[0] == '-')
+	{
+		const std::string end_stamp = spec.substr(1);
+		if (!is_valid_backup_stamp(end_stamp))
+		{
+			return false;
+		}
+		interval.enabled = true;
+		interval.has_start = false;
+		interval.has_end = true;
+		interval.end_stamp = end_stamp;
+		interval.end_inclusive = end_inclusive;
+		return true;
+	}
+
+	// Case 2: Open-ended right: <time>-
+	if (spec[spec.size() - 1] == '-')
+	{
+		const std::string start_stamp = spec.substr(0, spec.size() - 1);
+		if (!is_valid_backup_stamp(start_stamp))
+		{
+			return false;
+		}
+		interval.enabled = true;
+		interval.has_start = true;
+		interval.start_stamp = start_stamp;
+		interval.start_inclusive = start_inclusive;
+		interval.has_end = false;
+		return true;
+	}
+
+	// Case 3: Single exact date: <time> (11 chars)
+	if (spec.size() == 11)
+	{
+		if (!is_valid_backup_stamp(spec))
+		{
+			return false;
+		}
+		interval.enabled = true;
+		interval.is_exact = true;
+		interval.start_stamp = spec;
+		interval.end_stamp = spec;
+		interval.has_start = true;
+		interval.has_end = true;
+		interval.start_inclusive = start_inclusive;
+		interval.end_inclusive = end_inclusive;
+		return true;
+	}
+
+	// Case 4: Bounded interval: <start>-<end> (23 chars: 11 + 1 + 11)
+	if (spec.size() == 23 && spec[11] == '-')
+	{
+		const std::string start_stamp = spec.substr(0, 11);
+		const std::string end_stamp = spec.substr(12, 11);
+		if (!is_valid_backup_stamp(start_stamp) || !is_valid_backup_stamp(end_stamp))
+		{
+			return false;
+		}
+		interval.enabled = true;
+		interval.has_start = true;
+		interval.start_stamp = start_stamp;
+		interval.start_inclusive = start_inclusive;
+		interval.has_end = true;
+		interval.end_stamp = end_stamp;
+		interval.end_inclusive = end_inclusive;
+		return true;
+	}
+
+	return false;
+}
+
+bool parse_interval_param(const std::string& interval_param, std::vector<SBackupInterval>& intervals)
+{
+	intervals.clear();
+	std::vector<std::string> lines;
+	Tokenize(interval_param, lines, "\n");
+	for (size_t i = 0; i < lines.size(); ++i)
+	{
+		std::vector<std::string> specs;
+		Tokenize(lines[i], specs, ",");
+		for (size_t j = 0; j < specs.size(); ++j)
+		{
+			const std::string spec = trim(specs[j]);
+			if (spec.empty())
+			{
+				continue;
+			}
+			SBackupInterval interval;
+			if (!parse_single_interval(spec, interval))
+			{
+				Server->Log("Invalid --interval specification \"" + spec + "\". Expected format: yymmdd-hhmm, -yymmdd-hhmm, yymmdd-hhmm-, or yymmdd-hhmm-yymmdd-hhmm with optional brackets [ or ].", LL_ERROR);
+				return false;
+			}
+			intervals.push_back(interval);
+		}
+	}
+	return true;
+}
+
+bool matches_interval_single(const SBackupInterval& interval, const std::string& backup_path)
+{
+	if (!interval.enabled)
+	{
+		return true;
+	}
+
+	if (backup_path.size() < 11 || backup_path[6] != '-')
+	{
+		return false;
+	}
+
+	const std::string stamp = backup_path.substr(0, 11);
+
+	if (interval.is_exact)
+	{
+		if (!interval.start_inclusive || !interval.end_inclusive)
+		{
+			return false;
+		}
+		return stamp == interval.start_stamp;
+	}
+
+	if (interval.has_start)
+	{
+		if (interval.start_inclusive)
+		{
+			if (stamp < interval.start_stamp) return false;
+		}
+		else
+		{
+			if (stamp <= interval.start_stamp) return false;
+		}
+	}
+
+	if (interval.has_end)
+	{
+		if (interval.end_inclusive)
+		{
+			if (stamp > interval.end_stamp) return false;
+		}
+		else
+		{
+			if (stamp >= interval.end_stamp) return false;
+		}
+	}
+
+	return true;
+}
+
+bool matches_intervals(const std::vector<SBackupInterval>& intervals, const std::string& backup_path)
+{
+	if (intervals.empty())
+	{
+		return true;
+	}
+
+	for (size_t i = 0; i < intervals.size(); ++i)
+	{
+		if (matches_interval_single(intervals[i], backup_path))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 
 bool starts_with(const std::string& value, const std::string& prefix)
 {
@@ -432,6 +855,31 @@ std::string join_path(const std::string& a, const std::string& b)
 		return a + b;
 	}
 	return a + os_file_sep() + b;
+}
+
+std::string resolve_client_storage_dir(const std::string& storage_prefix, const std::string& clientname)
+{
+	const std::string native_name = client_name_to_native(clientname);
+	const std::string native_path = join_path(storage_prefix, native_name);
+	if (os_get_file_type(os_file_prefix(native_path)) != 0)
+	{
+		return native_name;
+	}
+
+	const std::string raw_path = join_path(storage_prefix, clientname);
+	if (os_get_file_type(os_file_prefix(raw_path)) != 0)
+	{
+		return clientname;
+	}
+
+	const std::string zfs_name = client_name_to_zfs(clientname);
+	const std::string zfs_path = join_path(storage_prefix, zfs_name);
+	if (os_get_file_type(os_file_prefix(zfs_path)) != 0)
+	{
+		return zfs_name;
+	}
+
+	return native_name;
 }
 
 // Storage imports need to address the on-disk .hashes tree exactly like the normal
@@ -748,7 +1196,8 @@ bool parse_backup_time_from_path(const std::string& backup_path, std::string& sq
 
 int current_image_backup_exists(IDatabase* db, const std::string& clientname, const std::string& backup_path)
 {
-	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid WHERE c.name=? AND i.path LIKE ?", false);
+	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND (i.path LIKE ? OR i.path LIKE ?)", false);
 	if (q == NULL)
 	{
 		// Storage reconciliation must not continue with a failed lookup query. If
@@ -758,7 +1207,10 @@ int current_image_backup_exists(IDatabase* db, const std::string& clientname, co
 		return ELookupStatus_Error;
 	}
 	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
+	q->Bind(client_name_to_zfs(clientname));
 	q->Bind("%/" + clientname + "/" + backup_path + "/%");
+	q->Bind("%/" + backup_path + "/%");
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
@@ -794,12 +1246,14 @@ time_t parse_backup_unix_time(const std::string& backup_path)
 int check_image_dataset_exists_in_db(IDatabase* db, const std::string& clientname, const std::string& backup_path)
 {
 	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
-		"WHERE c.name=? AND (i.path LIKE ? OR i.path LIKE ?)", false);
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND (i.path LIKE ? OR i.path LIKE ?)", false);
 	if (q == NULL)
 	{
 		return ELookupStatus_Error;
 	}
 	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
+	q->Bind(client_name_to_zfs(clientname));
 	q->Bind("%/" + clientname + "/" + backup_path + "/%");
 	q->Bind("%/" + backup_path + "/%");
 	db_results res = q->Read();
@@ -811,10 +1265,12 @@ int check_image_dataset_exists_in_db(IDatabase* db, const std::string& clientnam
 bool is_client_backup_recently_active(IDatabase* db, const std::string& clientname)
 {
 	IQuery* q = db->Prepare("SELECT COUNT(*) AS c FROM backups b INNER JOIN clients c ON c.id=b.clientid "
-		"WHERE c.name=? AND b.done=0 AND b.running > datetime('now', '-2 hours')", false);
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND b.done=0 AND b.running > datetime('now', '-2 hours')", false);
 	if (q != NULL)
 	{
 		q->Bind(clientname);
+		q->Bind(client_name_to_native(clientname));
+		q->Bind(client_name_to_zfs(clientname));
 		db_results res = q->Read();
 		q->Reset();
 		db->destroyQuery(q);
@@ -824,10 +1280,12 @@ bool is_client_backup_recently_active(IDatabase* db, const std::string& clientna
 		}
 	}
 	IQuery* qi = db->Prepare("SELECT COUNT(*) AS c FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
-		"WHERE c.name=? AND i.complete=0 AND i.running > datetime('now', '-2 hours')", false);
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND i.complete=0 AND i.running > datetime('now', '-2 hours')", false);
 	if (qi != NULL)
 	{
 		qi->Bind(clientname);
+		qi->Bind(client_name_to_native(clientname));
+		qi->Bind(client_name_to_zfs(clientname));
 		db_results res = qi->Read();
 		qi->Reset();
 		db->destroyQuery(qi);
@@ -861,7 +1319,7 @@ int64 ensure_client(IDatabase* db, const std::string& clientname, bool apply)
 	// attach to a consistent client id. Remaining statistics are rebuilt from the
 	// imported backup rows and files rows below.
 	IQuery* q = db->Prepare("INSERT INTO clients(name) VALUES(?)", false);
-	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
 	if (!q->Write())
 	{
 		q->Reset();
@@ -944,7 +1402,7 @@ bool update_client_rollups(IDatabase* db, int64 clientid)
 
 std::string dataset_link_path(const std::string& storage_prefix, const SDatasetEntry& entry)
 {
-	return join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+	return join_path(join_path(storage_prefix, resolve_client_storage_dir(storage_prefix, entry.clientname)), entry.backup_path);
 }
 
 bool is_image_backup_name(const std::string& backup_path)
@@ -966,34 +1424,6 @@ std::string strip_file_extension(const std::string& filename)
 	}
 
 	return filename.substr(0, filename.size() - ext.size() - 1);
-}
-
-bool is_backup_timestamp_component(const std::string& backup_path)
-{
-	if (backup_path.size() < 11 || backup_path[6] != '-')
-	{
-		return false;
-	}
-
-	// Visible storage imports must only consider objects that match the regular
-	// UrBackup naming scheme. This filters out administrative directories and
-	// copied helper content before any client/backup reconstruction logic starts.
-	for (size_t i = 0; i < 6; ++i)
-	{
-		if (backup_path[i] < '0' || backup_path[i] > '9')
-		{
-			return false;
-		}
-	}
-	for (size_t i = 7; i < 11; ++i)
-	{
-		if (backup_path[i] < '0' || backup_path[i] > '9')
-		{
-			return false;
-		}
-	}
-
-	return true;
 }
 
 bool is_valid_visible_backup_name(const std::string& backup_path)
@@ -1026,7 +1456,7 @@ std::string storage_entry_display_name(const SStorageBackupEntry& entry)
 int current_storage_image_backup_exists(IDatabase* db, const SStorageBackupEntry& entry)
 {
 	IQuery* q = db->Prepare("SELECT i.id FROM backup_images i INNER JOIN clients c ON c.id=i.clientid "
-		"WHERE c.name=? AND i.path LIKE ?", false);
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND (i.path LIKE ? OR i.path LIKE ?)", false);
 	if (q == NULL)
 	{
 		// Storage-image imports use the same existence probe as file imports. A
@@ -1035,17 +1465,21 @@ int current_storage_image_backup_exists(IDatabase* db, const SStorageBackupEntry
 		return ELookupStatus_Error;
 	}
 
+	q->Bind(entry.clientname);
+	q->Bind(client_name_to_native(entry.clientname));
+	q->Bind(client_name_to_zfs(entry.clientname));
+
 	if (entry.standalone_image_file)
 	{
 		// Standalone image files are matched by their basename because they do not
 		// have the extra backup directory level that directory-backed image backups use.
-		q->Bind(entry.clientname);
 		q->Bind("%/" + entry.clientname + "/" + ExtractFileName(entry.payload_path));
+		q->Bind("%/" + ExtractFileName(entry.payload_path));
 	}
 	else
 	{
-		q->Bind(entry.clientname);
 		q->Bind("%/" + entry.clientname + "/" + entry.backup_path + "/%");
+		q->Bind("%/" + entry.backup_path + "/%");
 	}
 	db_results res = q->Read();
 	q->Reset();
@@ -1075,10 +1509,18 @@ bool should_skip_storage_visible_entry_name(const std::string& name)
 	return !name.empty() && name[0] == '.';
 }
 
-bool list_visible_storage_backup_entries(const std::string& storage_prefix, const std::string& client_filter,
+bool list_visible_storage_backup_entries(const std::string& storage_prefix,
+	const std::string& client_filter,
+	const std::string& client_regex,
+	const std::vector<SBackupInterval>& intervals,
 	std::vector<SStorageBackupEntry>& entries, SStats& stats)
 {
 	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
+	std::vector<std::regex> client_regexes;
+	if (!client_regex.empty())
+	{
+		parse_client_regex_list(client_regex, client_regexes);
+	}
 	bool has_error = false;
 	std::vector<SFile> clients = getFiles(storage_prefix, &has_error);
 	if (has_error)
@@ -1100,7 +1542,7 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 		{
 			continue;
 		}
-		if (!matches_client_filter(client_filters, clients[i].name))
+		if (!matches_client_filter_or_regex(client_filters, client_regexes, clients[i].name))
 		{
 			continue;
 		}
@@ -1134,7 +1576,7 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 			entry.client_exists_in_db = false;
 			entry.root_path = join_path(client_root, backups[j].name);
 			entry.payload_path.clear();
-			entry.clientname = clients[i].name;
+			entry.clientname = client_name_to_native(clients[i].name);
 
 			// Remove-unknown treats plain names without dots as file-backup candidates
 			// even when they are not directories. Import-storage mirrors that behavior
@@ -1173,6 +1615,11 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 				entry.payload_path = entry.root_path;
 			}
 
+			if (!matches_intervals(intervals, entry.backup_path))
+			{
+				continue;
+			}
+
 			// A visible backup symlink whose target is currently not reachable would be
 			// seen by later cleanup logic as a broken storage object. Reconcile-storage
 			// warns immediately so operators do not run remove-unknown against an
@@ -1190,6 +1637,7 @@ bool list_visible_storage_backup_entries(const std::string& storage_prefix, cons
 
 	return true;
 }
+
 
 bool insert_dataset_image_backup_row(IDatabase* db, const std::vector<STableColumnInfo>& image_columns,
 	int64 clientid, const std::string& sqlite_time, const std::string& image_path,
@@ -1995,13 +2443,16 @@ bool insert_dataset_file_backup_row(IDatabase* db, const std::vector<STableColum
 SExistingFileBackupState current_file_backup_state(IDatabase* db, const std::string& clientname, const std::string& path)
 {
 	SExistingFileBackupState ret;
-	IQuery* q = db->Prepare("SELECT b.id, b.complete, b.done FROM backups b INNER JOIN clients c ON c.id=b.clientid WHERE c.name=? AND b.path=?", false);
+	IQuery* q = db->Prepare("SELECT b.id, b.complete, b.done FROM backups b INNER JOIN clients c ON c.id=b.clientid "
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND b.path=?", false);
 	if (q == NULL)
 	{
 		ret.status = ELookupStatus_Error;
 		return ret;
 	}
 	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
+	q->Bind(client_name_to_zfs(clientname));
 	q->Bind(path);
 	db_results res = q->Read();
 	q->Reset();
@@ -2018,6 +2469,7 @@ SExistingFileBackupState current_file_backup_state(IDatabase* db, const std::str
 	ret.done = watoi(res[0]["done"]) != 0;
 	return ret;
 }
+
 
 bool import_storage_file_backup(IDatabase* db, const std::vector<STableColumnInfo>& backup_columns,
 	const SStorageBackupEntry& entry, bool apply, bool ignore_read_errors, bool rehash_files, bool verbose, std::set<int64>& changed_clientids, SStats& stats)
@@ -2463,11 +2915,13 @@ bool import_storage_image_backup(IDatabase* db, const std::vector<STableColumnIn
 }
 
 bool import_missing_dataset_backups(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
+	const std::vector<SBackupInterval>& intervals,
 	const std::string& storage_prefix, bool apply, bool ignore_read_errors, bool rehash_files, SStats& stats)
 {
 	const bool verbose = !Server->getServerParameter("verbose").empty();
 	std::vector<SStorageBackupEntry> entries;
-	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, entries, stats))
+	if (!list_visible_storage_backup_entries(storage_prefix, client_filter, client_regex, intervals, entries, stats))
 	{
 		return false;
 	}
@@ -2587,6 +3041,8 @@ bool import_missing_dataset_backups(IDatabase* db, const std::string& client_fil
 }
 
 bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
+	const std::vector<SBackupInterval>& intervals,
 	const std::string& storage_prefix, bool apply, SStats& stats)
 {
 	(void)db;
@@ -2600,6 +3056,11 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 	}
 
 	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
+	std::vector<std::regex> client_regexes;
+	if (!client_regex.empty())
+	{
+		parse_client_regex_list(client_regex, client_regexes);
+	}
 	bool ok = true;
 
 	if (file_zfs_links)
@@ -2623,7 +3084,7 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 			const SDatasetEntry& entry = entries[i];
 			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
 
-			if (!matches_client_filter(client_filters, entry.clientname))
+			if (!matches_client_filter_or_regex(client_filters, client_regexes, entry.clientname))
 			{
 				continue;
 			}
@@ -2639,7 +3100,13 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 				continue;
 			}
 
-			const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+			if (!matches_intervals(intervals, entry.backup_path))
+			{
+				continue;
+			}
+
+			const std::string client_dir = resolve_client_storage_dir(storage_prefix, entry.clientname);
+			const std::string link_path = join_path(join_path(storage_prefix, client_dir), entry.backup_path);
 			if (os_get_file_type(os_file_prefix(link_path)) != 0)
 			{
 				continue;
@@ -2700,7 +3167,7 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 			const SDatasetEntry& entry = entries[i];
 			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
 
-			if (!matches_client_filter(client_filters, entry.clientname))
+			if (!matches_client_filter_or_regex(client_filters, client_regexes, entry.clientname))
 			{
 				continue;
 			}
@@ -2716,11 +3183,18 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 				continue;
 			}
 
-			const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+			if (!matches_intervals(intervals, entry.backup_path))
+			{
+				continue;
+			}
+
+			const std::string client_dir = resolve_client_storage_dir(storage_prefix, entry.clientname);
+			const std::string link_path = join_path(join_path(storage_prefix, client_dir), entry.backup_path);
 			if (os_get_file_type(os_file_prefix(link_path)) != 0)
 			{
 				continue;
 			}
+
 
 			std::string mountpoint = entry.mountpoint;
 			if (mountpoint.empty() || mountpoint == "none" || mountpoint == "-")
@@ -2760,6 +3234,8 @@ bool recreate_missing_dataset_links(IDatabase* db, const std::string& client_fil
 }
 
 bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
+	const std::vector<SBackupInterval>& intervals,
 	const std::string& storage_prefix, int min_age_hours, bool apply, SStats& stats)
 {
 	const bool file_zfs_links = BackupServer::getSnapshotMethod(false) == BackupServer::ESnapshotMethod_ZfsFile;
@@ -2772,6 +3248,11 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 	}
 
 	const std::set<std::string> client_filters = parse_client_filter_set(client_filter);
+	std::vector<std::regex> client_regexes;
+	if (!client_regex.empty())
+	{
+		parse_client_regex_list(client_regex, client_regexes);
+	}
 	bool ok = true;
 	const time_t now = time(NULL);
 	const int64 min_age_seconds = static_cast<int64>(std::max(0, min_age_hours)) * 3600;
@@ -2797,7 +3278,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 			const SDatasetEntry& entry = entries[i];
 			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
 
-			if (!matches_client_filter(client_filters, entry.clientname))
+			if (!matches_client_filter_or_regex(client_filters, client_regexes, entry.clientname))
 			{
 				continue;
 			}
@@ -2809,6 +3290,11 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 
 			std::string dummy_time;
 			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
+			{
+				continue;
+			}
+
+			if (!matches_intervals(intervals, entry.backup_path))
 			{
 				continue;
 			}
@@ -2857,7 +3343,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 					++stats.untracked_datasets_removed;
 				}
 
-				const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+				const std::string link_path = dataset_link_path(storage_prefix, entry);
 				if (os_get_file_type(os_file_prefix(link_path)) != 0)
 				{
 					Server->deleteFile(os_file_prefix(link_path));
@@ -2889,7 +3375,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 			const SDatasetEntry& entry = entries[i];
 			draw_cursor_progress(progress, static_cast<_i64>(i + 1), entry.clientname + "/" + entry.backup_path, false);
 
-			if (!matches_client_filter(client_filters, entry.clientname))
+			if (!matches_client_filter_or_regex(client_filters, client_regexes, entry.clientname))
 			{
 				continue;
 			}
@@ -2901,6 +3387,11 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 
 			std::string dummy_time;
 			if (!parse_backup_time_from_path(entry.backup_path, dummy_time))
+			{
+				continue;
+			}
+
+			if (!matches_intervals(intervals, entry.backup_path))
 			{
 				continue;
 			}
@@ -2949,7 +3440,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 					++stats.untracked_datasets_removed;
 				}
 
-				const std::string link_path = join_path(join_path(storage_prefix, entry.clientname), entry.backup_path);
+				const std::string link_path = dataset_link_path(storage_prefix, entry);
 				if (os_get_file_type(os_file_prefix(link_path)) != 0)
 				{
 					Server->deleteFile(os_file_prefix(link_path));
@@ -2962,6 +3453,7 @@ bool remove_untracked_datasets(IDatabase* db, const std::string& client_filter,
 
 	return ok;
 }
+
 
 bool get_file_size(const std::string& path, _i64& size)
 {
@@ -3499,7 +3991,7 @@ bool attach_current_files(IDatabase* db)
 
 int current_client_id(IDatabase* db, const std::string& clientname, int64& clientid)
 {
-	IQuery* q = db->Prepare("SELECT id FROM clients WHERE name=?", false);
+	IQuery* q = db->Prepare("SELECT id FROM clients WHERE name=? OR name=? OR name=?", false);
 	if (q == NULL)
 	{
 		// A failed Prepare() means the current database handle is unusable for this
@@ -3508,6 +4000,8 @@ int current_client_id(IDatabase* db, const std::string& clientname, int64& clien
 		return ELookupStatus_Error;
 	}
 	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
+	q->Bind(client_name_to_zfs(clientname));
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
@@ -3535,7 +4029,8 @@ bool row_exists_id(IDatabase* db, const std::string& table, int64 id)
 
 int current_backup_exists(IDatabase* db, const std::string& clientname, const std::string& path)
 {
-	IQuery* q = db->Prepare("SELECT b.id FROM backups b INNER JOIN clients c ON c.id=b.clientid WHERE c.name=? AND b.path=?", false);
+	IQuery* q = db->Prepare("SELECT b.id FROM backups b INNER JOIN clients c ON c.id=b.clientid "
+		"WHERE (c.name=? OR c.name=? OR c.name=?) AND b.path=?", false);
 	if (q == NULL)
 	{
 		// The observed crash path was: file-index setup invalidated the old DB
@@ -3546,12 +4041,15 @@ int current_backup_exists(IDatabase* db, const std::string& clientname, const st
 		return ELookupStatus_Error;
 	}
 	q->Bind(clientname);
+	q->Bind(client_name_to_native(clientname));
+	q->Bind(client_name_to_zfs(clientname));
 	q->Bind(path);
 	db_results res = q->Read();
 	q->Reset();
 	db->destroyQuery(q);
 	return res.empty() ? ELookupStatus_NotFound : ELookupStatus_Found;
 }
+
 
 bool is_malformed_file_row(const db_single_result& row, std::string& reason)
 {
@@ -3810,6 +4308,7 @@ bool import_file_rows(IDatabase* db_main, int64 backupid,
 }
 
 bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
 	const std::string& new_storage_prefix, bool apply, SStats& stats)
 {
 	std::vector<SColumn> backup_columns = intersect_columns(table_columns(db, "main", "backups"),
@@ -3826,7 +4325,7 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 	}
 
 	std::string where;
-	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	const std::string client_filter_expr = client_filter_sql_expr(db, client_filter, client_regex, "c.name");
 	if (!client_filter_expr.empty())
 	{
 		where = " WHERE " + client_filter_expr;
@@ -3942,10 +4441,11 @@ bool reconcile_missing_backups(IDatabase* db, const std::string& client_filter,
 }
 
 bool migrate_current_file_paths(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	std::string where;
-	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	const std::string client_filter_expr = client_filter_sql_expr(db, client_filter, client_regex, "c.name");
 	if (!client_filter_expr.empty())
 	{
 		where = " WHERE " + client_filter_expr;
@@ -4071,10 +4571,11 @@ std::string malformed_file_row_log_message(const db_single_result& row, const st
 		+ " incoming_stat_match " + row_result_value(row, "incoming_stat_match");
 }
 
-bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
+bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex, bool apply, SStats& stats)
 {
 	std::string where;
-	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	const std::string client_filter_expr = client_filter_sql_expr(db, client_filter, client_regex, "c.name");
 	if (!client_filter_expr.empty())
 	{
 		where = " WHERE " + client_filter_expr;
@@ -4134,10 +4635,11 @@ bool remove_malformed_file_rows(IDatabase* db, const std::string& client_filter,
 }
 
 bool remove_missing_file_rows(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex,
 	const std::string& new_storage_prefix, bool apply, bool report_malformed_rows, SStats& stats)
 {
 	std::string where;
-	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	const std::string client_filter_expr = client_filter_sql_expr(db, client_filter, client_regex, "c.name");
 	if (!client_filter_expr.empty())
 	{
 		where = " WHERE " + client_filter_expr;
@@ -4241,11 +4743,12 @@ std::string valid_file_row_sql_predicate()
 		"AND f.clientid IS NULL AND f.incremental IS NULL)";
 }
 
-bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter, bool apply, SStats& stats)
+bool drop_empty_file_backups(IDatabase* db, const std::string& client_filter,
+	const std::string& client_regex, bool apply, SStats& stats)
 {
 	std::string where = " WHERE NOT EXISTS (SELECT 1 FROM curr_files.files f WHERE f.backupid=b.id AND "
 		+ valid_file_row_sql_predicate() + ")";
-	const std::string client_filter_expr = client_filter_sql_expr(client_filter, "c.name");
+	const std::string client_filter_expr = client_filter_sql_expr(db, client_filter, client_regex, "c.name");
 	if (!client_filter_expr.empty())
 	{
 		where += " AND " + client_filter_expr;
@@ -4359,6 +4862,8 @@ int reconcile_storage()
 	}
 	const std::string backup_database_dir = strip_trailing_sep(Server->getServerParameter("backup_database"));
 	const std::string client_filter = Server->getServerParameter("client");
+	const std::string client_regex = Server->getServerParameter("client_regex");
+	const std::string interval_param = Server->getServerParameter("interval");
 	const bool apply = Server->getServerParameter("apply") == "true";
 	const bool skip_db_backup = Server->getServerParameter("skip_db_backup") == "true";
 	const bool migrate_existing_file_paths = Server->getServerParameter("migrate_existing_file_paths") == "true";
@@ -4378,6 +4883,18 @@ int reconcile_storage()
 	}
 	const bool drop_empty_backups = Server->getServerParameter("drop_empty_backups") == "true";
 	const bool have_import_db = !import_db_dir.empty();
+
+	std::vector<std::regex> parsed_client_regexes;
+	if (!client_regex.empty() && !parse_client_regex_list(client_regex, parsed_client_regexes))
+	{
+		return 1;
+	}
+
+	std::vector<SBackupInterval> parsed_intervals;
+	if (!interval_param.empty() && !parse_interval_param(interval_param, parsed_intervals))
+	{
+		return 1;
+	}
 
 	const bool has_action = have_import_db
 		|| migrate_existing_file_paths
@@ -4420,6 +4937,14 @@ int reconcile_storage()
 	if (!client_filter.empty())
 	{
 		Server->Log("Restricting reconciliation to client set \"" + client_filter + "\"", LL_INFO);
+	}
+	if (!client_regex.empty())
+	{
+		Server->Log("Restricting reconciliation to client regex patterns", LL_INFO);
+	}
+	if (!interval_param.empty())
+	{
+		Server->Log("Restricting reconciliation to specified backup interval(s)", LL_INFO);
 	}
 	if (import_db_dir.empty())
 	{
@@ -4527,7 +5052,7 @@ int reconcile_storage()
 
 	if (remove_malformed_file_rows_enabled)
 	{
-		ok = ok && remove_malformed_file_rows(db, client_filter, apply, stats);
+		ok = ok && remove_malformed_file_rows(db, client_filter, client_regex, apply, stats);
 	}
 	else
 	{
@@ -4536,7 +5061,7 @@ int reconcile_storage()
 
 	if (have_import_db)
 	{
-		ok = ok && reconcile_missing_backups(db, client_filter, new_storage_prefix, apply, stats);
+		ok = ok && reconcile_missing_backups(db, client_filter, client_regex, new_storage_prefix, apply, stats);
 	}
 	else
 	{
@@ -4546,7 +5071,7 @@ int reconcile_storage()
 	if (recreate_missing_dataset_links_enabled)
 	{
 		warn_if_dataset_detection_failed();
-		ok = ok && recreate_missing_dataset_links(db, client_filter, new_storage_prefix, apply, stats);
+		ok = ok && recreate_missing_dataset_links(db, client_filter, client_regex, parsed_intervals, new_storage_prefix, apply, stats);
 	}
 	else
 	{
@@ -4556,7 +5081,7 @@ int reconcile_storage()
 	if (remove_untracked_datasets_enabled)
 	{
 		warn_if_dataset_detection_failed();
-		ok = ok && remove_untracked_datasets(db, client_filter, new_storage_prefix,
+		ok = ok && remove_untracked_datasets(db, client_filter, client_regex, parsed_intervals, new_storage_prefix,
 			min_dataset_age_hours > 0 ? min_dataset_age_hours : 2, apply, stats);
 	}
 	else
@@ -4566,7 +5091,7 @@ int reconcile_storage()
 
 	if (import_missing_dataset_backups_enabled)
 	{
-		ok = ok && import_missing_dataset_backups(db, client_filter, new_storage_prefix, apply, ignore_read_errors, rehash_files, stats);
+		ok = ok && import_missing_dataset_backups(db, client_filter, client_regex, parsed_intervals, new_storage_prefix, apply, ignore_read_errors, rehash_files, stats);
 	}
 	else
 	{
@@ -4576,7 +5101,7 @@ int reconcile_storage()
 	bool report_malformed_rows_in_scan = !remove_malformed_file_rows_enabled;
 	if (migrate_existing_file_paths)
 	{
-		ok = ok && migrate_current_file_paths(db, client_filter, new_storage_prefix, apply,
+		ok = ok && migrate_current_file_paths(db, client_filter, client_regex, new_storage_prefix, apply,
 			report_malformed_rows_in_scan, stats);
 		report_malformed_rows_in_scan = false;
 	}
@@ -4586,7 +5111,7 @@ int reconcile_storage()
 	}
 	if (remove_missing_files)
 	{
-		ok = ok && remove_missing_file_rows(db, client_filter, new_storage_prefix, apply,
+		ok = ok && remove_missing_file_rows(db, client_filter, client_regex, new_storage_prefix, apply,
 			report_malformed_rows_in_scan, stats);
 		report_malformed_rows_in_scan = false;
 	}
@@ -4596,7 +5121,7 @@ int reconcile_storage()
 	}
 	if (drop_empty_backups)
 	{
-		ok = ok && drop_empty_file_backups(db, client_filter, apply, stats);
+		ok = ok && drop_empty_file_backups(db, client_filter, client_regex, apply, stats);
 	}
 	else
 	{
