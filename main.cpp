@@ -637,11 +637,11 @@ int main_fkt(int argc, char *argv[])
 	Server->Log("Shutting down plugins...");
 	Server->ShutdownPlugins();
 
-	Server->Log("Deleting server...");
-	delete Server;
-	
+	// Avoid use-after-free by background threads during shutdown (matching Windows service behavior)
 	sqlite3_free(sqlite3_temp_directory);
 
+	Server->Log("Server shutdown complete.");
+	_exit(0);
 #endif
 	return 0;
 }

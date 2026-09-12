@@ -1027,27 +1027,38 @@ DLLEXPORT void LoadActions(IServer* pServer)
 
 DLLEXPORT void UnloadActions(void)
 {
-	unsigned int wtime=500;
+	unsigned int wtime=30000;
 	if(is_leak_check)
-		wtime=10000;
+		wtime=30000;
 
 	bool shutdown_ok=false;
 	if(server_exit_pipe!=NULL)
 	{
 		std::string msg="exit";
 		int64 starttime=Server->getTimeMS();
+		int64 last_log=starttime;
 		while(msg!="ok" && Server->getTimeMS()-starttime<wtime)
 		{
 			server_exit_pipe->Write("exit");
 			Server->wait(100);
 			server_exit_pipe->Read(&msg, 0);
+			if(Server->getTimeMS()-last_log > 2000)
+			{
+				Server->Log("Waiting for backup server to exit...", LL_INFO);
+				last_log = Server->getTimeMS();
+			}
 		}
 
 		if(msg=="ok")
 		{
 			Server->destroy(server_exit_pipe);
+			server_exit_pipe = NULL;
 			BackupServer::cleanupThrottlers();
 			shutdown_ok=true;
+		}
+		else
+		{
+			Server->Log("Backup server did not acknowledge exit within timeout.", LL_WARNING);
 		}
 	}
 	
@@ -1097,11 +1108,7 @@ DLLEXPORT void UnloadActions(void)
 
 	if (!shutdown_ok)
 	{
-		for (size_t i = 0; i < db_ids.size(); ++i)
-		{
-			IDatabase *db = Server->getDatabase(Server->getThreadID(), db_ids[i]);
-			db->BeginWriteTransaction();
-		}
+		Server->Log("Shutdown incomplete - skipping database destruction to avoid crashes.", LL_WARNING);
 	}
 	else
 	{
