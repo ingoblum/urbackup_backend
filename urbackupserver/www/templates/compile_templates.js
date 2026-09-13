@@ -1,6 +1,19 @@
 var fs = require('fs');
 var path = require('path');
-var dust = require("dustjs-linkedin");
+var dust;
+// Attempt to load dust from installed dustjs-linkedin package;
+// fallback to evaluating the bundled ../js/dust-full.min.js in a vm context
+// if npm package is not installed in the environment.
+try {
+    dust = require("dustjs-linkedin");
+} catch(e) {
+    var vm = require('vm');
+    var ctx = {};
+    ctx.window = ctx;
+    vm.createContext(ctx);
+    vm.runInContext(fs.readFileSync('../js/dust-full.min.js', 'utf8'), ctx);
+    dust = ctx.dust;
+}
 var EventEmitter=require('events').EventEmitter,
     filesEE=new EventEmitter();
 

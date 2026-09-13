@@ -63,6 +63,12 @@
 					<a class="btn btn-sm btn-primary" href="javascript: addNewClient1();"><span class="glyphicon glyphicon-plus" aria-hidden="true"></span> {tAdd new client}</a>
 				</div>
 			{/allow_add_client}
+			{! Button to trigger manual backup storage cleanup !}
+			{?can_start_cleanup}
+				<div class="btn-group" style="margin-left: 20px;">
+					<a class="btn btn-sm btn-default" href="javascript: startCleanup();"><span class="glyphicon glyphicon-trash" aria-hidden="true"></span> {tStart cleanup}</a>
+				</div>
+			{/can_start_cleanup}
 		</div>
 		
 		{?removed_clients_table}

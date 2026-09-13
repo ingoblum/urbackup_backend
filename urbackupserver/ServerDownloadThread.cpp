@@ -127,17 +127,25 @@ void ServerDownloadThread::operator()( void )
 		{
 			if(curr.patch_dl_files.prepared)
 			{
-				delete curr.patch_dl_files.orig_file;
-				curr.patch_dl_files.orig_file = NULL;
+				// IFile inherits from IObject. In UrBackup, IObjects must be removed via Remove()
+				// (which invokes the virtual destructor / custom cleanup), never with raw C++ delete.
+				if (curr.patch_dl_files.orig_file != NULL)
+				{
+					curr.patch_dl_files.orig_file->Remove();
+					curr.patch_dl_files.orig_file = NULL;
+				}
 				ScopedDeleteFile del_1(curr.patch_dl_files.patchfile);
+				curr.patch_dl_files.patchfile = NULL;
 				ScopedDeleteFile del_2(curr.patch_dl_files.hashoutput);
+				curr.patch_dl_files.hashoutput = NULL;
 				if(curr.patch_dl_files.delete_chunkhashes)
 				{
 					ScopedDeleteFile del_3(curr.patch_dl_files.chunkhashes);
+					curr.patch_dl_files.chunkhashes = NULL;
 				}
-				else
+				else if (curr.patch_dl_files.chunkhashes != NULL)
 				{
-					delete curr.patch_dl_files.chunkhashes;
+					curr.patch_dl_files.chunkhashes->Remove();
 					curr.patch_dl_files.chunkhashes = NULL;
 				}
 				curr.patch_dl_files.prepared = false;
@@ -207,17 +215,27 @@ void ServerDownloadThread::operator()( void )
 
 			if(curr.patch_dl_files.prepared)
 			{
-				delete curr.patch_dl_files.orig_file;
+				// Safely destroy IObjects via Remove() rather than raw C++ delete
+				if (curr.patch_dl_files.orig_file != NULL)
+				{
+					curr.patch_dl_files.orig_file->Remove();
+					curr.patch_dl_files.orig_file = NULL;
+				}
 				ScopedDeleteFile del_1(curr.patch_dl_files.patchfile);
+				curr.patch_dl_files.patchfile = NULL;
 				ScopedDeleteFile del_2(curr.patch_dl_files.hashoutput);
+				curr.patch_dl_files.hashoutput = NULL;
 				if(curr.patch_dl_files.delete_chunkhashes)
 				{
 					ScopedDeleteFile del_3(curr.patch_dl_files.chunkhashes);
+					curr.patch_dl_files.chunkhashes = NULL;
 				}
-				else
+				else if (curr.patch_dl_files.chunkhashes != NULL)
 				{
-					delete curr.patch_dl_files.chunkhashes;
+					curr.patch_dl_files.chunkhashes->Remove();
+					curr.patch_dl_files.chunkhashes = NULL;
 				}
+				curr.patch_dl_files.prepared = false;
 			}
 
 			continue;
@@ -1119,36 +1137,56 @@ void ServerDownloadThread::queueStop()
 	cond->notify_one();
 }
 
-// Cleans up the queue instantly, deletes temporary prepared patch files on disk,
-// and notifies all waiters so threads terminate within milliseconds instead of
-// processing remaining items as incomplete files.
+// Cleans up unqueued items instantly and notifies all waiters so threads terminate quickly.
+// BUGFIX / EXPLANATION:
+// Items that have it->queued == true are actively being transferred / processed by FileClientChunked
+// or a worker thread. Deleting their IFile pointers out from underneath them causes a fatal
+// use-after-free and double-free crash (SIGSEGV in virtual method table / destructor calls).
+// Therefore, in-flight queued items are left to be cleanly destroyed by their own local
+// ObjectScope and ScopedDeleteFile stack guards on the worker thread upon abort/socket error.
+// Only unqueued prepared items are deleted here, using IObject::Remove() rather than raw delete.
 void ServerDownloadThread::abort()
 {
 	IScopedLock lock(mutex);
 	aborted = true;
 	is_offline = true;
 	skipping = true;
-	for (std::deque<SQueueItem>::iterator it = dl_queue.begin(); it != dl_queue.end(); ++it)
+	for (std::deque<SQueueItem>::iterator it = dl_queue.begin(); it != dl_queue.end(); )
 	{
+		if (it->queued)
+		{
+			// In-flight item actively handled by FileClientChunked or worker thread.
+			// Do not delete here; the worker thread and its ObjectScope/ScopedDeleteFile
+			// stack guards will clean it up safely without use-after-free.
+			++it;
+			continue;
+		}
+
 		if (it->patch_dl_files.prepared)
 		{
-			delete it->patch_dl_files.orig_file;
-			it->patch_dl_files.orig_file = NULL;
+			if (it->patch_dl_files.orig_file != NULL)
+			{
+				it->patch_dl_files.orig_file->Remove();
+				it->patch_dl_files.orig_file = NULL;
+			}
 			ScopedDeleteFile del_1(it->patch_dl_files.patchfile);
+			it->patch_dl_files.patchfile = NULL;
 			ScopedDeleteFile del_2(it->patch_dl_files.hashoutput);
+			it->patch_dl_files.hashoutput = NULL;
 			if (it->patch_dl_files.delete_chunkhashes)
 			{
 				ScopedDeleteFile del_3(it->patch_dl_files.chunkhashes);
+				it->patch_dl_files.chunkhashes = NULL;
 			}
-			else
+			else if (it->patch_dl_files.chunkhashes != NULL)
 			{
-				delete it->patch_dl_files.chunkhashes;
+				it->patch_dl_files.chunkhashes->Remove();
 				it->patch_dl_files.chunkhashes = NULL;
 			}
 			it->patch_dl_files.prepared = false;
 		}
+		it = dl_queue.erase(it);
 	}
-	dl_queue.clear();
 	queue_size = 0;
 	SQueueItem ni;
 	ni.action = EQueueAction_Quit;
@@ -1258,7 +1296,15 @@ IFsFile * ServerDownloadThread::getTempFile()
 	{
 		size_t num = tmpfile_num++;
 			
-		std::string fn = backuppath + os_file_sep() + tmpfile_dirname + os_file_sep() + convert(num);
+		// BUGFIX / EXPLANATION:
+		// When use_tmpfiles is disabled, tmpfile_num is an instance member variable. Because UrBackup
+		// spawns multiple concurrent ServerDownloadThreads writing into the exact same tmpfile_dirname,
+		// without thread_idx each thread starts at 0 and writes temporary files 0, 1, 2, 5... into the
+		// same directory. When one thread finishes and moves/deletes file 5, another thread tries to open
+		// or read its own file 5 and encounters ENOENT (ec=2). That disk error triggered the fail-fast
+		// abort, which then exposed the use-after-free segfault above.
+		// Prefixing the filename with convert(thread_idx) + "_" guarantees unique temporary files.
+		std::string fn = backuppath + os_file_sep() + tmpfile_dirname + os_file_sep() + convert(thread_idx) + "_" + convert(num);
 		pfd = Server->openFile(os_file_prefix(fn), MODE_RW_CREATE);
 
 		if (pfd == NULL)

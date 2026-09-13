@@ -53,6 +53,9 @@ IMutex *ServerCleanupThread::a_mutex=NULL;
 bool ServerCleanupThread::update_stats_interruptible=false;
 volatile bool ServerCleanupThread::do_quit=false;
 bool ServerCleanupThread::update_stats_disabled = false;
+// Flags for immediate manual cleanup trigger and active execution tracking
+bool ServerCleanupThread::manual_cleanup = false;
+bool ServerCleanupThread::is_running_cleanup = false;
 std::map<int, size_t> ServerCleanupThread::locked_images;
 IMutex* ServerCleanupThread::cleanup_lock_mutex = NULL;
 bool ServerCleanupThread::allow_clientlist_deletion = true;
@@ -300,7 +303,8 @@ void ServerCleanupThread::operator()(void)
 
 		{
 			IScopedLock lock(mutex);
-			if(!update_stats)
+			// Wake up immediately if an immediate manual cleanup or stats update was triggered
+			if(!update_stats && !manual_cleanup)
 			{
 				cond->wait(&lock, 3600000);
 			}
@@ -339,11 +343,30 @@ void ServerCleanupThread::operator()(void)
 			int chour=watoi(res[0]["time"]);
 			ServerSettings settings(db);
 			std::vector<STimeSpan> tw=settings.getCleanupWindow();
-			if( ( (!tw.empty() && ServerSettings::isInTimeSpan(tw)) || ( tw.empty() && (chour==3 || chour==4) ) )
-				&& Server->getTimeSeconds()-last_cleanup>min_cleanup_interval
+			// Check whether a manual cleanup run was requested via startCleanupNow()
+			bool trigger_cleanup = false;
+			{
+				IScopedLock lock(mutex);
+				if (manual_cleanup)
+				{
+					trigger_cleanup = true;
+					manual_cleanup = false;
+				}
+			}
+			// Bypass configured cleanup time window and min interval if manually triggered
+			if( ( trigger_cleanup || (!tw.empty() && ServerSettings::isInTimeSpan(tw)) || ( tw.empty() && (chour==3 || chour==4) ) )
+				&& ( trigger_cleanup || Server->getTimeSeconds()-last_cleanup>min_cleanup_interval )
 				&& os_directory_exists(settings.getSettings()->backupfolder) )
 			{
 				IScopedLock lock(a_mutex);
+				{
+					IScopedLock lock_m(mutex);
+					is_running_cleanup = true;
+				}
+				if (trigger_cleanup)
+				{
+					Server->Log("Manual cleanup started...", LL_INFO);
+				}
 
 				ISettingsReader *settings=Server->createDBSettingsReader(db, "settings_db.settings",
 					"SELECT value FROM settings_db.settings WHERE key=? AND clientid=0");
@@ -414,11 +437,30 @@ void ServerCleanupThread::operator()(void)
 				Server->clearDatabases(Server->getThreadID());
 
 				last_cleanup=Server->getTimeSeconds();
+				{
+					IScopedLock lock_m(mutex);
+					is_running_cleanup = false;
+				}
 			}
 		}
 	}
 
 	delete this;
+}
+
+// Wakes the cleanup thread and triggers immediate cleanup bypassing schedule windows
+void ServerCleanupThread::startCleanupNow()
+{
+	IScopedLock lock(mutex);
+	manual_cleanup = true;
+	cond->notify_all();
+}
+
+// Thread-safe query whether cleanup is actively running
+bool ServerCleanupThread::isRunningCleanup()
+{
+	IScopedLock lock(mutex);
+	return is_running_cleanup;
 }
 
 void ServerCleanupThread::updateStats(bool interruptible)

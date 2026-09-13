@@ -26,6 +26,7 @@
 #include "../server.h"
 #include "../ClientMain.h"
 #include "../dao/ServerBackupDao.h"
+#include "../server_cleanup.h"
 
 #include <algorithm>
 #include <memory>
@@ -313,9 +314,25 @@ ACTION_IMPL(status)
 			}
 		}
 
+		// Handle manual backup storage cleanup trigger from the status page (admin only)
+		if (rights == "all" && POST.find("start_cleanup") != POST.end())
+		{
+			if (ServerCleanupThread::isRunningCleanup())
+			{
+				ret.set("cleanup_already_running", true);
+			}
+			else
+			{
+				ServerCleanupThread::startCleanupNow();
+				ret.set("cleanup_started", true);
+			}
+		}
+
 		if(rights=="all")
 		{
 			ret.set("has_status_check", true);
+			// Allow admin users to trigger manual cleanup from the status page UI
+			ret.set("can_start_cleanup", true);
 
 			if(ServerStatus::getServerNospcStalled()>0)
 			{

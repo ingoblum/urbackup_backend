@@ -89,6 +89,11 @@ public:
 
 	static void removeUnknown(bool dry_run=false);
 
+	// Trigger immediate cleanup (bypasses window/interval and wakes the cleanup thread)
+	static void startCleanupNow();
+	// Check whether a cleanup run is actively executing
+	static bool isRunningCleanup();
+
 	static void updateStats(bool interruptible);
 
 	static bool isUpdateingStats();
@@ -204,6 +209,9 @@ private:
 	static bool update_stats;
 	static bool update_stats_interruptible;
 	static bool update_stats_disabled;
+	// Flags to request an immediate manual cleanup run and track its execution state
+	static bool manual_cleanup;
+	static bool is_running_cleanup;
 	
 	std::vector<int> removeerr;
 

@@ -1,4 +1,4 @@
-﻿g.main_nav_pos=5;
+g.main_nav_pos=5;
 g.loading=false;
 g.lang="-";
 g.startup=true;
@@ -1532,7 +1532,9 @@ function show_status2(data)
 		dlt_mod_start: dlt_mod_start, dlt_mod_end: dlt_mod_end, internet_client_added: data.added_new_client, new_authkey: data.new_authkey, new_clientname: data.new_clientname,
 		status_client_download_windows: status_client_download_windows, status_client_download_linux: status_client_download_linux,
 		database_error: database_error, removed_clients_table: removed_clients.length>0, removed_clients: removed_clients,
-		has_client_download: has_client_download, allow_add_client:allow_add_client});
+		has_client_download: has_client_download, allow_add_client:allow_add_client,
+		// Flag indicating administrative rights to trigger manual cleanup
+		can_start_cleanup: data.can_start_cleanup});
 	
 	if(g.data_f!=ndata)
 	{
@@ -6111,6 +6113,51 @@ function getServerUrlPlaceholder()
 	site_url+="socket";
 
 	return site_url;
+}
+
+// Prompts the administrator for confirmation and triggers an immediate backup cleanup run
+function startCleanup()
+{
+	var msg = trans("really_start_cleanup");
+	if (!msg || msg == "really_start_cleanup")
+	{
+		msg = "Möchten Sie die Bereinigung des Backup-Speichers jetzt wirklich starten? Abgelaufene Sicherungen werden dabei gemäß den Aufbewahrungsregeln gelöscht.";
+	}
+	if (confirm(msg))
+	{
+		if(!startLoading()) return;
+		new getJSON("status", "start_cleanup=true", function(data) {
+			stopLoading();
+			if (data && data.cleanup_started)
+			{
+				var started_msg = trans("cleanup_started");
+				if (!started_msg || started_msg == "cleanup_started")
+				{
+					started_msg = "Die Bereinigung wurde im Hintergrund gestartet.";
+				}
+				alert(started_msg);
+			}
+			else if (data && data.cleanup_already_running)
+			{
+				var running_msg = trans("cleanup_already_running");
+				if (!running_msg || running_msg == "cleanup_already_running")
+				{
+					running_msg = "Die Bereinigung läuft bereits im Hintergrund.";
+				}
+				alert(running_msg);
+			}
+			else
+			{
+				var failed_msg = trans("cleanup_start_failed");
+				if (!failed_msg || failed_msg == "cleanup_start_failed")
+				{
+					failed_msg = "Die Bereinigung konnte nicht gestartet werden.";
+				}
+				alert(failed_msg);
+			}
+			show_status1();
+		});
+	}
 }
 
 function addNewClient1()
