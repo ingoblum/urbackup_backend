@@ -88,6 +88,7 @@ void BackupServerPrepareHash::operator()(void)
 		}
 		else if(data=="abort")
 		{
+			// Propagate abort down the pipeline to server_hash and discard further hash jobs
 			aborted = true;
 			output->Write("abort");
 			pipe->Write("abort");
@@ -96,6 +97,8 @@ void BackupServerPrepareHash::operator()(void)
 
 		if(rc>0)
 		{
+			// In abort mode, quickly drain the pipe and delete temporary files created
+			// during download (temp_fn, hashoutput_fn) without performing CPU/IO heavy hashing.
 			if (aborted)
 			{
 				CRData rd(&data);

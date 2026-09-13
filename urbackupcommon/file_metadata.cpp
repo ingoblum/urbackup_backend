@@ -181,6 +181,10 @@ bool write_file_metadata(IFile* out, INotEnoughSpaceCallback *cb, const FileMeta
 		{
 			if(!overwrite_existing)
 			{
+				// Parallel FileMetadataDownloadThread and server_hash can race on sidecar files (.hashes).
+				// FileMetadataDownloadThread writes 8 bytes header + metadata (e.g. 115 bytes total) with overwrite_existing=true.
+				// If that thread finishes first, server_hash arrives here with overwrite_existing=false expecting out->Size() == hashdata_size (8).
+				// Instead of failing and aborting the backup snapshot (@ro), check if valid metadata magic is already written.
 				if(out->Seek(hashdata_size))
 				{
 					_u32 existing_meta_size = get_metadata_size(out);

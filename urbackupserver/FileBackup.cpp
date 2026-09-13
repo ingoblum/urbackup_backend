@@ -1259,6 +1259,7 @@ void FileBackup::waitForFileThreads(bool aborted)
 	SStatus status=ServerStatus::getStatus(clientname);
 	if (aborted)
 	{
+		// Signal hash and worker threads to discard remaining queue elements and delete temp files
 		hashpipe->Write("abort");
 		hashpipe_prepare->Write("abort");
 	}

@@ -94,6 +94,8 @@ private:
 	
 	volatile bool working;
 	volatile bool has_error;
+	// Set when "abort" is received over the pipe; indicates that any remaining items
+	// in the pipe should have their temporary files deleted and be discarded without hashing.
 	volatile bool aborted;
 
 	logid_t logid;

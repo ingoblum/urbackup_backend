@@ -176,6 +176,8 @@ void BackupServerHash::operator()(void)
 
 		if(rc>0)
 		{
+			// In abort mode, drain items rapidly, remove temporary files, and skip all
+			// file linking, block copying, and database transactions.
 			if (aborted)
 			{
 				CRData rd(&data);

@@ -94,6 +94,7 @@ void ServerDownloadThread::operator()( void )
 			IScopedLock lock(mutex);
 			while(dl_queue.empty())
 			{
+				// Fast exit: do not block waiting for incoming items if an abort was triggered
 				if (aborted)
 				{
 					break;
@@ -120,6 +121,8 @@ void ServerDownloadThread::operator()( void )
 			}			
 		}
 
+		// On abort or quit, immediately release and delete any prepared patch download files
+		// (pfd, hashoutput, chunkhashes) to prevent disk space leaks and avoid wasteful processing.
 		if(curr.action==EQueueAction_Quit || aborted)
 		{
 			if(curr.patch_dl_files.prepared)
@@ -156,6 +159,9 @@ void ServerDownloadThread::operator()( void )
 			continue;
 		}
 
+		// When aborted, skip the legacy incomplete file copy/linking phase completely.
+		// Previously, skipping=true looped through the entire queue running link_or_copy_file()
+		// and pushed thousands of incomplete files to hashpipe_prepare, taking hours/days.
 		if(!aborted && (is_offline || skipping))
 		{
 			if(curr.fileclient== EFileClient_Chunked)
@@ -1113,6 +1119,9 @@ void ServerDownloadThread::queueStop()
 	cond->notify_one();
 }
 
+// Cleans up the queue instantly, deletes temporary prepared patch files on disk,
+// and notifies all waiters so threads terminate within milliseconds instead of
+// processing remaining items as incomplete files.
 void ServerDownloadThread::abort()
 {
 	IScopedLock lock(mutex);

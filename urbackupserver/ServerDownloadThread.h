@@ -213,6 +213,8 @@ public:
 
 	void queueSkip();
 
+	// Immediately aborts pending transfers, drains dl_queue, and deletes temporary patch files
+	// to return within seconds instead of processing remaining files as incomplete backups.
 	void abort();
 
 	void queueScriptEnd(const SQueueItem &todl);
@@ -362,5 +364,6 @@ private:
 
 	ActiveDlIds& active_dls_ids;
 
+	// Flag indicating an emergency abort has been triggered (by admin stop or fatal server disk error).
 	volatile bool aborted;
 };

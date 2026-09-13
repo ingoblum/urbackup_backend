@@ -728,9 +728,16 @@ bool IncrFileBackup::doFileBackup()
 								backup_stopped = true;
 								should_backoff = false;
 								ServerLogger::Log(logid, "Server admin stopped backup.", LL_ERROR);
+								// Fast-Cancel: abort() immediately drains queues and cleans up temp files
+								// instead of spending hours copying remaining items as incomplete files.
 								server_download->abort();
 							}
 
+							// Fail-Fast: Detect severe server-side disk/database write errors immediately.
+							// Previously bsh[i]->hasError() was only checked at the very end of the backup,
+							// meaning a disk error early on would still let UrBackup transfer terabytes for days
+							// before ultimately discarding the backup. Client-side read errors (e.g. unreadable
+							// WSL/Cygwin files CANNOT_OPEN_FILE) are tolerated when ignore_disk_errors is set.
 							bool server_worker_disk_error = false;
 							for (size_t i = 0; i < bsh.size(); ++i)
 							{
@@ -1445,6 +1452,7 @@ bool IncrFileBackup::doFileBackup()
 			break;
 		}
 
+		// Fail-Fast: poll worker disk errors during download loop so we exit immediately
 		bool server_worker_disk_error = false;
 		for (size_t i = 0; i < bsh.size(); ++i)
 		{
@@ -1523,6 +1531,7 @@ bool IncrFileBackup::doFileBackup()
 
 	ServerLogger::Log(logid, "Waiting for file hashing and copying threads...", LL_INFO);
 
+	// Inform waitForFileThreads whether we are shutting down abnormally so pipes can be aborted quickly
 	bool backup_aborted = r_offline || c_has_error || disk_error || ServerStatus::getProcess(clientname, status_id).stop;
 	waitForFileThreads(backup_aborted);
 

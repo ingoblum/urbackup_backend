@@ -16,6 +16,7 @@ public:
 
 	void queueSkip();
 
+	// Broadcasts abort to all download worker threads to drain queues immediately.
 	void abort();
 
 	bool sleepQueue();

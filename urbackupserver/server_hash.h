@@ -158,6 +158,7 @@ private:
 
 	volatile bool working;
 	volatile bool has_error;
+	// Flag to discard incoming pipeline items, clean up temporary files, and bypass SQL/linking.
 	volatile bool aborted;
 
 	IFsFile *chunk_output_fn;
