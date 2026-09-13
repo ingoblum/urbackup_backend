@@ -94,6 +94,7 @@ private:
 	
 	volatile bool working;
 	volatile bool has_error;
+	volatile bool aborted;
 
 	logid_t logid;
 

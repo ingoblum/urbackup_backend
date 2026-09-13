@@ -54,7 +54,7 @@ ServerDownloadThread::ServerDownloadThread( FileClient& fc, FileClientChunked* f
 	is_offline(false), client_main(client_main), filesrv_protocol_version(filesrv_protocol_version), skipping(false), queue_size(0),
 	all_downloads_ok(true), incremental_num(incremental_num), logid(logid), has_timeout(false), with_hashes(with_hashes), with_metadata(client_main->getProtocolVersions().file_meta>0), shares_without_snapshot(shares_without_snapshot),
 	with_sparse_hashing(with_sparse_hashing), exp_backoff(false), num_embedded_metadata_files(0), file_metadata_download(file_metadata_download), num_issues(0), last_snap_num_issues(0), has_disk_error(false), sc_failure_fatal(sc_failure_fatal),
-	tmpfile_num(0), filepath_corrections(filepath_corrections), max_file_id(max_file_id), thread_idx(thread_idx), active_dls_ids(active_dls_ids)
+	tmpfile_num(0), filepath_corrections(filepath_corrections), max_file_id(max_file_id), thread_idx(thread_idx), active_dls_ids(active_dls_ids), aborted(false)
 {
 	mutex = Server->createMutex();
 	cond = Server->createCondition();
@@ -94,7 +94,15 @@ void ServerDownloadThread::operator()( void )
 			IScopedLock lock(mutex);
 			while(dl_queue.empty())
 			{
+				if (aborted)
+				{
+					break;
+				}
 				cond->wait(&lock);
+			}
+			if (aborted && dl_queue.empty())
+			{
+				break;
 			}
 			curr = dl_queue.front();
 			dl_queue.pop_front();
@@ -112,10 +120,27 @@ void ServerDownloadThread::operator()( void )
 			}			
 		}
 
-		if(curr.action==EQueueAction_Quit)
+		if(curr.action==EQueueAction_Quit || aborted)
 		{
+			if(curr.patch_dl_files.prepared)
+			{
+				delete curr.patch_dl_files.orig_file;
+				curr.patch_dl_files.orig_file = NULL;
+				ScopedDeleteFile del_1(curr.patch_dl_files.patchfile);
+				ScopedDeleteFile del_2(curr.patch_dl_files.hashoutput);
+				if(curr.patch_dl_files.delete_chunkhashes)
+				{
+					ScopedDeleteFile del_3(curr.patch_dl_files.chunkhashes);
+				}
+				else
+				{
+					delete curr.patch_dl_files.chunkhashes;
+					curr.patch_dl_files.chunkhashes = NULL;
+				}
+				curr.patch_dl_files.prepared = false;
+			}
 			IScopedLock lock(mutex);
-			if(!dl_queue.empty())
+			if(!dl_queue.empty() && !aborted)
 			{
 				dl_queue.push_back(curr);
 				continue;
@@ -131,7 +156,7 @@ void ServerDownloadThread::operator()( void )
 			continue;
 		}
 
-		if(is_offline || skipping)
+		if(!aborted && (is_offline || skipping))
 		{
 			if(curr.fileclient== EFileClient_Chunked)
 			{
@@ -298,6 +323,10 @@ void ServerDownloadThread::addToQueueFull(size_t id, const std::string &fn, cons
 	}
 
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 
 	if(!at_front_postpone_quitstop)
 	{
@@ -355,6 +384,10 @@ void ServerDownloadThread::addToQueueChunked(size_t id, const std::string &fn, c
 	}
 
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 	dl_queue.push_back(ni);
 	cond->notify_one();
 
@@ -371,6 +404,10 @@ void ServerDownloadThread::addToQueueStartShadowcopy(const std::string& fn)
 	ni.patch_dl_files.prepare_error=false;
 
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 	dl_queue.push_back(ni);
 	cond->notify_one();
 }
@@ -385,6 +422,10 @@ void ServerDownloadThread::addToQueueStopShadowcopy(const std::string& fn)
 	ni.patch_dl_files.prepare_error=false;
 
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 	dl_queue.push_back(ni);
 	cond->notify_one();
 }
@@ -404,6 +445,10 @@ void ServerDownloadThread::queueScriptEnd(const SQueueItem &todl)
 	ni.script_random = todl.script_random;
 
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 
 	insertFullQueueEarliest(ni, false);
 
@@ -1056,12 +1101,50 @@ bool ServerDownloadThread::isOffline()
 
 void ServerDownloadThread::queueStop()
 {
+	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 	SQueueItem ni;
 	ni.action = EQueueAction_Quit;
 
-	IScopedLock lock(mutex);
 	dl_queue.push_back(ni);
 	cond->notify_one();
+}
+
+void ServerDownloadThread::abort()
+{
+	IScopedLock lock(mutex);
+	aborted = true;
+	is_offline = true;
+	skipping = true;
+	for (std::deque<SQueueItem>::iterator it = dl_queue.begin(); it != dl_queue.end(); ++it)
+	{
+		if (it->patch_dl_files.prepared)
+		{
+			delete it->patch_dl_files.orig_file;
+			it->patch_dl_files.orig_file = NULL;
+			ScopedDeleteFile del_1(it->patch_dl_files.patchfile);
+			ScopedDeleteFile del_2(it->patch_dl_files.hashoutput);
+			if (it->patch_dl_files.delete_chunkhashes)
+			{
+				ScopedDeleteFile del_3(it->patch_dl_files.chunkhashes);
+			}
+			else
+			{
+				delete it->patch_dl_files.chunkhashes;
+				it->patch_dl_files.chunkhashes = NULL;
+			}
+			it->patch_dl_files.prepared = false;
+		}
+	}
+	dl_queue.clear();
+	queue_size = 0;
+	SQueueItem ni;
+	ni.action = EQueueAction_Quit;
+	dl_queue.push_back(ni);
+	cond->notify_all();
 }
 
 bool ServerDownloadThread::isDownloadOk( size_t id )
@@ -1084,6 +1167,10 @@ size_t ServerDownloadThread::getMaxOkId()
 std::string ServerDownloadThread::getQueuedFileFull(FileClient::MetadataQueue& metadata, size_t& folder_items, bool& finish_script, int64& file_id)
 {
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return std::string();
+	}
 	int max_prepare = 1;
 	bool retry = true;
 	while (retry)
@@ -1230,6 +1317,10 @@ void ServerDownloadThread::resetQueueFull()
 bool ServerDownloadThread::getQueuedFileChunked( std::string& remotefn, IFile*& orig_file, IFile*& patchfile, IFile*& chunkhashes, IFsFile*& hashoutput, _i64& predicted_filesize, int64& file_id, bool& is_script)
 {
 	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return false;
+	}
 	bool retry=true;
 	while(retry)
 	{
@@ -1568,10 +1659,14 @@ bool ServerDownloadThread::deleteTempFolder()
 
 void ServerDownloadThread::queueSkip()
 {
+	IScopedLock lock(mutex);
+	if (aborted)
+	{
+		return;
+	}
 	SQueueItem ni;
 	ni.action = EQueueAction_Skip;
 
-	IScopedLock lock(mutex);
 	dl_queue.push_front(ni);
 	cond->notify_one();
 }

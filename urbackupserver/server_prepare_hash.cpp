@@ -60,6 +60,7 @@ BackupServerPrepareHash::BackupServerPrepareHash(IPipe *pPipe, IPipe *pOutput, i
 	chunk_patcher.setCallback(this);
 	chunk_patcher.setWithSparse(true);
 	has_error=false;
+	aborted=false;
 }
 
 BackupServerPrepareHash::~BackupServerPrepareHash(void)
@@ -85,9 +86,45 @@ void BackupServerPrepareHash::operator()(void)
 		{
 			continue;
 		}
+		else if(data=="abort")
+		{
+			aborted = true;
+			output->Write("abort");
+			pipe->Write("abort");
+			continue;
+		}
 
 		if(rc>0)
 		{
+			if (aborted)
+			{
+				CRData rd(&data);
+				int64 fileid;
+				rd.getVarInt(&fileid);
+				std::string temp_fn;
+				rd.getStr(&temp_fn);
+				int backupid;
+				rd.getInt(&backupid);
+				int incremental;
+				rd.getInt(&incremental);
+				char with_hashes;
+				rd.getChar(&with_hashes);
+				std::string tfn;
+				rd.getStr(&tfn);
+				std::string hashpath;
+				rd.getStr(&hashpath);
+				std::string hashoutput_fn;
+				rd.getStr(&hashoutput_fn);
+				if (!temp_fn.empty())
+				{
+					Server->deleteFile(os_file_prefix(temp_fn));
+				}
+				if (!hashoutput_fn.empty())
+				{
+					Server->deleteFile(os_file_prefix(hashoutput_fn));
+				}
+				continue;
+			}
 			working=true;
 			
 			CRData rd(&data);

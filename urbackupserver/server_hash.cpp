@@ -104,6 +104,7 @@ BackupServerHash::BackupServerHash(IPipe *pPipe, int pClientid, bool use_snapsho
 	space_logcnt=0;
 	working=false;
 	has_error=false;
+	aborted=false;
 	chunk_patcher.setCallback(this);
 	fileindex=NULL;
 
@@ -166,9 +167,52 @@ void BackupServerHash::operator()(void)
 		{
 			continue;
 		}
+		else if(data=="abort")
+		{
+			aborted = true;
+			pipe->Write("abort");
+			continue;
+		}
 
 		if(rc>0)
 		{
+			if (aborted)
+			{
+				CRData rd(&data);
+				int iaction;
+				rd.getInt(&iaction);
+				EAction action=static_cast<EAction>(iaction);
+				if(action==EAction_LinkOrCopy)
+				{
+					int64 fileid;
+					rd.getVarInt(&fileid);
+					std::string temp_fn;
+					rd.getStr(&temp_fn);
+					int backupid;
+					rd.getInt(&backupid);
+					int incremental;
+					rd.getInt(&incremental);
+					char with_hashes;
+					rd.getChar(&with_hashes);
+					std::string tfn;
+					rd.getStr(&tfn);
+					std::string hashpath;
+					rd.getStr(&hashpath);
+					std::string sha2;
+					rd.getStr(&sha2);
+					std::string hashoutput_fn;
+					rd.getStr(&hashoutput_fn);
+					if (!temp_fn.empty())
+					{
+						Server->deleteFile(os_file_prefix(temp_fn));
+					}
+					if (!hashoutput_fn.empty())
+					{
+						Server->deleteFile(os_file_prefix(hashoutput_fn));
+					}
+				}
+				continue;
+			}
 			CRData rd(&data);
 
 			int iaction;

@@ -16,6 +16,8 @@ public:
 
 	void queueSkip();
 
+	void abort();
+
 	bool sleepQueue();
 
 	bool isOffline();

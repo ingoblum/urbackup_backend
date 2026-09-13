@@ -299,7 +299,28 @@ bool FullFileBackup::doFileBackup()
 							r_offline = true;
 							should_backoff = false;
 							ServerLogger::Log(logid, "Server admin stopped backup.", LL_ERROR);
-							server_download->queueSkip();
+							server_download->abort();
+							break;
+						}
+
+						bool server_worker_disk_error = false;
+						for (size_t i = 0; i < bsh.size(); ++i)
+						{
+							if (bsh[i]->hasError()) { server_worker_disk_error = true; break; }
+						}
+						if (!server_worker_disk_error)
+						{
+							for (size_t i = 0; i < bsh_prepare.size(); ++i)
+							{
+								if (bsh_prepare[i]->hasError()) { server_worker_disk_error = true; break; }
+							}
+						}
+						if (server_worker_disk_error)
+						{
+							ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
+							server_download->abort();
+							disk_error = true;
+							r_offline = true;
 							break;
 						}
 
@@ -626,6 +647,35 @@ bool FullFileBackup::doFileBackup()
 
 	while(!server_download->join(1000))
 	{
+		if (ServerStatus::getProcess(clientname, status_id).stop)
+		{
+			ServerLogger::Log(logid, "Backup was stopped by user. Aborting file transfers...", LL_INFO);
+			server_download->abort();
+			r_offline = true;
+			break;
+		}
+
+		bool server_worker_disk_error = false;
+		for (size_t i = 0; i < bsh.size(); ++i)
+		{
+			if (bsh[i]->hasError()) { server_worker_disk_error = true; break; }
+		}
+		if (!server_worker_disk_error)
+		{
+			for (size_t i = 0; i < bsh_prepare.size(); ++i)
+			{
+				if (bsh_prepare[i]->hasError()) { server_worker_disk_error = true; break; }
+			}
+		}
+		if (server_worker_disk_error)
+		{
+			ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
+			server_download->abort();
+			disk_error = true;
+			r_offline = true;
+			break;
+		}
+
 		if(files_size==0)
 		{
 			ServerStatus::setProcessPcDone(clientname, status_id, 100);
@@ -691,7 +741,8 @@ bool FullFileBackup::doFileBackup()
 
 	ServerLogger::Log(logid, "Waiting for file hashing and copying threads...", LL_INFO);
 
-	waitForFileThreads();
+	bool backup_aborted = r_offline || c_has_error || disk_error || ServerStatus::getProcess(clientname, status_id).stop;
+	waitForFileThreads(backup_aborted);
 
 	if (!r_offline && !c_has_error && !disk_error)
 	{
@@ -701,7 +752,7 @@ bool FullFileBackup::doFileBackup()
 		}
 	}
 
-	stopFileMetadataDownloadThread(false, server_download->getNumEmbeddedMetadataFiles());
+	stopFileMetadataDownloadThread(backup_aborted, server_download->getNumEmbeddedMetadataFiles());
 
 	if (!r_offline && !c_has_error && !disk_error
 		&& client_main->getProtocolVersions().wtokens_version > 0 )

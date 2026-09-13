@@ -728,7 +728,28 @@ bool IncrFileBackup::doFileBackup()
 								backup_stopped = true;
 								should_backoff = false;
 								ServerLogger::Log(logid, "Server admin stopped backup.", LL_ERROR);
-								server_download->queueSkip();
+								server_download->abort();
+							}
+
+							bool server_worker_disk_error = false;
+							for (size_t i = 0; i < bsh.size(); ++i)
+							{
+								if (bsh[i]->hasError()) { server_worker_disk_error = true; break; }
+							}
+							if (!server_worker_disk_error)
+							{
+								for (size_t i = 0; i < bsh_prepare.size(); ++i)
+								{
+									if (bsh_prepare[i]->hasError()) { server_worker_disk_error = true; break; }
+								}
+							}
+							if (server_worker_disk_error)
+							{
+								ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
+								server_download->abort();
+								disk_error = true;
+								r_offline = true;
+								backup_stopped = true;
 							}
 						}
 
@@ -1170,7 +1191,7 @@ bool IncrFileBackup::doFileBackup()
 							{
 								ServerLogger::Log(logid, "Error getting parallel hash for file \"" + cf.name + "\" line " + convert(line)+" (2)", LL_ERROR);
 								r_offline = true;
-								server_download->queueSkip();
+								server_download->abort();
 								phash_load_offline = true;
 							}
 							else
@@ -1416,6 +1437,35 @@ bool IncrFileBackup::doFileBackup()
 
 	while(!server_download->join(1000))
 	{
+		if (ServerStatus::getProcess(clientname, status_id).stop)
+		{
+			ServerLogger::Log(logid, "Backup was stopped by user. Aborting file transfers...", LL_INFO);
+			server_download->abort();
+			r_offline = true;
+			break;
+		}
+
+		bool server_worker_disk_error = false;
+		for (size_t i = 0; i < bsh.size(); ++i)
+		{
+			if (bsh[i]->hasError()) { server_worker_disk_error = true; break; }
+		}
+		if (!server_worker_disk_error)
+		{
+			for (size_t i = 0; i < bsh_prepare.size(); ++i)
+			{
+				if (bsh_prepare[i]->hasError()) { server_worker_disk_error = true; break; }
+			}
+		}
+		if (server_worker_disk_error)
+		{
+			ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
+			server_download->abort();
+			disk_error = true;
+			r_offline = true;
+			break;
+		}
+
 		if(files_size==0)
 		{
 			ServerStatus::setProcessPcDone(clientname, status_id, 100);
@@ -1473,7 +1523,8 @@ bool IncrFileBackup::doFileBackup()
 
 	ServerLogger::Log(logid, "Waiting for file hashing and copying threads...", LL_INFO);
 
-	waitForFileThreads();
+	bool backup_aborted = r_offline || c_has_error || disk_error || ServerStatus::getProcess(clientname, status_id).stop;
+	waitForFileThreads(backup_aborted);
 
 	for (size_t i = 0; i < bsh.size(); ++i)
 	{
@@ -1494,7 +1545,7 @@ bool IncrFileBackup::doFileBackup()
 		}
 	}
 
-	stopFileMetadataDownloadThread(false, server_download->getNumEmbeddedMetadataFiles());
+	stopFileMetadataDownloadThread(backup_aborted, server_download->getNumEmbeddedMetadataFiles());
 
 	if (!r_offline && !c_has_error && !disk_error
 		&& client_main->getProtocolVersions().wtokens_version > 0)

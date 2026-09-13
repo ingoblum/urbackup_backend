@@ -158,6 +158,7 @@ private:
 
 	volatile bool working;
 	volatile bool has_error;
+	volatile bool aborted;
 
 	IFsFile *chunk_output_fn;
 	ChunkPatcher chunk_patcher;

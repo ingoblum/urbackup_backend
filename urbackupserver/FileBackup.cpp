@@ -1254,11 +1254,19 @@ void FileBackup::notifyClientBackupFailed()
 	client_main->sendClientMessageRetry("BACKUP FAILED " + params, "OK", "Sending status (BACKUP FAILED) to client failed", 10000, 2);
 }
 
-void FileBackup::waitForFileThreads(void)
+void FileBackup::waitForFileThreads(bool aborted)
 {
 	SStatus status=ServerStatus::getStatus(clientname);
-	hashpipe->Write("flush");
-	hashpipe_prepare->Write("flush");
+	if (aborted)
+	{
+		hashpipe->Write("abort");
+		hashpipe_prepare->Write("abort");
+	}
+	else
+	{
+		hashpipe->Write("flush");
+		hashpipe_prepare->Write("flush");
+	}
 	
 	size_t hashqueuesize=std::string::npos;
 	size_t prepare_hashqueuesize=0;
@@ -1267,7 +1275,7 @@ void FileBackup::waitForFileThreads(void)
 		if (hashqueuesize != std::string::npos)
 		{
 			ServerStatus::setProcessQueuesize(clientname, status_id, prepare_hashqueuesize, hashqueuesize);
-			Server->wait(1000);
+			Server->wait(aborted ? 50 : 1000);
 		}
 
 		size_t bsh_working = bsh.size() - hashpipe->getNumWaiters();
@@ -1281,9 +1289,9 @@ void FileBackup::waitForFileThreads(void)
 
 		while (hashpipe->getNumWaiters() < bsh.size())
 		{
-			Server->wait(1000);
+			Server->wait(aborted ? 50 : 1000);
 		}
-	}	
+	}
 
 	ServerStatus::setProcessQueuesize(clientname, status_id, 0, 0);
 }

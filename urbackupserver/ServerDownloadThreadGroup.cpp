@@ -112,6 +112,14 @@ void ServerDownloadThreadGroup::queueSkip()
 	}
 }
 
+void ServerDownloadThreadGroup::abort()
+{
+	for (size_t i = 0; i < dl_threads.size(); ++i)
+	{
+		dl_threads[i].dl_thread->abort();
+	}
+}
+
 bool ServerDownloadThreadGroup::sleepQueue()
 {
 	for (size_t i = 0; i < dl_threads.size(); ++i)

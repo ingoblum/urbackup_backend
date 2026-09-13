@@ -213,6 +213,8 @@ public:
 
 	void queueSkip();
 
+	void abort();
+
 	void queueScriptEnd(const SQueueItem &todl);
 	
 	bool load_file(SQueueItem todl);
@@ -359,4 +361,6 @@ private:
 	size_t thread_idx;
 
 	ActiveDlIds& active_dls_ids;
+
+	volatile bool aborted;
 };

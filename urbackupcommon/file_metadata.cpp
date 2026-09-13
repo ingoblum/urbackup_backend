@@ -181,6 +181,15 @@ bool write_file_metadata(IFile* out, INotEnoughSpaceCallback *cb, const FileMeta
 		{
 			if(!overwrite_existing)
 			{
+				if(out->Seek(hashdata_size))
+				{
+					_u32 existing_meta_size = get_metadata_size(out);
+					if(existing_meta_size > 0)
+					{
+						return true;
+					}
+				}
+
 				Server->Log("File \""+out->getFilename()+"\" has wrong size. Should="+convert(size_should)+" is="+convert(out->Size())+". Error writing metadata to file. -1", LL_WARNING);
 				return false;
 			}

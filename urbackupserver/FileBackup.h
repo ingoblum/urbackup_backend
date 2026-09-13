@@ -228,7 +228,7 @@ protected:
 	void sendBackupOkay(bool b_okay);
 	void notifyClientBackupSuccessful(void);
 	void notifyClientBackupFailed();
-	void waitForFileThreads();
+	void waitForFileThreads(bool aborted = false);
 	bool verify_file_backup(IFile *fileentries);
 	void save_debug_data(const std::string& rfn, const std::string& local_hash, const std::string& remote_hash);
 	std::string getSHA256(const std::string& fn);
