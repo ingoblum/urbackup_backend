@@ -43,8 +43,23 @@ namespace
 		EQueueAction_Skip
 	};
 
+	// Default constructor guarantees pointers and booleans are zero-initialized.
+	// Previously uninitialized when SQueueItem was pushed to dl_queue (e.g. for EQueueAction_Quit
+	// in queueStop/abort), causing prepared==true from stack garbage and fatal crashes when
+	// attempting to invoke Remove() on uninitialized pointer addresses.
 	struct SPatchDownloadFiles
 	{
+		SPatchDownloadFiles()
+			: prepared(false),
+			  prepare_error(false),
+			  orig_file(NULL),
+			  patchfile(NULL),
+			  chunkhashes(NULL),
+			  delete_chunkhashes(false),
+			  hashoutput(NULL)
+		{
+		}
+
 		bool prepared;
 		bool prepare_error;
 		IFile* orig_file;
@@ -60,14 +75,18 @@ namespace
 	{
 		SQueueItem()
 			: id(std::string::npos),
-			fileclient(EFileClient_Full),
-			queued(false),
-			action(EQueueAction_Fileclient),
-			is_script(false),
-			folder_items(0),
-			script_end(false),
-			switched(false),
-			write_metadata(false)
+			  predicted_filesize(0),
+			  fileclient(EFileClient_Full),
+			  queued(false),
+			  action(EQueueAction_Fileclient),
+			  patch_dl_files(),
+			  is_script(false),
+			  metadata_only(false),
+			  write_metadata(false),
+			  folder_items(0),
+			  script_end(false),
+			  script_random(0),
+			  switched(false)
 		{
 		}
 

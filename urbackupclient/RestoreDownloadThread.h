@@ -18,6 +18,12 @@ namespace
 
 	struct SPatchDownloadFiles
 	{
+		SPatchDownloadFiles()
+			: orig_file(NULL),
+			  chunkhashes(NULL)
+		{
+		}
+
 		IFsFile* orig_file;
 		IFile* chunkhashes;
 	};
@@ -33,11 +39,14 @@ namespace
 	{
 		SQueueItem()
 			: id(std::string::npos),
-			fileclient(EFileClient_Full),
-			queued(false),
-			action(EQueueAction_Fileclient),
-			is_script(false),
-			folder_items(0)
+			  predicted_filesize(0),
+			  fileclient(EFileClient_Full),
+			  metadata_only(false),
+			  queued(false),
+			  action(EQueueAction_Fileclient),
+			  patch_dl_files(),
+			  is_script(false),
+			  folder_items(0)
 		{
 		}
 

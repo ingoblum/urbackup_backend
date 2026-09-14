@@ -125,7 +125,7 @@ void ServerDownloadThread::operator()( void )
 		// (pfd, hashoutput, chunkhashes) to prevent disk space leaks and avoid wasteful processing.
 		if(curr.action==EQueueAction_Quit || aborted)
 		{
-			if(curr.patch_dl_files.prepared)
+			if(curr.patch_dl_files.prepared && !curr.queued)
 			{
 				// IFile inherits from IObject. In UrBackup, IObjects must be removed via Remove()
 				// (which invokes the virtual destructor / custom cleanup), never with raw C++ delete.
@@ -213,7 +213,7 @@ void ServerDownloadThread::operator()( void )
 				}
 			}
 
-			if(curr.patch_dl_files.prepared)
+			if(curr.patch_dl_files.prepared && !curr.queued)
 			{
 				// Safely destroy IObjects via Remove() rather than raw C++ delete
 				if (curr.patch_dl_files.orig_file != NULL)
@@ -1158,7 +1158,13 @@ void ServerDownloadThread::abort()
 			// In-flight item actively handled by FileClientChunked or worker thread.
 			// Do not delete here; the worker thread and its ObjectScope/ScopedDeleteFile
 			// stack guards will clean it up safely without use-after-free.
-			++it;
+			// Nullify pointers and erase from dl_queue so operator() never accesses them upon waking up.
+			it->patch_dl_files.prepared = false;
+			it->patch_dl_files.orig_file = NULL;
+			it->patch_dl_files.patchfile = NULL;
+			it->patch_dl_files.hashoutput = NULL;
+			it->patch_dl_files.chunkhashes = NULL;
+			it = dl_queue.erase(it);
 			continue;
 		}
 
@@ -1512,7 +1518,7 @@ SPatchDownloadFiles ServerDownloadThread::preparePatchDownloadFiles( const SQueu
 		ServerLogger::Log(logid, "Error creating temporary file 'hash_tmp' in load_file_patch", LL_ERROR);
 		return dlfiles;
 	}
-	ScopedDeleteFile hash_tmp_delete(pfd);
+	ScopedDeleteFile hash_tmp_delete(hash_tmp);
 
 	if(!server_token.empty())
 	{

@@ -335,7 +335,17 @@ int64 os_atoi64(const std::string &str)
 
 bool os_create_dir(const std::string &path)
 {
-	return mkdir(path.c_str(), S_IRWXU | S_IRWXG)==0;
+	if (mkdir(path.c_str(), S_IRWXU | S_IRWXG)==0)
+		return true;
+	if (errno == EEXIST)
+	{
+		// If directory already exists (e.g. created concurrently by another download thread),
+		// treat as success to avoid spurious recursive creation errors and warnings.
+		struct stat b;
+		if (stat(path.c_str(), &b)==0 && S_ISDIR(b.st_mode))
+			return true;
+	}
+	return false;
 }
 
 bool os_create_reflink(const std::string &linkname, const std::string &fname)
