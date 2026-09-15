@@ -112,11 +112,13 @@ void ServerDownloadThread::operator()( void )
 			{
 				if(curr.fileclient == EFileClient_Full)
 				{
-					queue_size-=queue_items_full;
+					if(queue_size >= queue_items_full) queue_size -= queue_items_full;
+					else queue_size = 0;
 				}
 				else if(curr.fileclient== EFileClient_Chunked)
 				{
-					queue_size-=queue_items_chunked;
+					if(queue_size >= queue_items_chunked) queue_size -= queue_items_chunked;
+					else queue_size = 0;
 				}
 			}			
 		}

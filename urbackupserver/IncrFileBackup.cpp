@@ -731,6 +731,7 @@ bool IncrFileBackup::doFileBackup()
 								// Fast-Cancel: abort() immediately drains queues and cleans up temp files
 								// instead of spending hours copying remaining items as incomplete files.
 								server_download->abort();
+								abortHashThreads();
 							}
 
 							// Fail-Fast: Detect severe server-side disk/database write errors immediately.
@@ -754,6 +755,7 @@ bool IncrFileBackup::doFileBackup()
 							{
 								ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
 								server_download->abort();
+								abortHashThreads();
 								disk_error = true;
 								r_offline = true;
 								backup_stopped = true;
@@ -1199,6 +1201,7 @@ bool IncrFileBackup::doFileBackup()
 								ServerLogger::Log(logid, "Error getting parallel hash for file \"" + cf.name + "\" line " + convert(line)+" (2)", LL_ERROR);
 								r_offline = true;
 								server_download->abort();
+								abortHashThreads();
 								phash_load_offline = true;
 							}
 							else
@@ -1448,6 +1451,7 @@ bool IncrFileBackup::doFileBackup()
 		{
 			ServerLogger::Log(logid, "Backup was stopped by user. Aborting file transfers...", LL_INFO);
 			server_download->abort();
+			abortHashThreads();
 			r_offline = true;
 			break;
 		}
@@ -1469,6 +1473,7 @@ bool IncrFileBackup::doFileBackup()
 		{
 			ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
 			server_download->abort();
+			abortHashThreads();
 			disk_error = true;
 			r_offline = true;
 			break;

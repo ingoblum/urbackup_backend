@@ -231,6 +231,7 @@ protected:
 	// Waits for hashing and worker threads to complete. When aborted=true,
 	// sends "abort" signal across pipes and polls with a fast 50ms interval
 	// so the backup shutdown completes in seconds rather than minutes/hours.
+	void abortHashThreads();
 	void waitForFileThreads(bool aborted = false);
 	bool verify_file_backup(IFile *fileentries);
 	void save_debug_data(const std::string& rfn, const std::string& local_hash, const std::string& remote_hash);

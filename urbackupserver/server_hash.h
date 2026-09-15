@@ -61,6 +61,11 @@ public:
 
 	bool hasError(void);
 
+	void setAborted(bool p_aborted = true)
+	{
+		aborted = p_aborted;
+	}
+
 	virtual bool handle_not_enough_space(const std::string &path);
 
 	virtual void next_chunk_patcher_bytes(const char *buf, size_t bsize, bool changed, bool* is_sparse);

@@ -1254,20 +1254,28 @@ void FileBackup::notifyClientBackupFailed()
 	client_main->sendClientMessageRetry("BACKUP FAILED " + params, "OK", "Sending status (BACKUP FAILED) to client failed", 10000, 2);
 }
 
+void FileBackup::abortHashThreads()
+{
+	for (size_t i = 0; i < bsh_prepare.size(); ++i)
+	{
+		bsh_prepare[i]->setAborted(true);
+	}
+	for (size_t i = 0; i < bsh.size(); ++i)
+	{
+		bsh[i]->setAborted(true);
+	}
+}
+
 void FileBackup::waitForFileThreads(bool aborted)
 {
 	SStatus status=ServerStatus::getStatus(clientname);
 	if (aborted)
 	{
-		// Signal hash and worker threads to discard remaining queue elements and delete temp files
-		hashpipe->Write("abort");
-		hashpipe_prepare->Write("abort");
+		// Directly signal hash and worker threads to discard remaining queue elements and delete temp files
+		abortHashThreads();
 	}
-	else
-	{
-		hashpipe->Write("flush");
-		hashpipe_prepare->Write("flush");
-	}
+	hashpipe->Write("flush");
+	hashpipe_prepare->Write("flush");
 	
 	size_t hashqueuesize=std::string::npos;
 	size_t prepare_hashqueuesize=0;
@@ -1279,8 +1287,11 @@ void FileBackup::waitForFileThreads(bool aborted)
 			Server->wait(aborted ? 50 : 1000);
 		}
 
-		size_t bsh_working = bsh.size() - hashpipe->getNumWaiters();
-		size_t bsh_prepare_working = bsh_prepare.size() - hashpipe_prepare->getNumWaiters();
+		size_t num_waiters = hashpipe->getNumWaiters();
+		size_t bsh_working = (num_waiters < bsh.size()) ? (bsh.size() - num_waiters) : 0;
+
+		size_t num_prepare_waiters = hashpipe_prepare->getNumWaiters();
+		size_t bsh_prepare_working = (num_prepare_waiters < bsh_prepare.size()) ? (bsh_prepare.size() - num_prepare_waiters) : 0;
 		
 		hashqueuesize = hashpipe->getNumElements() + bsh_working;
 		prepare_hashqueuesize = hashpipe_prepare->getNumElements() + bsh_prepare_working;

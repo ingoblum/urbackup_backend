@@ -302,6 +302,7 @@ bool FullFileBackup::doFileBackup()
 							// Fast-Cancel: abort() immediately drains queues and cleans up temp files
 							// instead of spending hours copying remaining items as incomplete files.
 							server_download->abort();
+							abortHashThreads();
 							break;
 						}
 
@@ -326,6 +327,7 @@ bool FullFileBackup::doFileBackup()
 						{
 							ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
 							server_download->abort();
+							abortHashThreads();
 							disk_error = true;
 							r_offline = true;
 							break;
@@ -658,6 +660,7 @@ bool FullFileBackup::doFileBackup()
 		{
 			ServerLogger::Log(logid, "Backup was stopped by user. Aborting file transfers...", LL_INFO);
 			server_download->abort();
+			abortHashThreads();
 			r_offline = true;
 			break;
 		}
@@ -679,6 +682,7 @@ bool FullFileBackup::doFileBackup()
 		{
 			ServerLogger::Log(logid, "Fatal server disk error occurred during backup. Aborting file transfers...", LL_ERROR);
 			server_download->abort();
+			abortHashThreads();
 			disk_error = true;
 			r_offline = true;
 			break;

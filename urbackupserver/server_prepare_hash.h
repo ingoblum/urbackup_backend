@@ -47,6 +47,11 @@ public:
 
 	bool hasError(void);
 
+	void setAborted(bool p_aborted = true)
+	{
+		aborted = p_aborted;
+	}
+
 	class IHashProgressCallback
 	{
 	public:

@@ -169,8 +169,10 @@ void BackupServerHash::operator()(void)
 		}
 		else if(data=="abort")
 		{
+			// Mark thread as aborted to discard remaining items and delete temp files.
+			// Do NOT re-write "abort" to pipe; doing so creates an infinite loop
+			// because the thread immediately reads back what it wrote!
 			aborted = true;
-			pipe->Write("abort");
 			continue;
 		}
 

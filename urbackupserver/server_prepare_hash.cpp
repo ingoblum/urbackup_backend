@@ -88,10 +88,10 @@ void BackupServerPrepareHash::operator()(void)
 		}
 		else if(data=="abort")
 		{
-			// Propagate abort down the pipeline to server_hash and discard further hash jobs
+			// Mark thread as aborted to discard remaining items and delete temp files.
+			// Do NOT re-write "abort" to pipe or output; doing so creates an infinite loop
+			// because the thread immediately reads back what it wrote!
 			aborted = true;
-			output->Write("abort");
-			pipe->Write("abort");
 			continue;
 		}
 
@@ -118,6 +118,14 @@ void BackupServerPrepareHash::operator()(void)
 				rd.getStr(&hashpath);
 				std::string hashoutput_fn;
 				rd.getStr(&hashoutput_fn);
+				std::string old_file_fn;
+				rd.getStr(&old_file_fn);
+				int64 t_filesize;
+				rd.getInt64(&t_filesize);
+				std::string client_sha_dig;
+				rd.getStr(&client_sha_dig);
+				std::string sparse_extents_fn;
+				rd.getStr(&sparse_extents_fn);
 				if (!temp_fn.empty())
 				{
 					Server->deleteFile(os_file_prefix(temp_fn));
@@ -125,6 +133,10 @@ void BackupServerPrepareHash::operator()(void)
 				if (!hashoutput_fn.empty())
 				{
 					Server->deleteFile(os_file_prefix(hashoutput_fn));
+				}
+				if (!sparse_extents_fn.empty())
+				{
+					Server->deleteFile(os_file_prefix(sparse_extents_fn));
 				}
 				continue;
 			}
