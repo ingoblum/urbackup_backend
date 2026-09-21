@@ -733,7 +733,7 @@ bool BackupServerHash::findFileAndLink(const std::string &tfn, IFile *tf, std::s
 	{
 		ff_last=existing_file.fullpath;
 		tries_once=true;
-		bool too_many_hardlinks;
+		bool too_many_hardlinks = false;
 		bool b = false;
 		if (use_snapshots
 			&& snapshot_file_inplace)

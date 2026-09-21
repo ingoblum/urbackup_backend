@@ -1296,7 +1296,7 @@ bool IncrFileBackup::doFileBackup()
 					}
 					else if(!use_snapshots) //is not changed
 					{						
-						bool too_many_hardlinks;
+						bool too_many_hardlinks = false;
 						bool b=create_hardlink(os_file_prefix(backuppath+local_curr_os_path), os_file_prefix(srcpath), crossvolume_links, &too_many_hardlinks, NULL);
 
 						if(b)

@@ -402,6 +402,10 @@ bool os_create_hardlink(const std::string &linkname, const std::string &fname, b
 		return os_create_reflink(linkname, fname);
 		
     int rc=link((fname).c_str(), (linkname).c_str());
+#ifdef EMLINK
+	if(rc!=0 && errno==EMLINK && too_many_links!=NULL)
+		*too_many_links=true;
+#endif
 	return rc==0;
 }
 
