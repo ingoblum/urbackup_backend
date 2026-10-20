@@ -158,7 +158,6 @@ JSON::Value addNextArchival(IDatabase* db, int clientid, IQuery* get_next, const
 	return JSON::Value(archive_str);
 }
 
-
 JSON::Object getJSONClientSettings(IDatabase* db, int t_clientid)
 {
 	std::map<std::string, ServerSettings::SClientSetting> settings = ServerSettings::getClientSettings(db, t_clientid);
@@ -556,6 +555,7 @@ bool updateArchiveSettings(int clientid, IDatabase *db)
 {
 	bool ret = true;
 	IQuery* q = db->Prepare("INSERT INTO settings_db.settings(key, value, clientid) VALUES ('archive_update', '1', ?)");
+	// The rules of the general settings and of groups are used by clients
 	if (clientid <= 0)
 	{
 		db_results res_ids = db->Read("SELECT id FROM clients");
