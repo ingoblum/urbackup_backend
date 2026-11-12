@@ -5,7 +5,7 @@ g.startup=true;
 g.no_tab_mouse_click=false;
 g.tabberidx=-1;
 g.progress_stop_id=-1;
-g.current_version=2005003700;
+g.current_version=2005003800;
 g.status_show_all=false;
 g.ldap_login=false;
 g.datatable_default_config={};
@@ -4321,7 +4321,8 @@ g.settings_list=[
 "hash_threads",
 "client_hash_threads",
 "image_compress_threads",
-"client_rename_detection"
+"client_rename_detection",
+"max_running_jobs_per_client_group"
 ];
 g.general_settings_list=[
 "backupfolder",

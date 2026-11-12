@@ -402,12 +402,14 @@ size_t SChannelPipe::Read(char * buffer, size_t bsize, int timeoutms)
 		{
 			if (!ssl_connect_negotiate(timeoutms, false))
 			{
+				has_error = true;
 				return 0;
 			}
 		}
 
 		if (res == SEC_I_CONTEXT_EXPIRED)
 		{
+			has_error = true;
 			return 0;
 		}
 	}
@@ -535,14 +537,13 @@ bool SChannelPipe::isWritable(int timeoutms)
 
 bool SChannelPipe::isReadable(int timeoutms)
 {
-	if (has_error)
-		return false;
-
 	if (decbuf_pos > 0)
 		return true;
 
 	if (encbuf_pos > 0 && !incomplete_message)
 		return true;
+
+	return bpipe->isReadable(timeoutms);
 }
 
 bool SChannelPipe::hasError(void)

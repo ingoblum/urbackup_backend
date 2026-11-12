@@ -407,6 +407,7 @@ void ServerSettings::readSettingsDefault(ISettingsReader* settings_default,
 		settings->use_incremental_symlinks = (settings_global->getValue("use_incremental_symlinks", "true") == "true");
 		settings->show_server_updates = (settings_global->getValue("show_server_updates", "true") == "true");
 		settings->server_url = trim(settings_global->getValue("server_url", ""));
+		settings->max_running_jobs_per_client_group = settings_global->getValue("max_running_jobs_per_client_group", 1000);
 	}
 
 	if (clientid == 0)
@@ -502,6 +503,7 @@ void ServerSettings::readSettingsDefault(ISettingsReader* settings_default,
 		settings->client_hash_threads = 1;
 		settings->image_compress_threads = 0;
 		settings->client_rename_detection = true;
+		settings->max_running_jobs_per_client_group = 1000;
 	}
 	
 	readStringClientSetting(q_get_client_setting, "update_freq_incr", std::string(), &settings->update_freq_incr, false);
@@ -662,13 +664,17 @@ void ServerSettings::readSettingsDefault(ISettingsReader* settings_default,
 
 	readIntClientSetting(q_get_client_setting, "download_threads", &settings->download_threads, false);
 	
-	readIntClientSetting(q_get_client_setting, "hash_threads", &settings->hash_threads, false);
+	//readIntClientSetting(q_get_client_setting, "hash_threads", &settings->hash_threads, false);
+	settings->hash_threads = 1;
 	
-	readIntClientSetting(q_get_client_setting, "client_hash_threads", &settings->client_hash_threads, false);
+	//readIntClientSetting(q_get_client_setting, "client_hash_threads", &settings->client_hash_threads, false);
+	settings->client_hash_threads = 1;
 	
 	readIntClientSetting(q_get_client_setting, "image_compress_threads", &settings->image_compress_threads, false);
 
 	readBoolClientSetting(q_get_client_setting, "client_rename_detection", &settings->client_rename_detection, false);
+
+	readIntClientSetting(q_get_client_setting, "max_running_jobs_per_client_group", &settings->max_running_jobs_per_client_group, false);
 }
 
 void ServerSettings::readSettingsClient(ISettingsReader* settings_client, IQuery* q_get_client_setting)
@@ -792,8 +798,12 @@ void ServerSettings::readSettingsClient(ISettingsReader* settings_client, IQuery
 	readStringClientSetting(q_get_client_setting, "client_settings_tray_access_pw", std::string(), &settings->client_settings_tray_access_pw, false);
 
 	readIntClientSetting(q_get_client_setting, "download_threads", &settings->download_threads, false);
-	readIntClientSetting(q_get_client_setting, "hash_threads", &settings->hash_threads, false);
-	readIntClientSetting(q_get_client_setting, "client_hash_threads", &settings->client_hash_threads, false);
+
+	//readIntClientSetting(q_get_client_setting, "hash_threads", &settings->hash_threads, false);
+	settings->hash_threads = 1;
+	//readIntClientSetting(q_get_client_setting, "client_hash_threads", &settings->client_hash_threads, false);
+	settings->client_hash_threads = 1;
+
 	readIntClientSetting(q_get_client_setting, "image_compress_threads", &settings->image_compress_threads, false);
 
 	readBoolClientSetting(q_get_client_setting, "client_rename_detection", &settings->client_rename_detection, false);
@@ -1358,6 +1368,7 @@ void ServerSettings::readSettings()
 	clientid = settings_default_id;
 	readSettingsDefault(settings_default.get(),
 		settings_global_ptr, q_get_client_setting);
+	local_settings->group_id = settings_default_id * -1;
 
 	clientid = clientid_backup;
 
@@ -1630,6 +1641,7 @@ std::map<std::string, ServerSettings::SClientSetting> ServerSettings::getClientS
 	SET_SETTING_INT(client_hash_threads);
 	SET_SETTING_INT(image_compress_threads);
 	SET_SETTING_BOOL(client_rename_detection);
+	SET_SETTING_INT(max_running_jobs_per_client_group);
 #undef SET_SETTING
 	return ret;
 }
