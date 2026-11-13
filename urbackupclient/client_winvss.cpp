@@ -1116,8 +1116,9 @@ bool IndexThread::deleteShadowcopyWin(SCDirs *dir)
 	{
 		for (size_t i = 0; i < vss_all_components.size(); ++i)
 		{
+			// Deduplicate writer IDs in deleteShadowcopyWin (previously != end() kept critical_writers empty).
 			if (std::find(critical_writers.begin(),
-				critical_writers.end(), vss_all_components[i].writerId) != critical_writers.end())
+				critical_writers.end(), vss_all_components[i].writerId) == critical_writers.end())
 			{
 				critical_writers.push_back(vss_all_components[i].writerId);
 			}

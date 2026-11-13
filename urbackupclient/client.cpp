@@ -1618,7 +1618,8 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 	token_cache.reset();
 
 #ifdef _WIN32
-	bool backup_with_vss_components = index_group==0 
+	// Allow virtual subclients with resolved VSS component selections to run component backups too.
+	bool backup_with_vss_components = (index_group == 0 || !index_clientsubname.empty())
 		&& (vss_select_all_components || !vss_select_components.empty());
 #else
 	bool backup_with_vss_components = false;
@@ -1747,7 +1748,8 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 		std::fstream outfile(filelist_fn.c_str(), std::ios::out|std::ios::binary);
 
 #ifdef _WIN32
-		if (index_group == 0)
+		// Virtual subclients also need start_shadowcopy_components when backup_with_vss_components is enabled.
+		if (index_group == 0 || !index_clientsubname.empty())
 		{
 			if (backup_with_vss_components)
 			{
