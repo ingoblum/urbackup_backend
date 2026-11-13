@@ -351,6 +351,9 @@
     <ClCompile Include="apps\patch.cpp">
       <Filter>apps</Filter>
     </ClCompile>
+    <ClCompile Include="apps\reconcile_storage.cpp">
+      <Filter>apps</Filter>
+    </ClCompile>
     <ClCompile Include="PhashLoad.cpp">
       <Filter>Quelldateien</Filter>
     </ClCompile>
@@ -684,6 +687,9 @@
       <Filter>Headerdateien</Filter>
     </ClInclude>
     <ClInclude Include="apps\patch.h">
+      <Filter>apps</Filter>
+    </ClInclude>
+    <ClInclude Include="apps\reconcile_storage.h">
       <Filter>apps</Filter>
     </ClInclude>
     <ClInclude Include="PhashLoad.h">
