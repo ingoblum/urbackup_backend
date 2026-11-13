@@ -639,18 +639,27 @@ bool CClientThread::ProcessPacket(CRData *data)
 				{
 					extra_flags = FILE_FLAG_OPEN_REPARSE_POINT;
 				}
+				// Allow concurrent read/write/delete sharing to avoid ERROR_SHARING_VIOLATION on active files.
+				const DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 #ifndef BACKUP_SEM
-				hFile=CreateFileW(Server->ConvertToWchar(filename).c_str(), FILE_READ_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED|FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+				hFile=CreateFileW(Server->ConvertToWchar(filename).c_str(), FILE_READ_DATA, share_mode, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED|FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 #else
 				if (backup_semantics)
 					extra_flags |= FILE_FLAG_BACKUP_SEMANTICS;
-				hFile=CreateFileW(Server->ConvertToWchar(filename).c_str(), FILE_READ_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+				hFile=CreateFileW(Server->ConvertToWchar(filename).c_str(), FILE_READ_DATA, share_mode, NULL, OPEN_EXISTING,
 					FILE_FLAG_OVERLAPPED|FILE_FLAG_SEQUENTIAL_SCAN|extra_flags, NULL);
 #endif
 
 				if(hFile == INVALID_HANDLE_VALUE)
 				{
 					std::string openerr = os_last_error_str();
+					// Distinguish unresolvable reparse points (e.g. dangling symlinks or AF_UNIX sockets)
+					// from genuine disk/permission errors when opening without FILE_FLAG_OPEN_REPARSE_POINT.
+					const DWORD attrs = GetFileAttributesW(Server->ConvertToWchar(filename).c_str());
+					if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+					{
+						Log("Cannot open reparse point \"" + o_filename + "\" for data read: " + openerr, LL_INFO);
+					}
 #ifdef CHECK_BASE_PATH
 					std::string share_name = getuntil("/",o_filename);
 					if(!share_name.empty())

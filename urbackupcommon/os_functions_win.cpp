@@ -519,6 +519,44 @@ bool isDirectory(const std::string &path, void* transaction)
         }
 }
 
+// Define WSL and AF_UNIX reparse tags when building against older Windows SDK headers.
+#ifndef IO_REPARSE_TAG_LX_SYMLINK
+#define IO_REPARSE_TAG_LX_SYMLINK 0xA000001D
+#endif
+#ifndef IO_REPARSE_TAG_AF_UNIX
+#define IO_REPARSE_TAG_AF_UNIX 0x80000023
+#endif
+#ifndef IO_REPARSE_TAG_LX_FIFO
+#define IO_REPARSE_TAG_LX_FIFO 0x80000024
+#endif
+#ifndef IO_REPARSE_TAG_LX_CHR
+#define IO_REPARSE_TAG_LX_CHR 0x80000025
+#endif
+#ifndef IO_REPARSE_TAG_LX_BLK
+#define IO_REPARSE_TAG_LX_BLK 0x80000026
+#endif
+
+namespace
+{
+	// Identifies Windows/WSL reparse tags that represent symbolic links whose target can be read.
+	bool isSymlinkReparseTag(DWORD tag)
+	{
+		return tag == IO_REPARSE_TAG_MOUNT_POINT
+			|| tag == IO_REPARSE_TAG_SYMLINK
+			|| tag == IO_REPARSE_TAG_LX_SYMLINK;
+	}
+
+	// Identifies non-regular special file reparse points (AF_UNIX sockets, WSL FIFOs/devices)
+	// that must never be opened for data reads via CreateFileW.
+	bool isWslSpecialReparseTag(DWORD tag)
+	{
+		return tag == IO_REPARSE_TAG_AF_UNIX
+			|| tag == IO_REPARSE_TAG_LX_FIFO
+			|| tag == IO_REPARSE_TAG_LX_CHR
+			|| tag == IO_REPARSE_TAG_LX_BLK;
+	}
+}
+
 bool os_is_symlink_int(const std::string& path)
 {
 	WIN32_FIND_DATAW wfd;
@@ -532,8 +570,7 @@ bool os_is_symlink_int(const std::string& path)
 
 	if (wfd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
 	{
-		if (wfd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT
-			|| wfd.dwReserved0 == IO_REPARSE_TAG_SYMLINK)
+		if (isSymlinkReparseTag(wfd.dwReserved0))
 		{
 			return true;
 		}
@@ -1228,6 +1265,14 @@ bool os_get_symlink_target(const std::string &lname, std::string &target)
 		memcpy(&wtarget[0],
 			&reparse_buffer->MountPointReparseBuffer.PathBuffer[reparse_buffer->MountPointReparseBuffer.SubstituteNameOffset/sizeof(wchar_t)],
 			reparse_buffer->MountPointReparseBuffer.SubstituteNameLength);
+	}
+	else if (reparse_buffer->ReparseTag == IO_REPARSE_TAG_LX_SYMLINK
+		&& reparse_buffer->ReparseDataLength > sizeof(ULONG))
+	{
+		// WSL1 symlinks store a 4-byte version header followed by the UTF-8 target path.
+		const char* utf8_target = reinterpret_cast<const char*>(reparse_buffer->GenericReparseBuffer.DataBuffer + sizeof(ULONG));
+		target.assign(utf8_target, reparse_buffer->ReparseDataLength - sizeof(ULONG));
+		return true;
 	}
 	else
 	{
