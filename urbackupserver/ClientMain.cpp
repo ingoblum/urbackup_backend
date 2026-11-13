@@ -26,6 +26,7 @@
 #include "../urbackupcommon/fileclient/tcpstack.h"
 #include "../common/data.h"
 #include "../urbackupcommon/settingslist.h"
+#include "../urbackupcommon/vss_component_settings.h"
 #include "server_channel.h"
 #include "server_log.h"
 #include "ServerDownloadThread.h"
@@ -1971,13 +1972,35 @@ void ClientMain::sendSettings(void)
 				}
 				else
 				{
+					// Enforce allow_component_config before sending vss_select_components.use to the client
+					// so disallowed client overrides cannot be activated locally.
+					int effective_use = setting.use;
+					if (key == "vss_select_components" && !server_settings->getSettings()->allow_component_config)
+					{
+						effective_use &= ~c_use_value_client;
+						if (effective_use == 0)
+						{
+							effective_use = !setting.value.empty() ? c_use_value : c_use_group;
+						}
+					}
 					s_settings += key + ".home=" + setting.value + "\n";
 					s_settings += key + ".client=" + setting.value_client + "\n";
-					s_settings += key + ".use=" + convert(setting.use) + "\n";
+					s_settings += key + ".use=" + convert(effective_use) + "\n";
 					s_settings += key + ".use_lm=" + convert(setting.use_last_modified) + "\n";
 				}
 				
-				if (setting.use == c_use_group)
+				if (key == "vss_select_components")
+				{
+					// Resolve vss_select_components using semantic rules (exclusions override inclusions,
+					// server/group default=0 restricts client) instead of raw '&' concatenation.
+					value = vss_settings::resolveVssComponentString(
+						setting.use,
+						server_settings->getSettings()->allow_component_config,
+						value_default,
+						setting.value,
+						setting.value_client);
+				}
+				else if (setting.use == c_use_group)
 				{
 					value = value_default;
 				}

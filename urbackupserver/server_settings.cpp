@@ -19,6 +19,7 @@
 #include "../stringtools.h"
 #include "../urbackupcommon/settingslist.h"
 #include "../urbackupcommon/os_functions.h"
+#include "../urbackupcommon/vss_component_settings.h"
 #include <stdlib.h>
 #include <assert.h>
 #include <math.h>
@@ -636,13 +637,30 @@ void ServerSettings::readSettingsDefault(ISettingsReader* settings_default,
 
 	readBoolClientSetting(q_get_client_setting, "ignore_disk_errors", &settings->ignore_disk_errors, false);
 	
-	readStringClientSetting(q_get_client_setting, "vss_select_components", std::string("&"), &settings->vss_select_components, false);
+	// Read allow_component_config before vss_select_components so group/client resolution
+	// can enforce whether client-side component overrides are permitted.
+	readBoolClientSetting(q_get_client_setting, "allow_component_config", &settings->allow_component_config, false);
+
+	{
+		// Resolve vss_select_components using structured rule merging instead of blind '&' concatenation.
+		q_get_client_setting->Bind(clientid);
+		q_get_client_setting->Bind("vss_select_components");
+		db_results vss_res = q_get_client_setting->Read();
+		q_get_client_setting->Reset();
+		if (!vss_res.empty())
+		{
+			settings->vss_select_components = vss_settings::resolveVssComponentString(
+				watoi(vss_res[0]["use"]),
+				settings->allow_component_config,
+				settings->vss_select_components,
+				vss_res[0]["value"],
+				vss_res[0]["value_client"]);
+		}
+	}
 
 	readBoolClientSetting(q_get_client_setting, "allow_file_restore", &settings->allow_file_restore, false);
 
 	readBoolClientSetting(q_get_client_setting, "allow_component_restore", &settings->allow_component_restore, false);
-	
-	readBoolClientSetting(q_get_client_setting, "allow_component_config", &settings->allow_component_config, false);
 
 	readStringClientSetting(q_get_client_setting, "image_snapshot_groups", std::string(), &settings->image_snapshot_groups, false);
 	readStringClientSetting(q_get_client_setting, "file_snapshot_groups", std::string(), &settings->file_snapshot_groups, false);
@@ -726,7 +744,25 @@ void ServerSettings::readSettingsClient(ISettingsReader* settings_client, IQuery
 	readBoolClientSetting(q_get_client_setting, "local_encrypt", &settings->local_encrypt);
 	readBoolClientSetting(q_get_client_setting, "local_compress", &settings->local_compress);
 
-	readStringClientSetting(q_get_client_setting, "vss_select_components", "&", &settings->vss_select_components);
+	// Read allow_component_config first so client-level vss_select_components resolution respects it.
+	readBoolClientSetting(q_get_client_setting, "allow_component_config", &settings->allow_component_config);
+
+	{
+		// Resolve client-level vss_select_components against the previously resolved group/global value.
+		q_get_client_setting->Bind(clientid);
+		q_get_client_setting->Bind("vss_select_components");
+		db_results vss_res = q_get_client_setting->Read();
+		q_get_client_setting->Reset();
+		if (!vss_res.empty())
+		{
+			settings->vss_select_components = vss_settings::resolveVssComponentString(
+				watoi(vss_res[0]["use"]),
+				settings->allow_component_config,
+				settings->vss_select_components,
+				vss_res[0]["value"],
+				vss_res[0]["value_client"]);
+		}
+	}
 
 	if (settings->image_snapshot_groups.empty())
 	{
@@ -782,7 +818,6 @@ void ServerSettings::readSettingsClient(ISettingsReader* settings_client, IQuery
 	readBoolClientSetting(q_get_client_setting, "ignore_disk_errors", &settings->ignore_disk_errors);
 
 	readBoolClientSetting(q_get_client_setting, "allow_file_restore", &settings->allow_file_restore);
-	readBoolClientSetting(q_get_client_setting, "allow_component_config", &settings->allow_component_config);
 	readBoolClientSetting(q_get_client_setting, "allow_component_restore", &settings->allow_component_restore);
 
 	readStringClientSetting(q_get_client_setting, "image_snapshot_groups", std::string(), &settings->image_snapshot_groups, false);
