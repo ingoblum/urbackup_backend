@@ -643,6 +643,70 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			with_components ? false : true,
 			with_components ? VSS_BT_FULL : VSS_BT_COPY, false));
 
+		// Disable Exchange VSS writer classes whenever their components are not actively selected.
+		// Otherwise VSS still notifies MSExchangeRepl on non-component/log backups without AddComponent,
+		// triggering events 2024/2026/2044 (0x80070015) and KeyNotFoundException (2140) on BackupComplete.
+		{
+			struct ExchangeWriterEntry
+			{
+				VSS_ID id;
+				const char* guid;
+			};
+			// Cover both active Mailbox Store writer and passive DAG Replica writer.
+			const ExchangeWriterEntry exchange_writers[] = {
+				{ { 0x76fe1ac4, 0x15f7, 0x4bcd, { 0x98, 0x7e, 0x8e, 0x1a, 0xcb, 0x46, 0x2f, 0xb7 } }, "{76fe1ac4-15f7-4bcd-987e-8e1acb462fb7}" },
+				{ { 0x7630e38d, 0x08a7, 0x490c, { 0x9d, 0x46, 0x8b, 0xf0, 0xd8, 0x0e, 0x04, 0xa9 } }, "{7630e38d-08a7-490c-9d46-8bf0d80e04a9}" }
+			};
+
+			std::vector<VSS_ID> disabled_exchange_writers;
+			for (size_t i = 0; i < sizeof(exchange_writers) / sizeof(exchange_writers[0]); ++i)
+			{
+				const ExchangeWriterEntry& entry = exchange_writers[i];
+				bool writer_selected = false;
+				if (with_components && !vss_settings::isWriterExcluded(vss_excluded_writers, entry.guid))
+				{
+					if (vss_select_all_components)
+					{
+						writer_selected = true;
+					}
+					else
+					{
+						for (size_t k = 0; k < vss_select_components.size(); ++k)
+						{
+							if (vss_select_components[k].writerId == entry.id)
+							{
+								writer_selected = true;
+								break;
+							}
+						}
+					}
+				}
+				if (!writer_selected)
+				{
+					disabled_exchange_writers.push_back(entry.id);
+				}
+			}
+
+			// DisableWriterClasses must run after InitializeForBackup/SetBackupState and before
+			// GatherWriterMetadata so VSS omits the disabled writer classes from this backup session.
+			if (!disabled_exchange_writers.empty())
+			{
+				const HRESULT disable_hr = backupcom->DisableWriterClasses(
+					disabled_exchange_writers.data(),
+					static_cast<UINT>(disabled_exchange_writers.size()));
+				if (disable_hr == S_OK)
+				{
+					VSSLog("Disabled " + std::to_string(disabled_exchange_writers.size())
+						+ " unselected Exchange VSS writer class(es).", LL_INFO);
+				}
+				else
+				{
+					VSSLog("Disabling unselected Exchange VSS writer class(es) failed. VSS error code "
+						+ GetErrorHResErrStr(disable_hr), LL_WARNING);
+				}
+			}
+		}
+
 		IVssAsync *pb_result;
 
 		CHECK_COM_RESULT_RETURN(backupcom->GatherWriterMetadata(&pb_result));
