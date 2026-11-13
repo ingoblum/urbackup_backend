@@ -484,9 +484,13 @@ private:
 	bool wait_for(IVssAsync *vsasync, const std::string& error_prefix, const int timeoutms = -1);
 	std::string GetErrorHResErrStr(HRESULT res);
 	void printProviderInfo(HRESULT res);
+	// ignore_retryable_in_ok_state allows callers after DoSnapshotSet to treat VSS_E_WRITERERROR_RETRYABLE
+	// as an error even when the writer state is VSS_WS_WAITING_FOR_BACKUP_COMPLETE or VSS_WS_STABLE.
 	bool check_writer_status(IVssBackupComponents *backupcom, std::string& errmsg, 
-		int loglevel, bool continue_on_failure, const std::vector<VSS_ID>& critical_writers, bool* critical_failure, bool* retryable_error);
-	bool checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HRESULT pHrResultFailure, std::string& errmsg, int loglevel, bool continue_on_failure, bool* retryable_error);
+		int loglevel, bool continue_on_failure, const std::vector<VSS_ID>& critical_writers, bool* critical_failure, bool* retryable_error,
+		bool ignore_retryable_in_ok_state = true);
+	bool checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HRESULT pHrResultFailure, std::string& errmsg, int loglevel, bool continue_on_failure, bool* retryable_error,
+		bool ignore_retryable_in_ok_state = true);
 	bool deleteShadowcopyWin(SCDirs *dir);
 	void initVss();
 	bool deleteSavedShadowCopyWin(SShadowCopy& scs, SShadowCopyContext& context);

@@ -328,7 +328,7 @@ bool IndexThread::wait_for(IVssAsync *vsasync, const std::string& error_prefix, 
 	return true;
 }
 
-bool IndexThread::checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HRESULT pHrResultFailure, std::string& errmsg, int loglevel, bool continue_on_failure, bool* retryable_error)
+bool IndexThread::checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HRESULT pHrResultFailure, std::string& errmsg, int loglevel, bool continue_on_failure, bool* retryable_error, bool ignore_retryable_in_ok_state)
 {
 #define FAIL_STATE(x) case x: { state=#x; failure=true; } break
 #define OK_STATE(x) case x: { state=#x; ok_state=true; } break
@@ -389,8 +389,11 @@ bool IndexThread::checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HR
 	else
 		writerName = "(NULL)";
 
+	// After DoSnapshotSet (ignore_retryable_in_ok_state == false), treat VSS_E_WRITERERROR_RETRYABLE
+	// as an actual failure even when the writer transitioned to an ok_state such as
+	// VSS_WS_WAITING_FOR_BACKUP_COMPLETE, so the retry loop can re-attempt the snapshot.
 	if (failure 
-		|| (has_error && (!ok_state || pHrResultFailure!= VSS_E_WRITERERROR_RETRYABLE) ) )
+		|| (has_error && (!ok_state || !ignore_retryable_in_ok_state || pHrResultFailure != VSS_E_WRITERERROR_RETRYABLE) ) )
 	{
 		const std::string erradd = ". UrBackup will continue with the backup but the associated data may not be consistent.";
 		std::string nerrmsg = "Writer " + writerName + " has failure state " + state + " with error " + err;
@@ -418,7 +421,7 @@ bool IndexThread::checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HR
 
 
 bool IndexThread::check_writer_status(IVssBackupComponents *backupcom, std::string& errmsg, int loglevel, bool continue_on_failure, 
-	const std::vector<VSS_ID>& critical_writers, bool* critical_failure, bool* retryable_error)
+	const std::vector<VSS_ID>& critical_writers, bool* critical_failure, bool* retryable_error, bool ignore_retryable_in_ok_state)
 {
 	if (critical_failure != NULL)
 		*critical_failure = false;
@@ -458,7 +461,7 @@ bool IndexThread::check_writer_status(IVssBackupComponents *backupcom, std::stri
 		{
 			bool critical_writer = std::find(critical_writers.begin(), critical_writers.end(), pidWriter)!=critical_writers.end();
 
-			if (!checkErrorAndLog(pbstrWriter, pState, pHrResultFailure, errmsg, critical_writer ? LL_ERROR : loglevel, continue_on_failure, retryable_error))
+			if (!checkErrorAndLog(pbstrWriter, pState, pHrResultFailure, errmsg, critical_writer ? LL_ERROR : loglevel, continue_on_failure, retryable_error, ignore_retryable_in_ok_state))
 			{
 				if (critical_writer
 					&& critical_failure!=NULL)
@@ -800,13 +803,15 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 
 		bool snapshot_ok = false;
 		bool critical_writer_failure = false;
+		// Do not ignore VSS_E_WRITERERROR_RETRYABLE in ok_state right after DoSnapshotSet so
+		// snapshot-phase writer failures (e.g. Exchange PrepareSnapshot/Freeze) trigger retries.
 		if (tries>1)
 		{
-			snapshot_ok = check_writer_status(backupcom, errmsg, LL_WARNING, true, critical_writers, &critical_writer_failure, &retryable_error);
+			snapshot_ok = check_writer_status(backupcom, errmsg, LL_WARNING, true, critical_writers, &critical_writer_failure, &retryable_error, false);
 		}
 		else
 		{
-			snapshot_ok = check_writer_status(backupcom, errmsg, LL_WARNING, true, critical_writers, &critical_writer_failure, NULL);
+			snapshot_ok = check_writer_status(backupcom, errmsg, LL_WARNING, true, critical_writers, &critical_writer_failure, NULL, false);
 		}
 		--tries;
 		const char* windows_component_exp = "This client is configured to backup Windows components. "
