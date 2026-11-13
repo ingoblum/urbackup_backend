@@ -23,6 +23,8 @@
 #include "file_permissions.h"
 #include "DirectoryWatcherThread.h"
 #include "../urbackupcommon/json.h"
+#include "../urbackupcommon/os_functions.h"
+#include "../urbackupcommon/vss_component_settings.h"
 #include "ClientService.h"
 #include <assert.h>
 
@@ -37,6 +39,135 @@ namespace
 {
 	const int vss_wait_timeout = 2 * 60 * 1000; // 2 min
 	const int vss_wait_timeout_long = 10 * 60 * 1000;
+
+	// RAII guard for IVssBackupComponents ensuring AbortBackup() and Release() are called
+	// deterministically on any early return or error path unless ownership was explicitly transferred.
+	class VssSessionGuard
+	{
+	public:
+		VssSessionGuard() = default;
+		VssSessionGuard(const VssSessionGuard&) = delete;
+		VssSessionGuard& operator=(const VssSessionGuard&) = delete;
+
+		~VssSessionGuard()
+		{
+			abortAndReset();
+		}
+
+		void adopt(IVssBackupComponents* com)
+		{
+			abortAndReset();
+			backupcom_ = com;
+			backup_started_ = false;
+		}
+
+		void markBackupStarted()
+		{
+			backup_started_ = true;
+		}
+
+		IVssBackupComponents* get() const
+		{
+			return backupcom_;
+		}
+
+		// Releases ownership without calling AbortBackup() (used after snapshots are committed to SCRef).
+		IVssBackupComponents* release()
+		{
+			IVssBackupComponents* tmp = backupcom_;
+			backupcom_ = nullptr;
+			backup_started_ = false;
+			return tmp;
+		}
+
+		// Releases the COM pointer after BackupComplete/DeleteSnapshots already ran in the retry loop.
+		void resetWithoutAbort()
+		{
+			if (backupcom_ != nullptr)
+			{
+				backupcom_->Release();
+				backupcom_ = nullptr;
+			}
+			backup_started_ = false;
+		}
+
+	private:
+		void abortAndReset()
+		{
+			if (backupcom_ != nullptr)
+			{
+				if (backup_started_)
+				{
+					backupcom_->AbortBackup();
+				}
+				backupcom_->Release();
+				backupcom_ = nullptr;
+			}
+			backup_started_ = false;
+		}
+
+		IVssBackupComponents* backupcom_ = nullptr;
+		bool backup_started_ = false;
+	};
+
+	std::string convert(VSS_ID id);
+	// Returns true for Microsoft Exchange Store Writer and Exchange Replica Writer GUIDs.
+	bool isExchangeWriterId(const VSS_ID& writer_id)
+	{
+		const std::string lower = strlower(convert(writer_id));
+		return lower == "{76fe1ac4-15f7-4bcd-987e-8e1acb462fb7}"
+			|| lower == "{7630e38d-08a7-490c-9d46-8bf0d80e04a9}";
+	}
+
+	// Queries Windows SCM to verify that a given service is currently in SERVICE_RUNNING state.
+	bool isWindowsServiceRunning(const wchar_t* service_name, DWORD& out_state)
+	{
+		out_state = 0;
+		SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+		if (scm == nullptr)
+		{
+			return false;
+		}
+		SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_QUERY_STATUS);
+		if (svc == nullptr)
+		{
+			CloseServiceHandle(scm);
+			return false;
+		}
+		SERVICE_STATUS_PROCESS ssp = {};
+		DWORD bytes_needed = 0;
+		const BOOL ok = QueryServiceStatusEx(
+			svc,
+			SC_STATUS_PROCESS_INFO,
+			reinterpret_cast<LPBYTE>(&ssp),
+			sizeof(ssp),
+			&bytes_needed);
+		if (ok)
+		{
+			out_state = ssp.dwCurrentState;
+		}
+		CloseServiceHandle(svc);
+		CloseServiceHandle(scm);
+		return ok && ssp.dwCurrentState == SERVICE_RUNNING;
+	}
+
+	// Pre-flight check before selecting Exchange VSS writers: ensures MSExchangeIS and MSExchangeRepl
+	// are both running so VSS PrepareForBackup does not trigger a crashing RPC/dictionary lookup.
+	bool checkExchangeServicesReady(std::string& reason)
+	{
+		DWORD state = 0;
+		if (!isWindowsServiceRunning(L"MSExchangeIS", state))
+		{
+			reason = "MSExchangeIS is not in SERVICE_RUNNING state (state=" + std::to_string(state) + ")";
+			return false;
+		}
+		if (!isWindowsServiceRunning(L"MSExchangeRepl", state))
+		{
+			reason = "MSExchangeRepl is not in SERVICE_RUNNING state (state=" + std::to_string(state) + ")";
+			return false;
+		}
+		return true;
+	}
 
 	std::string sortHex(UINT i)
 	{
@@ -489,35 +620,37 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 	int tries = max_tries;
 	bool retryable_error = true;
 	IVssBackupComponents *backupcom = NULL;
+	// Guard owns the active IVssBackupComponents session until snapshots are handed off to dir->ref.
+	VssSessionGuard vss_guard;
 	while (tries>0 && retryable_error)
 	{
-		CHECK_COM_RESULT_RELEASE(CreateVssBackupComponents(&backupcom));
+		CHECK_COM_RESULT_RETURN(CreateVssBackupComponents(&backupcom));
 
 		if (!backupcom)
 		{
 			VSSLog("backupcom is NULL", LL_ERROR);
 			return false;
 		}
+		vss_guard.adopt(backupcom);
 
-		CHECK_COM_RESULT_RELEASE(backupcom->InitializeForBackup());
+		CHECK_COM_RESULT_RETURN(backupcom->InitializeForBackup());
+		vss_guard.markBackupStarted();
 
-		CHECK_COM_RESULT_RELEASE(backupcom->SetBackupState(with_components ? true : false, 
+		CHECK_COM_RESULT_RETURN(backupcom->SetBackupState(with_components ? true : false, 
 			with_components ? false : true,
 			with_components ? VSS_BT_FULL : VSS_BT_COPY, false));
 
 		IVssAsync *pb_result;
 
-		CHECK_COM_RESULT_RELEASE(backupcom->GatherWriterMetadata(&pb_result));
+		CHECK_COM_RESULT_RETURN(backupcom->GatherWriterMetadata(&pb_result));
 		if (!wait_for(pb_result, "Gathering writer status failed", vss_wait_timeout))
 		{
-			backupcom->AbortBackup();
-			backupcom->Release();
 			return false;
 		}
 
 #ifndef VSS_XP
 #ifndef VSS_S03
-		CHECK_COM_RESULT_RELEASE(backupcom->SetContext(VSS_CTX_APP_ROLLBACK));
+		CHECK_COM_RESULT_RETURN(backupcom->SetContext(VSS_CTX_APP_ROLLBACK));
 #endif
 #endif
 
@@ -528,24 +661,21 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			if (!selectVssComponents(backupcom, selected_vols))
 			{
 				VSSLog("Selecting components to backup failed", LL_ERROR);
-				backupcom->Release();
-				backupcom = NULL;
 				return false;
 			}
 
 			if (vss_all_components.empty())
 			{
 				VSSLog("Selected no components to backup", LL_INFO);
-				backupcom->Release();
-				backupcom = NULL;
 				return true;
 			}
 
 			critical_writers.clear();
 			for (size_t i = 0; i < vss_all_components.size(); ++i)
 			{
+				// Deduplicate writer IDs: previously used != end() which kept critical_writers always empty.
 				if (std::find(critical_writers.begin(),
-					critical_writers.end(), vss_all_components[i].writerId) != critical_writers.end())
+					critical_writers.end(), vss_all_components[i].writerId) == critical_writers.end())
 				{
 					critical_writers.push_back(vss_all_components[i].writerId);
 				}
@@ -607,7 +737,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 
 		if (!b_ok)
 		{
-			CHECK_COM_RESULT_RELEASE(backupcom->StartSnapshotSet(&dir->ref->ssetid));
+			CHECK_COM_RESULT_RETURN(backupcom->StartSnapshotSet(&dir->ref->ssetid));
 		}
 
 		additional_refs.clear();
@@ -641,7 +771,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 				}
 			}
 
-			CHECK_COM_RESULT_RELEASE(backupcom->AddToSnapshotSet(&(Server->ConvertToWchar(selected_vols[i])[0]), GUID_NULL, &additional_refs[i].volid));
+			CHECK_COM_RESULT_RETURN(backupcom->AddToSnapshotSet(&(Server->ConvertToWchar(selected_vols[i])[0]), GUID_NULL, &additional_refs[i].volid));
 
 			if (selected_vols[i] == wpath_lower)
 			{
@@ -651,22 +781,18 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 
 
 
-		CHECK_COM_RESULT_RELEASE(backupcom->PrepareForBackup(&pb_result));
+		CHECK_COM_RESULT_RETURN(backupcom->PrepareForBackup(&pb_result));
 		if (!wait_for(pb_result, "Preparing backup failed", vss_wait_timeout_long))
 		{
-			backupcom->AbortBackup();
-			backupcom->Release();
 			return false;
 		}
 
 		retryable_error = false;
 		check_writer_status(backupcom, errmsg, LL_WARNING, true, critical_writers, NULL, &retryable_error);
 
-		CHECK_COM_RESULT_RELEASE(backupcom->DoSnapshotSet(&pb_result));
+		CHECK_COM_RESULT_RETURN(backupcom->DoSnapshotSet(&pb_result));
 		if (!wait_for(pb_result, "Starting snapshot set failed", vss_wait_timeout_long))
 		{
-			backupcom->AbortBackup();
-			backupcom->Release();
 			return false;
 		}
 
@@ -696,8 +822,6 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			else
 			{
 				VSSLog(std::string("Writer is in error state during snapshot creation. ")+windows_component_exp, LL_ERROR);
-				backupcom->AbortBackup();
-				backupcom->Release();
 				return false;
 			}
 			break;
@@ -713,8 +837,6 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 				else
 				{
 					VSSLog(std::string("Creating snapshot failed after three tries. Giving up. ")+windows_component_exp, LL_ERROR);
-					backupcom->AbortBackup();
-					backupcom->Release();
 					return false;
 				}
 				break;
@@ -746,7 +868,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			}
 #endif
 #endif
-			backupcom->Release();
+			vss_guard.resetWithoutAbort();
 			backupcom = NULL;
 
 			Server->wait(30000);
@@ -760,12 +882,11 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 	for (size_t i = 0; i < additional_refs.size(); ++i)
 	{
 		VSS_SNAPSHOT_PROP snap_props = {};
-		CHECK_COM_RESULT_RELEASE(backupcom->GetSnapshotProperties(additional_refs[i].volid, &snap_props));
+		CHECK_COM_RESULT_RETURN(backupcom->GetSnapshotProperties(additional_refs[i].volid, &snap_props));
 
 		if (snap_props.m_pwszSnapshotDeviceObject == NULL)
 		{
 			VSSLog("GetSnapshotProperties did not return a volume path", LL_ERROR);
-			if (backupcom != NULL) { backupcom->AbortBackup(); backupcom->Release(); }
 			return false;
 		}
 
@@ -896,6 +1017,8 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 		}
 	}
 
+	// All snapshots are created and stored in dir->ref / additional_refs; release guard without aborting.
+	vss_guard.release();
 	return true;
 }
 
@@ -1113,80 +1236,68 @@ bool IndexThread::deleteSavedShadowCopyWin(SShadowCopy& scs, SShadowCopyContext&
 	}
 }
 
-bool IndexThread::getVssSettings()
+bool IndexThread::getVssSettings(const std::string& clientsubname)
 {
+	// Prefer subclient-specific configuration when clientsubname is set; fall back to main settings.cfg.
 	std::string settings_fn = "urbackup/data/settings.cfg";
+	if (!clientsubname.empty())
+	{
+		const std::string sub_fn = "urbackup/data/settings_" + conv_filename(clientsubname) + ".cfg";
+		if (FileExists(sub_fn))
+		{
+			settings_fn = sub_fn;
+		}
+	}
 	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
 	vss_select_components.clear();
+	vss_excluded_writers.clear();
 	vss_select_all_components = false;
 	bool select_default_components = false;
 	bool ret = false;
 	if (curr_settings.get() != NULL)
 	{
-		std::string use_val;
+		const bool allow_comp = curr_settings->getValue("allow_component_config", true);
 		int use = curr_settings->getValue("vss_select_components.use", c_use_value_client);
+		const std::string client_val = curr_settings->getValue("vss_select_components.client");
+		const std::string group_val = curr_settings->getValue("vss_select_components.group");
+		const std::string home_val = curr_settings->getValue("vss_select_components.home");
 
-		std::string val;
-		if (use & c_use_value_client)
+		// Resolve inheritance layers using the same semantic rules as the server.
+		vss_settings::VssComponentSpec spec;
+		if (!client_val.empty() || !group_val.empty() || !home_val.empty())
 		{
-			val = curr_settings->getValue("vss_select_components.client");
+			spec = vss_settings::resolveVssComponentSpec(use, allow_comp, group_val, home_val, client_val);
 		}
-		if (use & c_use_group)
+		else
 		{
-			std::string add = curr_settings->getValue("vss_select_components.group");
-			if (!add.empty()
-				&& add[0] != '&')
-				val += "&";
-			val += add;
-		}
-		if (use & c_use_value)
-		{
-			std::string add = curr_settings->getValue("vss_select_components.home");
-			if (!add.empty()
-				&& add[0] != '&')
-				val += "&";
-			val += add;
+			spec = vss_settings::parseVssComponentSpec(curr_settings->getValue("vss_select_components"));
 		}
 
-		if (!val.empty())
+		vss_excluded_writers = spec.excluded_tokens;
+		vss_select_all_components = spec.all;
+		if (vss_select_all_components)
 		{
-			str_map comps;
-			ParseParamStrHttp(val, &comps, false);
+			ret = true;
+		}
+		if (spec.has_default && spec.select_default)
+		{
+			select_default_components = true;
+		}
 
-			vss_select_components.clear();
-
-			for (str_map::iterator it = comps.begin();
-				it != comps.end(); ++it)
+		for (size_t i = 0; i < spec.includes.size(); ++i)
+		{
+			if (vss_settings::isWriterExcluded(vss_excluded_writers, spec.includes[i].writer))
 			{
-				if (next(it->first, 0, "writer_"))
-				{
-					std::string idx = getafter("writer_", it->first);
-
-					SComponent component;
-
-					component.componentName = comps["name_" + idx];
-					component.logicalPath = comps["path_" + idx];
-					HRESULT hr = IIDFromString(Server->ConvertToWchar(comps["writer_" + idx]).c_str(), &component.writerId);
-
-					if (hr==S_OK)
-					{
-						vss_select_components.push_back(component);
-						ret = true;
-					}
-				}
+				continue;
 			}
-
-			if (!comps["all"].empty()
-				&& comps["all"] != "0")
+			SComponent component;
+			component.componentName = spec.includes[i].name;
+			component.logicalPath = spec.includes[i].path;
+			HRESULT hr = IIDFromString(Server->ConvertToWchar(spec.includes[i].writer).c_str(), &component.writerId);
+			if (hr == S_OK)
 			{
-				vss_select_all_components = true;
+				vss_select_components.push_back(component);
 				ret = true;
-			}
-
-			if (!comps["default"].empty()
-				&& comps["default"] != "0")
-			{
-				select_default_components = true;
 			}
 		}
 	}

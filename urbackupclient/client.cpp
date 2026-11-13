@@ -904,7 +904,8 @@ void IndexThread::operator()(void)
 			//incr backup
 			bool has_dirs = readBackupDirs();
 			bool has_scripts = readBackupScripts(action == IndexThreadAction_StartFullFileBackup);
-			bool has_vss_components = getVssSettings();
+			// Pass index_clientsubname so virtual subclients evaluate their own VSS component settings.
+			bool has_vss_components = getVssSettings(index_clientsubname);
 			if( !has_dirs && !has_scripts && !has_vss_components)
 			{
 				addResult(curr_result_id, "no backup dirs");
@@ -1051,7 +1052,8 @@ void IndexThread::operator()(void)
 
 			bool has_dirs = readBackupDirs();
 			bool has_scripts = readBackupScripts(true);
-			bool has_vss_components = getVssSettings();
+			// Pass index_clientsubname so full backups on virtual subclients use subclient VSS settings.
+			bool has_vss_components = getVssSettings(index_clientsubname);
 			if(!has_dirs && !has_scripts && !has_vss_components)
 			{
 				addResult(curr_result_id, "no backup dirs");

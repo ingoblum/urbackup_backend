@@ -9,6 +9,7 @@
 #include "../urbackupcommon/filelist_utils.h"
 #include "clientdao.h"
 #include <map>
+#include <set>
 #include "tokens.h"
 #include "ClientHash.h"
 
@@ -489,7 +490,9 @@ private:
 	bool deleteShadowcopyWin(SCDirs *dir);
 	void initVss();
 	bool deleteSavedShadowCopyWin(SShadowCopy& scs, SShadowCopyContext& context);
-	bool getVssSettings();
+	// Accepts the active subclient name so VSS component settings can be loaded from
+	// subclient-specific settings_<subclient>.cfg files with fallback to settings.cfg.
+	bool getVssSettings(const std::string& clientsubname = std::string());
 	bool selectVssComponents(IVssBackupComponents *backupcom, std::vector<std::string>& selected_vols);
 	bool addFilespecVol(IVssWMFiledesc* wmFile, std::vector<std::string>& selected_vols);
 	bool addFiles(IVssWMFiledesc* wmFile, VSS_ID ssetid, const std::vector<SCRef*>& past_refs, std::string named_prefix,
@@ -504,7 +507,7 @@ private:
 #else
 	bool start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool for_imagebackup, bool * &onlyref, bool* not_configured);
 	bool get_volumes_mounted_locally();
-	bool getVssSettings() { return true; }
+	bool getVssSettings(const std::string& = std::string()) { return true; }
 #endif
 
 	bool deleteShadowcopy(SCDirs *dir);
@@ -926,6 +929,8 @@ private:
 
 	bool vss_select_all_components;
 	std::vector<SComponent > vss_select_components;
+	// Lowercase writer GUIDs explicitly excluded via negation syntax (e.g. -Exchange, -{GUID}).
+	std::set<std::string> vss_excluded_writers;
 	std::vector<SComponent> vss_explicitly_selected_components;
 	std::vector<SComponent> vss_all_components;
 	std::map<std::string, SVssInstance*> vss_name_instances;
